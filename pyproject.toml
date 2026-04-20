@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "apk-pipeline"
+version = "0.1.0"
+description = "Engineered APK reverse-engineering pipeline for manifest, JADX, and native analysis"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "androguard>=4.1.2",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
