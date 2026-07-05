@@ -4,16 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "apk-pipeline"
-version = "0.1.0"
-description = "Engineered APK reverse-engineering pipeline for manifest, JADX, and native analysis"
+version = "0.2.0"
+description = "Research pipeline for extracting Android APK code, native, resource, and review evidence."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
   "androguard>=4.1.2",
 ]
-
-[tool.setuptools]
-package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]

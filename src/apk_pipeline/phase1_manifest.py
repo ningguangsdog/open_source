@@ -1,243 +1,183 @@
+"""Phase 1: manifest and package metadata extraction."""
+
 from __future__ import annotations
 
-import logging
 from pathlib import Path
-from typing import Any, Callable, TypeVar
-
-from androguard.core.apk import APK
+from typing import Any
 
 from .models import PhaseResult
 from .utils import ensure_dir, safe_write_json
 
-logger = logging.getLogger(__name__)
 
-T = TypeVar("T")
+DANGEROUS_PERMISSION_MARKERS = (
+    "CAMERA",
+    "RECORD_AUDIO",
+    "READ_CONTACTS",
+    "WRITE_CONTACTS",
+    "READ_CALENDAR",
+    "WRITE_CALENDAR",
+    "ACCESS_FINE_LOCATION",
+    "ACCESS_COARSE_LOCATION",
+    "READ_PHONE_STATE",
+    "CALL_PHONE",
+    "READ_SMS",
+    "SEND_SMS",
+    "READ_EXTERNAL_STORAGE",
+    "WRITE_EXTERNAL_STORAGE",
+    "READ_MEDIA_IMAGES",
+    "READ_MEDIA_VIDEO",
+    "READ_MEDIA_AUDIO",
+    "POST_NOTIFICATIONS",
+)
 
 
-def _safe_call(
-    fn: Callable[[], T],
-    default: T,
-    field_name: str,
-    warnings: list[str],
-) -> T:
-    """
-    Run an APK metadata extraction call safely.
-
-    Some APKs, especially large commercial apps or bundle-derived APKs,
-    may contain resource table formats that are not fully compatible with
-    Androguard's ARSC parser. We treat such failures as field-level warnings
-    rather than phase-level failures.
-    """
+def _call(apk_obj: Any, method: str, default: Any = None) -> Any:
+    value = getattr(apk_obj, method, None)
+    if not callable(value):
+        return default
     try:
-        return fn()
-    except Exception as exc:
-        msg = f"Failed to extract {field_name}: {exc}"
-        logger.warning(msg)
-        warnings.append(msg)
+        return value()
+    except Exception:
         return default
 
 
-def _as_sorted_unique_list(value: Any) -> list[str]:
-    if value is None:
+def _stringify_list(values: Any) -> list[str]:
+    if values is None:
         return []
-    if isinstance(value, (list, tuple, set)):
-        return sorted(set(str(x) for x in value if x is not None))
-    return [str(value)]
+    if isinstance(values, (list, tuple, set)):
+        return sorted({str(item) for item in values if item is not None})
+    return [str(values)]
 
 
-def run_phase1(apk_path: Path, workspace: Path, force: bool = False) -> PhaseResult:
-    """
-    Phase I: Manifest-level semantic extraction.
+def _component_summary(apk_obj: Any) -> dict[str, list[str]]:
+    components = {
+        "activities": _stringify_list(_call(apk_obj, "get_activities", [])),
+        "services": _stringify_list(_call(apk_obj, "get_services", [])),
+        "receivers": _stringify_list(_call(apk_obj, "get_receivers", [])),
+        "providers": _stringify_list(_call(apk_obj, "get_providers", [])),
+    }
+    return components
 
-    This phase is intentionally implemented as a best-effort parser.
-    A failure to resolve resource-dependent fields such as app_name should
-    not prevent extraction of package name, permissions, components, or
-    native library metadata.
-    """
-    phase_dir = ensure_dir(workspace / "phase1_manifest")
-    summary_path = phase_dir / "manifest_summary.json"
-    decoded_manifest_path = phase_dir / "AndroidManifest_decoded.xml"
 
-    if summary_path.exists() and not force:
-        return PhaseResult(
-            phase="phase1_manifest",
-            success=True,
-            apk_filename=apk_path.name,
-            output_dir=str(phase_dir),
-            summary_path=str(summary_path),
-            message="Phase I skipped because outputs already exist.",
-        )
+def _sdk_summary(apk_obj: Any) -> dict[str, Any]:
+    return {
+        "min_sdk": _call(apk_obj, "get_min_sdk_version"),
+        "target_sdk": _call(apk_obj, "get_target_sdk_version"),
+        "max_sdk": _call(apk_obj, "get_max_sdk_version"),
+    }
 
-    warnings: list[str] = []
 
+def _extract_manifest_summary(apk_path: Path) -> dict[str, Any]:
     try:
-        apk = APK(str(apk_path))
+        from androguard.misc import AnalyzeAPK
 
-        file_list = _safe_call(
-            apk.get_files,
-            [],
-            "file list",
-            warnings,
-        )
-        file_list = sorted(str(x) for x in file_list)
-
-        native_libs = [
-            f for f in file_list
-            if f.startswith("lib/") and f.endswith(".so")
-        ]
-
-        # Important:
-        # apk.get_app_name() may trigger resources.arsc parsing.
-        # For some APKs, this may fail even when manifest/dex/native analysis works.
-        app_name = _safe_call(
-            apk.get_app_name,
-            None,
-            "app_name",
-            warnings,
-        )
-
-        package_name = _safe_call(
-            apk.get_package,
-            None,
-            "package_name",
-            warnings,
-        )
-
-        manifest_summary: dict[str, Any] = {
-            "apk_filename": apk_path.name,
-            "package_name": package_name,
-            "app_name": app_name,
-            "version_name": _safe_call(
-                apk.get_androidversion_name,
-                None,
-                "version_name",
-                warnings,
-            ),
-            "version_code": _safe_call(
-                apk.get_androidversion_code,
-                None,
-                "version_code",
-                warnings,
-            ),
-            "min_sdk": _safe_call(
-                apk.get_min_sdk_version,
-                None,
-                "min_sdk",
-                warnings,
-            ),
-            "target_sdk": _safe_call(
-                apk.get_target_sdk_version,
-                None,
-                "target_sdk",
-                warnings,
-            ),
-            "max_sdk": _safe_call(
-                apk.get_max_sdk_version,
-                None,
-                "max_sdk",
-                warnings,
-            ),
-            "main_activity": _safe_call(
-                apk.get_main_activity,
-                None,
-                "main_activity",
-                warnings,
-            ),
-            "permissions": _as_sorted_unique_list(
-                _safe_call(apk.get_permissions, [], "permissions", warnings)
-            ),
-            "activities": _as_sorted_unique_list(
-                _safe_call(apk.get_activities, [], "activities", warnings)
-            ),
-            "services": _as_sorted_unique_list(
-                _safe_call(apk.get_services, [], "services", warnings)
-            ),
-            "receivers": _as_sorted_unique_list(
-                _safe_call(apk.get_receivers, [], "receivers", warnings)
-            ),
-            "providers": _as_sorted_unique_list(
-                _safe_call(apk.get_providers, [], "providers", warnings)
-            ),
-            "libraries": _as_sorted_unique_list(
-                _safe_call(apk.get_libraries, [], "libraries", warnings)
-            ),
-            "features": _as_sorted_unique_list(
-                _safe_call(apk.get_features, [], "features", warnings)
-            ),
-            "native_libs": native_libs,
-            "file_count": len(file_list),
-            "native_lib_count": len(native_libs),
-            "warnings": warnings,
-            "partial": bool(warnings),
-            "parser": "androguard_best_effort",
+        apk_obj, _, _ = AnalyzeAPK(str(apk_path))
+    except Exception as exc:
+        return {
+            "apk": str(apk_path),
+            "success": False,
+            "error": repr(exc),
         }
 
-        # Best-effort decoded manifest export.
+    package = _call(apk_obj, "get_package")
+    app_name = _call(apk_obj, "get_app_name")
+    permissions = _stringify_list(_call(apk_obj, "get_permissions", []))
+    dangerous_permissions = [
+        permission
+        for permission in permissions
+        if any(marker in permission.upper() for marker in DANGEROUS_PERMISSION_MARKERS)
+    ]
+
+    payload: dict[str, Any] = {
+        "apk": str(apk_path),
+        "success": True,
+        "package": package,
+        "app_name": app_name,
+        "version_name": _call(apk_obj, "get_androidversion_name"),
+        "version_code": _call(apk_obj, "get_androidversion_code"),
+        "sdk": _sdk_summary(apk_obj),
+        "permissions": permissions,
+        "dangerous_permissions": dangerous_permissions,
+        "components": _component_summary(apk_obj),
+        "libraries": _stringify_list(_call(apk_obj, "get_libraries", [])),
+        "features": _stringify_list(_call(apk_obj, "get_features", [])),
+    }
+
+    manifest_xml = _call(apk_obj, "get_android_manifest_xml")
+    if manifest_xml is not None:
         try:
-            xml_obj = apk.get_android_manifest_xml()
-            from lxml import etree
+            payload["manifest_xml"] = manifest_xml.toxml()
+        except Exception:
+            payload["manifest_xml"] = ""
 
-            xml_bytes = etree.tostring(
-                xml_obj,
-                pretty_print=True,
-                encoding="utf-8",
-                xml_declaration=True,
-            )
-            decoded_manifest_path.write_bytes(xml_bytes)
-        except Exception as exc:
-            msg = f"Failed to export decoded manifest XML: {exc}"
-            logger.warning(msg)
-            warnings.append(msg)
-            decoded_manifest_path.write_text(
-                "<!-- Decoded manifest export failed. "
-                "Structured manifest metadata was extracted on a best-effort basis. -->",
-                encoding="utf-8",
-            )
-            manifest_summary["warnings"] = warnings
-            manifest_summary["partial"] = True
+    return payload
 
-        safe_write_json(summary_path, manifest_summary)
 
-        # Define Phase I success as whether we extracted any useful manifest-level signal.
-        # This prevents optional resource-resolution failures from invalidating the phase.
-        success = bool(
-            manifest_summary.get("package_name")
-            or manifest_summary.get("permissions")
-            or manifest_summary.get("activities")
-            or manifest_summary.get("native_libs")
-        )
+def _brief_manifest(summary: dict[str, Any]) -> dict[str, Any]:
+    components = summary.get("components") or {}
+    return {
+        "apk": summary.get("apk"),
+        "success": summary.get("success"),
+        "package": summary.get("package"),
+        "app_name": summary.get("app_name"),
+        "version_name": summary.get("version_name"),
+        "version_code": summary.get("version_code"),
+        "permissions_count": len(summary.get("permissions") or []),
+        "dangerous_permissions": summary.get("dangerous_permissions") or [],
+        "component_counts": {
+            key: len(value or [])
+            for key, value in components.items()
+        },
+    }
 
+
+def run_phase1_multi(
+    primary_apk: Path,
+    all_apks: list[Path],
+    workspace: Path,
+    *,
+    force: bool = False,
+) -> PhaseResult:
+    output_dir = ensure_dir(workspace / "phase1_manifest")
+    base_output_path = output_dir / "manifest_summary.json"
+    split_output_path = output_dir / "split_manifest_summary.json"
+
+    if base_output_path.exists() and split_output_path.exists() and not force:
         return PhaseResult(
-            phase="phase1_manifest",
-            success=success,
-            apk_filename=apk_path.name,
-            output_dir=str(phase_dir),
-            summary_path=str(summary_path),
-            message=(
-                "Phase I completed."
-                if success and not warnings
-                else "Phase I completed with warnings."
-                if success
-                else "Phase I completed but extracted limited metadata."
-            ),
-            details={
-                "package_name": manifest_summary.get("package_name"),
-                "app_name": manifest_summary.get("app_name"),
-                "permissions": len(manifest_summary.get("permissions", [])),
-                "activities": len(manifest_summary.get("activities", [])),
-                "native_lib_count": manifest_summary.get("native_lib_count", 0),
-                "partial": manifest_summary.get("partial", False),
-                "warning_count": len(warnings),
-            },
+            name="phase1_manifest",
+            success=True,
+            output_paths=[base_output_path, split_output_path],
+            details={"cached": True},
         )
 
-    except Exception as exc:
-        logger.exception("Phase I failed")
-        return PhaseResult(
-            phase="phase1_manifest",
-            success=False,
-            apk_filename=apk_path.name,
-            output_dir=str(phase_dir),
-            summary_path=str(summary_path) if summary_path.exists() else None,
-            message=f"Phase I failed: {exc}",
-        )
+    base_summary = _extract_manifest_summary(primary_apk)
+    split_summaries = [_extract_manifest_summary(path) for path in all_apks]
+
+    safe_write_json(base_output_path, base_summary)
+    safe_write_json(
+        split_output_path,
+        {
+            "primary_apk": str(primary_apk),
+            "apk_count": len(all_apks),
+            "splits": split_summaries,
+            "brief": [_brief_manifest(item) for item in split_summaries],
+        },
+    )
+
+    return PhaseResult(
+        name="phase1_manifest",
+        success=bool(base_summary.get("success")),
+        output_paths=[base_output_path, split_output_path],
+        details={
+            "package": base_summary.get("package"),
+            "app_name": base_summary.get("app_name"),
+            "permission_count": len(base_summary.get("permissions") or []),
+            "dangerous_permission_count": len(base_summary.get("dangerous_permissions") or []),
+            "split_manifest_count": sum(1 for item in split_summaries if item.get("success")),
+        },
+        error=base_summary.get("error"),
+    )
+
+
+def run_phase1(apk_path: Path, workspace: Path, *, force: bool = False) -> PhaseResult:
+    return run_phase1_multi(apk_path, [apk_path], workspace, force=force)
