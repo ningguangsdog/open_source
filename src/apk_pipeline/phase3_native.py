@@ -29,6 +29,7 @@ MAX_STRINGS = 5000
 MAX_INTERESTING_STRINGS = 500
 AUTO_DEEP_MIN_SCORE = 18
 AUTO_DEEP_MIN_CAPABILITY_SCORE = 12
+AUTOMATED_DECOMPILER_TOOLS = {"rizin", "radare2"}
 
 
 def _native_entries(apk_path: Path) -> list[zipfile.ZipInfo]:
@@ -436,6 +437,13 @@ def _auto_decompile_decision(
             "reason": "decompiler_missing",
             "candidate_count": len(callable_targets),
             "available_decompiler": None,
+        }
+    if tool not in AUTOMATED_DECOMPILER_TOOLS:
+        return {
+            "attempt": False,
+            "reason": "decompiler_adapter_not_automated",
+            "candidate_count": len(callable_targets),
+            "available_decompiler": tool,
         }
 
     high_value_targets = [

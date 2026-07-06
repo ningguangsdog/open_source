@@ -227,7 +227,7 @@ def _build_similarity_packet(
         "notes": [
             "This packet is intended for downstream review and similarity preparation.",
             "Hashes identify exact artifacts; token_fingerprint is a normalized static signal, not a similarity score.",
-            "Native pseudocode appears only when --native-depth deep and an adapter are available.",
+            "Native pseudocode appears when auto/deep native analysis selects targets and an automated adapter is available.",
         ],
     }
 
