@@ -18,19 +18,23 @@ The pipeline is designed for app-level capability review across many Android app
 3. `phase2_jadx`
    - Runs JADX on all dex-bearing splits by default.
    - Builds a code index with capability signals, native method declarations, `System.loadLibrary` calls, URLs, imports, and short source snippets.
+   - Emits Java evidence units and a package-level index for downstream review.
 
 4. `phase3_native`
    - Extracts native `.so` libraries from all native-bearing APK splits.
    - Collects strings, exported symbols, JNI symbols, URLs, and capability signals.
-   - Ranks high-value native targets automatically. If a supported native decompiler is installed, targeted pseudocode output is attempted.
+   - Ranks high-value native targets automatically and writes a native function index.
+   - Optional pseudocode output is attempted only in `--native-depth deep`.
 
 5. `phase4_resources`
    - Inventories local models, rule files, dictionaries, OCR assets, and other high-value resources.
    - Extracts conservative model metadata from visible file content, including TFLite magic markers, operator/name hints, and string samples.
+   - Emits separate model and resource evidence units.
 
 6. `phase5_evidence`
    - Produces a compact review packet from the previous stages.
-   - The packet is intended for manual review and downstream research triage. Similarity scoring is intentionally left out of this stage.
+   - Emits a JSONL evidence-unit stream, an app-level evidence graph, and a similarity-ready packet.
+   - Similarity scoring is intentionally left out of this stage.
 
 ## Quick Start
 
@@ -63,7 +67,12 @@ python scripts/run_pipeline.py \
 - `--no-decompile-all-splits`: only run JADX on the primary APK.
 - `--native-depth none`: skip native target ranking and optional native decompiler calls.
 - `--native-depth basic`: extract native metadata and ranked targets without decompiler attempts.
-- `--native-depth targeted`: extract native metadata, rank targets, and attempt targeted native pseudocode if a supported tool is available.
+- `--native-depth targeted`: extract native metadata, rank targets, and emit native evidence units.
+- `--native-depth deep`: run targeted mode and attempt native pseudocode if a supported tool is available.
+- `--native-decompiler auto|none|rizin|radare2|ghidra|retdec`: select the optional native decompiler adapter.
+- `--native-max-libraries`: cap the number of native libraries selected for deeper review.
+- `--native-max-decompile-targets`: cap the number of native targets sent to the optional decompiler.
+- `--native-target-capabilities`: prioritize one or more capability names during native target selection.
 - `--no-resource-scan`: skip raw model/resource inventory.
 - `--no-evidence-packets`: skip the final review packet.
 - `--no-jadx-download`: require a preinstalled `jadx` binary instead of downloading it.
@@ -79,20 +88,34 @@ apk_workspace/
   phase1_manifest/split_manifest_summary.json
   phase2_jadx/jadx_summary.json
   phase2_jadx/code_index.json
+  phase2_jadx/java_evidence_units.json
+  phase2_jadx/java_package_index.json
   phase3_native/native_analysis.json
   phase3_native/native_targets.json
+  phase3_native/native_function_index.json
+  phase3_native/native_evidence_units.json
+  phase3_native/native_deep_summary.json
   phase4_resources/resource_inventory.json
+  phase4_resources/model_evidence_units.json
+  phase4_resources/resource_evidence_units.json
   phase5_evidence/review_packet.md
   phase5_evidence/review_packet.json
   phase5_evidence/review_prompt.md
+  phase5_evidence/evidence_units.jsonl
+  phase5_evidence/evidence_graph.json
+  phase5_evidence/similarity_ready_packet.json
   pipeline_summary.json
 ```
 
 The most useful files for review are usually:
 
 - `phase5_evidence/review_packet.md`
+- `phase5_evidence/evidence_units.jsonl`
+- `phase5_evidence/similarity_ready_packet.json`
 - `phase2_jadx/code_index.json`
+- `phase2_jadx/java_evidence_units.json`
 - `phase3_native/native_targets.json`
+- `phase3_native/native_function_index.json`
 - `phase4_resources/resource_inventory.json`
 
 ## External Tools

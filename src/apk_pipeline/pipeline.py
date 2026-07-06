@@ -72,7 +72,12 @@ class APKPipeline:
                 force=self.config.force,
                 native_depth=self.config.native_depth,
                 native_max_functions=self.config.native_max_functions,
-                native_timeout=self.config.native_timeout,
+                native_decompiler=self.config.native_decompiler,
+                native_max_libraries=self.config.native_max_libraries,
+                native_max_decompile_targets=self.config.native_max_decompile_targets,
+                native_timeout_per_function=self.config.native_timeout_per_function,
+                native_timeout_per_app=self.config.native_timeout_per_app,
+                native_target_capabilities=self.config.native_target_capabilities,
             ),
         ]
 

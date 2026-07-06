@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .capability_taxonomy import capability_names, classify_text
+from .evidence import capability_confidence, compact_list, token_fingerprint, unit_id
 from .models import PhaseResult
 from .utils import ensure_dir, reset_dir, run_cmd, safe_extract_zip, safe_name, safe_read_text, safe_write_json, tool_exists, zip_contains
 
@@ -18,6 +19,12 @@ SOURCE_EXTENSIONS = (".java", ".kt", ".xml")
 URL_RE = re.compile(r"https?://[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+")
 PACKAGE_RE = re.compile(r"^\s*package\s+([A-Za-z0-9_.]+)\s*;", re.MULTILINE)
 IMPORT_RE = re.compile(r"^\s*import\s+([A-Za-z0-9_.*]+)\s*;", re.MULTILINE)
+CLASS_RE = re.compile(r"\b(?:class|interface|enum)\s+([A-Za-z0-9_$]+)")
+METHOD_RE = re.compile(
+    r"\b(?:public|private|protected|static|final|native|synchronized|abstract|\s)+"
+    r"[A-Za-z0-9_<>\[\].?,\s]+\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*\(",
+    re.MULTILINE,
+)
 NATIVE_METHOD_RE = re.compile(
     r"\bnative\s+(?:[A-Za-z0-9_<>\[\].]+\s+)+([A-Za-z0-9_]+)\s*\(",
     re.MULTILINE,
@@ -25,6 +32,7 @@ NATIVE_METHOD_RE = re.compile(
 LOAD_LIBRARY_RE = re.compile(r"System\.loadLibrary\(\s*\"([A-Za-z0-9_.-]+)\"")
 MAX_FILE_CHARS = 250_000
 MAX_SNIPPET_LEN = 240
+MAX_EVIDENCE_UNITS = 5000
 
 
 def _apk_has_dex(apk_path: Path) -> bool:
@@ -165,6 +173,8 @@ def _index_source_file(path: Path, root: Path) -> dict[str, Any] | None:
     capability_hits = classify_text(f"{rel_path}\n{text}")
     package_match = PACKAGE_RE.search(text)
     imports = sorted(set(IMPORT_RE.findall(text)))[:100]
+    class_match = CLASS_RE.search(text)
+    method_names = sorted(set(METHOD_RE.findall(text)))[:100]
     native_methods = sorted(set(NATIVE_METHOD_RE.findall(text)))[:100]
     load_libraries = sorted(set(LOAD_LIBRARY_RE.findall(text)))[:100]
     urls = sorted(set(URL_RE.findall(text)))[:100]
@@ -175,6 +185,8 @@ def _index_source_file(path: Path, root: Path) -> dict[str, Any] | None:
     return {
         "file": str(rel_path),
         "package": package_match.group(1) if package_match else None,
+        "class_name": class_match.group(1) if class_match else path.stem,
+        "method_names": method_names,
         "imports": imports,
         "native_methods": native_methods,
         "load_libraries": load_libraries,
@@ -182,6 +194,129 @@ def _index_source_file(path: Path, root: Path) -> dict[str, Any] | None:
         "capabilities": capability_hits,
         "snippets": _snippet_lines(rel_path, text, capability_hits),
     }
+
+
+def _split_name(rel_path: str) -> str | None:
+    parts = Path(rel_path).parts
+    return parts[0] if parts else None
+
+
+def _file_unit_kind(record: dict[str, Any]) -> str:
+    if record.get("native_methods") or record.get("load_libraries"):
+        return "native_bridge"
+    file_name = str(record.get("file") or "").lower()
+    if file_name.endswith(".xml"):
+        return "resource_source"
+    return "source_file"
+
+
+def _signature_for_record(record: dict[str, Any]) -> str:
+    package = record.get("package")
+    class_name = record.get("class_name")
+    if package and class_name:
+        return f"{package}.{class_name}"
+    return str(record.get("file") or class_name or "")
+
+
+def build_java_package_index(code_index: dict[str, Any]) -> dict[str, Any]:
+    packages: dict[str, dict[str, Any]] = {}
+    for record in code_index.get("files") or []:
+        package = record.get("package") or "<unknown>"
+        entry = packages.setdefault(
+            package,
+            {
+                "file_count": 0,
+                "capabilities": Counter(),
+                "native_libraries": Counter(),
+                "native_method_count": 0,
+                "url_count": 0,
+                "sample_files": [],
+            },
+        )
+        entry["file_count"] += 1
+        entry["capabilities"].update((record.get("capabilities") or {}).keys())
+        entry["native_libraries"].update(record.get("load_libraries") or [])
+        entry["native_method_count"] += len(record.get("native_methods") or [])
+        entry["url_count"] += len(record.get("urls") or [])
+        if len(entry["sample_files"]) < 20:
+            entry["sample_files"].append(record.get("file"))
+
+    normalized: dict[str, Any] = {}
+    for package, entry in sorted(packages.items()):
+        normalized[package] = {
+            "file_count": entry["file_count"],
+            "capabilities": dict(entry["capabilities"].most_common()),
+            "native_libraries": dict(entry["native_libraries"].most_common(50)),
+            "native_method_count": entry["native_method_count"],
+            "url_count": entry["url_count"],
+            "sample_files": [item for item in entry["sample_files"] if item],
+        }
+    return {
+        "package_count": len(normalized),
+        "packages": normalized,
+    }
+
+
+def build_java_evidence_units(code_index: dict[str, Any], *, max_units: int = MAX_EVIDENCE_UNITS) -> list[dict[str, Any]]:
+    units: list[dict[str, Any]] = []
+    for record in code_index.get("files") or []:
+        capabilities = capability_names((record.get("capabilities") or {}).keys())
+        snippets = record.get("snippets") or []
+        text_for_hash = "\n".join(
+            [
+                str(record.get("file") or ""),
+                str(record.get("package") or ""),
+                " ".join(record.get("imports") or []),
+                " ".join(record.get("method_names") or []),
+                "\n".join(str(item.get("text") or "") for item in snippets if isinstance(item, dict)),
+            ]
+        )
+        units.append(
+            {
+                "unit_id": unit_id("java", record.get("file")),
+                "phase": "phase2_jadx",
+                "kind": _file_unit_kind(record),
+                "file": record.get("file"),
+                "split": _split_name(str(record.get("file") or "")),
+                "package": record.get("package"),
+                "class_name": record.get("class_name"),
+                "method_names": compact_list(record.get("method_names") or [], 80),
+                "normalized_signature": _signature_for_record(record),
+                "capabilities": capabilities,
+                "imports": compact_list(record.get("imports") or [], 80),
+                "native_libraries": compact_list(record.get("load_libraries") or [], 80),
+                "native_methods": compact_list(record.get("native_methods") or [], 80),
+                "urls": compact_list(record.get("urls") or [], 40),
+                "snippets": snippets[:12],
+                "token_fingerprint": token_fingerprint(text_for_hash),
+                "confidence": capability_confidence(capabilities, len(snippets)),
+            }
+        )
+
+    for capability, snippets in (code_index.get("snippets_by_capability") or {}).items():
+        for snippet in snippets[:80]:
+            units.append(
+                {
+                    "unit_id": unit_id("java_snippet", capability, snippet.get("file"), snippet.get("line"), snippet.get("text")),
+                    "phase": "phase2_jadx",
+                    "kind": "code_snippet",
+                    "file": snippet.get("file"),
+                    "line": snippet.get("line"),
+                    "capabilities": capability_names([capability]),
+                    "text": snippet.get("text"),
+                    "token_fingerprint": token_fingerprint(str(snippet.get("text") or "")),
+                    "confidence": 0.65,
+                }
+            )
+
+    units.sort(
+        key=lambda item: (
+            -float(item.get("confidence") or 0),
+            item.get("kind") or "",
+            item.get("file") or "",
+        )
+    )
+    return units[:max_units]
 
 
 def build_code_index(decompile_root: Path, *, max_snippets_per_capability: int = 40) -> dict[str, Any]:
@@ -252,12 +387,15 @@ def run_phase2_multi(
     decompile_root = ensure_dir(output_dir / "decompiled")
     summary_path = output_dir / "jadx_summary.json"
     index_path = output_dir / "code_index.json"
+    evidence_path = output_dir / "java_evidence_units.json"
+    package_index_path = output_dir / "java_package_index.json"
 
-    if summary_path.exists() and index_path.exists() and not force:
+    output_paths = [summary_path, index_path, evidence_path, package_index_path]
+    if all(path.exists() for path in output_paths) and not force:
         return PhaseResult(
             name="phase2_jadx",
             success=True,
-            output_paths=[summary_path, index_path],
+            output_paths=output_paths,
             details={"cached": True},
         )
 
@@ -275,11 +413,14 @@ def run_phase2_multi(
             "message": "No dex-bearing APKs found.",
         }
         safe_write_json(summary_path, payload)
-        safe_write_json(index_path, build_code_index(decompile_root))
+        code_index = build_code_index(decompile_root)
+        safe_write_json(index_path, code_index)
+        safe_write_json(evidence_path, build_java_evidence_units(code_index))
+        safe_write_json(package_index_path, build_java_package_index(code_index))
         return PhaseResult(
             name="phase2_jadx",
             success=True,
-            output_paths=[summary_path, index_path],
+            output_paths=output_paths,
             details={"target_count": 0, "message": payload["message"]},
         )
 
@@ -319,7 +460,11 @@ def run_phase2_multi(
         decompile_root,
         max_snippets_per_capability=max_snippets_per_capability,
     )
+    java_evidence_units = build_java_evidence_units(code_index)
+    package_index = build_java_package_index(code_index)
     safe_write_json(index_path, code_index)
+    safe_write_json(evidence_path, java_evidence_units)
+    safe_write_json(package_index_path, package_index)
 
     payload = {
         "primary_apk": str(primary_apk),
@@ -329,9 +474,13 @@ def run_phase2_multi(
         "runs": runs,
         "success": all(run["success"] for run in runs),
         "code_index_path": str(index_path),
+        "java_evidence_units_path": str(evidence_path),
+        "java_package_index_path": str(package_index_path),
         "code_index_summary": {
             "files_scanned": code_index["files_scanned"],
             "indexed_file_count": code_index["indexed_file_count"],
+            "java_evidence_unit_count": len(java_evidence_units),
+            "package_count": package_index["package_count"],
             "capability_counts": code_index["capability_counts"],
             "native_method_count": code_index["native_method_count"],
             "load_library_count": len(code_index["load_library_calls"]),
@@ -344,7 +493,7 @@ def run_phase2_multi(
     return PhaseResult(
         name="phase2_jadx",
         success=payload["success"],
-        output_paths=[summary_path, index_path],
+        output_paths=output_paths,
         details=payload["code_index_summary"],
         warnings=warnings,
     )

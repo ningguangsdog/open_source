@@ -9,13 +9,15 @@ from pathlib import Path
 from typing import Any
 
 from .capability_taxonomy import capability_names, classify_text
+from .evidence import capability_confidence, compact_list, token_fingerprint, unit_id
 from .models import PhaseResult
-from .native_decompiler import run_targeted_decompile, select_native_targets
+from .native_decompiler import run_targeted_decompile, score_native_text, select_native_targets
 from .utils import (
     ensure_dir,
     printable_strings_from_bytes,
     run_cmd,
     safe_name,
+    safe_read_text,
     safe_write_json,
     sha256_file,
     tool_exists,
@@ -183,6 +185,230 @@ def _analyze_library(record: dict[str, Any]) -> dict[str, Any]:
     return enriched
 
 
+def _library_id(record: dict[str, Any]) -> str:
+    return unit_id(
+        "native_library",
+        record.get("sha256") or record.get("extracted_path"),
+        record.get("abi"),
+        record.get("name"),
+    )
+
+
+def _target_score(kind: str, library_path: str, name: str) -> tuple[int, list[str], list[str]]:
+    score, capabilities, reasons = score_native_text(f"{library_path} {name}")
+    if kind == "jni_symbol":
+        score += 10
+        reasons.append("jni_symbol")
+    elif kind == "exported_symbol":
+        score += 4
+        reasons.append("exported_symbol")
+    elif kind == "string":
+        score += 2
+        reasons.append("matched_string")
+    return score, capability_names(capabilities), sorted(set(reasons))[:12]
+
+
+def build_native_function_index(
+    library_records: list[dict[str, Any]],
+    *,
+    max_entries_per_library: int = 1500,
+) -> dict[str, Any]:
+    libraries: list[dict[str, Any]] = []
+    aggregate_capabilities: Counter[str] = Counter()
+
+    for record in library_records:
+        library_path = str(record.get("extracted_path") or record.get("entry") or "")
+        library_caps = capability_names((record.get("capability_counts") or {}).keys())
+        aggregate_capabilities.update(library_caps)
+        functions: list[dict[str, Any]] = []
+        seen_names: set[tuple[str, str]] = set()
+
+        for symbol in record.get("jni_symbols") or []:
+            name = str(symbol)
+            score, capabilities, reasons = _target_score("jni_symbol", library_path, name)
+            seen_names.add(("jni_symbol", name))
+            functions.append(
+                {
+                    "kind": "jni_symbol",
+                    "name": name,
+                    "score": score,
+                    "capabilities": capabilities,
+                    "reasons": reasons,
+                }
+            )
+
+        for symbol in record.get("exported_symbols") or []:
+            name = str(symbol)
+            if ("jni_symbol", name) in seen_names:
+                continue
+            score, capabilities, reasons = _target_score("exported_symbol", library_path, name)
+            seen_names.add(("exported_symbol", name))
+            functions.append(
+                {
+                    "kind": "exported_symbol",
+                    "name": name,
+                    "score": score,
+                    "capabilities": capabilities,
+                    "reasons": reasons,
+                }
+            )
+
+        for item in record.get("interesting_strings") or []:
+            value = item.get("value") if isinstance(item, dict) else item
+            if not value:
+                continue
+            name = str(value)
+            score, capabilities, reasons = _target_score("string", library_path, name)
+            item_capabilities = item.get("capabilities") if isinstance(item, dict) else []
+            functions.append(
+                {
+                    "kind": "string",
+                    "name": name[:500],
+                    "score": score,
+                    "capabilities": capability_names(set(capabilities).union(item_capabilities or [])),
+                    "reasons": reasons,
+                    "urls": item.get("urls") if isinstance(item, dict) else [],
+                }
+            )
+
+        functions.sort(key=lambda item: (-int(item.get("score") or 0), item.get("kind") or "", item.get("name") or ""))
+        libraries.append(
+            {
+                "library_id": _library_id(record),
+                "apk": record.get("apk"),
+                "entry": record.get("entry"),
+                "path": library_path,
+                "name": record.get("name"),
+                "abi": record.get("abi"),
+                "sha256": record.get("sha256"),
+                "size_bytes": record.get("size_bytes"),
+                "capabilities": library_caps,
+                "capability_counts": record.get("capability_counts") or {},
+                "exported_symbol_count": record.get("exported_symbol_count") or 0,
+                "jni_symbol_count": record.get("jni_symbol_count") or 0,
+                "interesting_string_count": len(record.get("interesting_strings") or []),
+                "function_count_indexed": min(len(functions), max_entries_per_library),
+                "functions": functions[:max_entries_per_library],
+                "functions_truncated": len(functions) > max_entries_per_library,
+            }
+        )
+
+    libraries.sort(
+        key=lambda item: (
+            -sum(int(value) for value in (item.get("capability_counts") or {}).values()),
+            item.get("name") or "",
+            item.get("abi") or "",
+        )
+    )
+    return {
+        "library_count": len(libraries),
+        "aggregate_capabilities": dict(sorted(aggregate_capabilities.items())),
+        "libraries": libraries,
+    }
+
+
+def _decompile_result_map(decompile_result: dict[str, Any] | None) -> dict[tuple[str, str], dict[str, Any]]:
+    mapped: dict[tuple[str, str], dict[str, Any]] = {}
+    for result in (decompile_result or {}).get("results") or []:
+        target = result.get("target") or {}
+        library = str(target.get("library") or "")
+        name = str(target.get("name") or "")
+        if library and name:
+            mapped[(library, name)] = result
+    return mapped
+
+
+def build_native_evidence_units(
+    library_records: list[dict[str, Any]],
+    targets: list[dict[str, Any]],
+    decompile_result: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    units: list[dict[str, Any]] = []
+    decompiled = _decompile_result_map(decompile_result)
+
+    for record in library_records:
+        capabilities = capability_names((record.get("capability_counts") or {}).keys())
+        interesting_strings = [
+            str(item.get("value") if isinstance(item, dict) else item)
+            for item in (record.get("interesting_strings") or [])[:80]
+        ]
+        fingerprint_text = "\n".join(
+            [
+                str(record.get("entry") or record.get("name") or ""),
+                " ".join(capabilities),
+                " ".join(record.get("exported_symbols") or []),
+                " ".join(interesting_strings),
+            ]
+        )
+        units.append(
+            {
+                "unit_id": _library_id(record),
+                "phase": "phase3_native",
+                "kind": "native_library",
+                "library_id": _library_id(record),
+                "apk": record.get("apk"),
+                "entry": record.get("entry"),
+                "library": record.get("extracted_path"),
+                "name": record.get("name"),
+                "abi": record.get("abi"),
+                "sha256": record.get("sha256"),
+                "size_bytes": record.get("size_bytes"),
+                "capabilities": capabilities,
+                "exported_symbol_count": record.get("exported_symbol_count") or 0,
+                "jni_symbol_count": record.get("jni_symbol_count") or 0,
+                "interesting_strings": compact_list(interesting_strings, 80),
+                "token_fingerprint": token_fingerprint(fingerprint_text),
+                "confidence": capability_confidence(capabilities, len(interesting_strings)),
+            }
+        )
+
+    for target in targets:
+        key = (str(target.get("library") or ""), str(target.get("name") or ""))
+        result = decompiled.get(key)
+        output_path = result.get("output_path") if result else None
+        pseudocode_excerpt = ""
+        if output_path:
+            pseudocode_excerpt = safe_read_text(Path(output_path), limit=4000)
+        capabilities = capability_names(target.get("capabilities") or [])
+        score = int(target.get("score") or 0)
+        fingerprint_text = "\n".join(
+            [
+                str(target.get("library") or ""),
+                str(target.get("kind") or ""),
+                str(target.get("name") or ""),
+                pseudocode_excerpt,
+            ]
+        )
+        units.append(
+            {
+                "unit_id": unit_id("native_target", target.get("library"), target.get("kind"), target.get("name")),
+                "phase": "phase3_native",
+                "kind": "native_target",
+                "library": target.get("library"),
+                "target_kind": target.get("kind"),
+                "name": target.get("name"),
+                "score": score,
+                "capabilities": capabilities,
+                "reasons": target.get("reasons") or [],
+                "decompiler_success": result.get("success") if result else None,
+                "decompiler_tool": result.get("tool") if result else None,
+                "pseudocode_path": output_path,
+                "pseudocode_excerpt": pseudocode_excerpt[:4000],
+                "token_fingerprint": token_fingerprint(fingerprint_text),
+                "confidence": min(0.95, 0.35 + min(score, 60) / 100 + 0.05 * len(capabilities)),
+            }
+        )
+
+    units.sort(
+        key=lambda item: (
+            -float(item.get("confidence") or 0),
+            item.get("kind") or "",
+            item.get("name") or "",
+        )
+    )
+    return units
+
+
 def run_phase3_multi(
     apk_paths: list[Path],
     workspace: Path,
@@ -190,22 +416,35 @@ def run_phase3_multi(
     force: bool = False,
     native_depth: str = "targeted",
     native_max_functions: int = 300,
-    native_timeout: int = 600,
+    native_decompiler: str = "auto",
+    native_max_libraries: int = 8,
+    native_max_decompile_targets: int = 40,
+    native_timeout_per_function: int = 90,
+    native_timeout_per_app: int = 3600,
+    native_target_capabilities: tuple[str, ...] = (),
 ) -> PhaseResult:
     output_dir = ensure_dir(workspace / "phase3_native")
     libs_dir = output_dir / "libs"
     analysis_path = output_dir / "native_analysis.json"
     targets_path = output_dir / "native_targets.json"
     decompile_path = output_dir / "native_decompilation.json"
+    function_index_path = output_dir / "native_function_index.json"
+    evidence_units_path = output_dir / "native_evidence_units.json"
+    deep_summary_path = output_dir / "native_deep_summary.json"
 
-    if analysis_path.exists() and targets_path.exists() and not force:
-        outputs = [analysis_path, targets_path]
-        if decompile_path.exists():
-            outputs.append(decompile_path)
+    output_paths = [
+        analysis_path,
+        targets_path,
+        decompile_path,
+        function_index_path,
+        evidence_units_path,
+        deep_summary_path,
+    ]
+    if all(path.exists() for path in output_paths) and not force:
         return PhaseResult(
             name="phase3_native",
             success=True,
-            output_paths=outputs,
+            output_paths=output_paths,
             details={"cached": True},
         )
 
@@ -219,27 +458,70 @@ def run_phase3_multi(
         abi_counts.update([str(record.get("abi"))])
         capability_counts.update(record.get("capability_counts") or {})
 
+    function_index = build_native_function_index(library_records)
+    safe_write_json(function_index_path, function_index)
+
     targets = (
         []
         if native_depth == "none"
-        else select_native_targets(library_records, max_targets=native_max_functions)
+        else select_native_targets(
+            library_records,
+            max_targets=native_max_functions,
+            max_libraries=native_max_libraries,
+            per_library_limit=max(20, native_max_functions // max(1, native_max_libraries)),
+            target_capabilities=native_target_capabilities,
+        )
     )
     target_payload = {
         "native_depth": native_depth,
+        "native_max_functions": native_max_functions,
+        "native_max_libraries": native_max_libraries,
+        "native_target_capabilities": list(native_target_capabilities),
         "target_count": len(targets),
         "targets": targets,
     }
     safe_write_json(targets_path, target_payload)
 
-    decompile_result: dict[str, Any] | None = None
-    if native_depth == "targeted" and targets:
+    decompile_result: dict[str, Any] | None = {
+        "status": "not_requested",
+        "message": "Use --native-depth deep to attempt native pseudocode generation.",
+        "attempted_targets": 0,
+        "results": [],
+    }
+    if native_depth == "deep" and targets:
         decompile_result = run_targeted_decompile(
             targets,
             output_dir / "decompiled_targets",
-            timeout=native_timeout,
-            max_targets=min(native_max_functions, 40),
+            decompiler=native_decompiler,
+            timeout_per_function=native_timeout_per_function,
+            timeout_per_app=native_timeout_per_app,
+            max_targets=min(native_max_functions, native_max_decompile_targets),
+            max_libraries=native_max_libraries,
+            target_capabilities=native_target_capabilities,
         )
-        safe_write_json(decompile_path, decompile_result)
+    safe_write_json(decompile_path, decompile_result)
+
+    native_evidence_units = build_native_evidence_units(library_records, targets, decompile_result)
+    safe_write_json(evidence_units_path, native_evidence_units)
+
+    deep_summary = {
+        "native_depth": native_depth,
+        "native_decompiler": native_decompiler,
+        "native_max_functions": native_max_functions,
+        "native_max_libraries": native_max_libraries,
+        "native_max_decompile_targets": native_max_decompile_targets,
+        "native_timeout_per_function": native_timeout_per_function,
+        "native_timeout_per_app": native_timeout_per_app,
+        "native_target_capabilities": list(native_target_capabilities),
+        "target_count": len(targets),
+        "function_index_path": str(function_index_path),
+        "evidence_units_path": str(evidence_units_path),
+        "decompilation_path": str(decompile_path),
+        "decompiler_status": decompile_result.get("status"),
+        "attempted_targets": decompile_result.get("attempted_targets"),
+        "successful_decompilations": sum(1 for item in decompile_result.get("results") or [] if item.get("success")),
+    }
+    safe_write_json(deep_summary_path, deep_summary)
 
     payload = {
         "apk_paths": [str(path) for path in apk_paths],
@@ -249,21 +531,22 @@ def run_phase3_multi(
         "libraries": library_records,
         "extraction_errors": extraction_errors,
         "targets_path": str(targets_path),
-        "decompilation_path": str(decompile_path) if decompile_result is not None else None,
+        "function_index_path": str(function_index_path),
+        "evidence_units_path": str(evidence_units_path),
+        "deep_summary_path": str(deep_summary_path),
+        "decompilation_path": str(decompile_path),
+        "native_evidence_unit_count": len(native_evidence_units),
     }
     safe_write_json(analysis_path, payload)
-
-    outputs = [analysis_path, targets_path]
-    if decompile_result is not None:
-        outputs.append(decompile_path)
 
     return PhaseResult(
         name="phase3_native",
         success=True,
-        output_paths=outputs,
+        output_paths=output_paths,
         details={
             "native_library_count": len(library_records),
             "target_count": len(targets),
+            "native_evidence_unit_count": len(native_evidence_units),
             "capability_counts": payload["capability_counts"],
             "decompiler_status": (decompile_result or {}).get("status"),
         },

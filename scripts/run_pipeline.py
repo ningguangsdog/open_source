@@ -30,9 +30,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--native-depth",
-        choices=["none", "basic", "targeted"],
+        choices=["none", "basic", "targeted", "deep"],
         default="targeted",
-        help="Native analysis depth. targeted selects high-value functions and uses a decompiler if available.",
+        help="Native analysis depth. targeted ranks evidence; deep also attempts native pseudocode.",
     )
     parser.add_argument(
         "--native-max-functions",
@@ -41,10 +41,39 @@ def parse_args() -> argparse.Namespace:
         help="Maximum ranked native targets to keep in phase3_native/native_targets.json.",
     )
     parser.add_argument(
-        "--native-timeout",
+        "--native-decompiler",
+        choices=["auto", "none", "rizin", "radare2", "ghidra", "retdec"],
+        default="auto",
+        help="Preferred native decompiler adapter for --native-depth deep.",
+    )
+    parser.add_argument(
+        "--native-max-libraries",
         type=int,
-        default=600,
-        help="Timeout in seconds for each optional native decompiler command.",
+        default=8,
+        help="Maximum native libraries selected for deeper native review.",
+    )
+    parser.add_argument(
+        "--native-max-decompile-targets",
+        type=int,
+        default=40,
+        help="Maximum native targets sent to the optional decompiler adapter.",
+    )
+    parser.add_argument(
+        "--native-timeout-per-function",
+        type=int,
+        default=90,
+        help="Timeout in seconds for one optional native decompiler command.",
+    )
+    parser.add_argument(
+        "--native-timeout-per-app",
+        type=int,
+        default=3600,
+        help="Total timeout budget in seconds for optional native decompilation.",
+    )
+    parser.add_argument(
+        "--native-target-capabilities",
+        default="",
+        help="Comma-separated capability names to prioritize during native target selection.",
     )
     parser.add_argument(
         "--no-resource-scan",
@@ -83,7 +112,16 @@ def main() -> int:
         emit_evidence_packets=not args.no_evidence_packets,
         native_depth=args.native_depth,
         native_max_functions=args.native_max_functions,
-        native_timeout=args.native_timeout,
+        native_decompiler=args.native_decompiler,
+        native_max_libraries=args.native_max_libraries,
+        native_max_decompile_targets=args.native_max_decompile_targets,
+        native_timeout_per_function=args.native_timeout_per_function,
+        native_timeout_per_app=args.native_timeout_per_app,
+        native_target_capabilities=tuple(
+            item.strip()
+            for item in args.native_target_capabilities.split(",")
+            if item.strip()
+        ),
         max_snippets_per_capability=args.max_snippets_per_capability,
     )
 

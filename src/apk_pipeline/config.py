@@ -18,5 +18,10 @@ class PipelineConfig:
     emit_evidence_packets: bool = True
     native_depth: str = "targeted"
     native_max_functions: int = 300
-    native_timeout: int = 600
+    native_decompiler: str = "auto"
+    native_max_libraries: int = 8
+    native_max_decompile_targets: int = 40
+    native_timeout_per_function: int = 90
+    native_timeout_per_app: int = 3600
+    native_target_capabilities: tuple[str, ...] = ()
     max_snippets_per_capability: int = 40

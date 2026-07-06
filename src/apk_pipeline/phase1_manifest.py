@@ -49,6 +49,15 @@ def _stringify_list(values: Any) -> list[str]:
     return [str(values)]
 
 
+def _build_apk_parser(apk_path: Path) -> Any:
+    try:
+        from androguard.core.apk import APK
+    except Exception:
+        from androguard.core.bytecodes.apk import APK  # type: ignore
+
+    return APK(str(apk_path))
+
+
 def _component_summary(apk_obj: Any) -> dict[str, list[str]]:
     components = {
         "activities": _stringify_list(_call(apk_obj, "get_activities", [])),
@@ -69,9 +78,7 @@ def _sdk_summary(apk_obj: Any) -> dict[str, Any]:
 
 def _extract_manifest_summary(apk_path: Path) -> dict[str, Any]:
     try:
-        from androguard.misc import AnalyzeAPK
-
-        apk_obj, _, _ = AnalyzeAPK(str(apk_path))
+        apk_obj = _build_apk_parser(apk_path)
     except Exception as exc:
         return {
             "apk": str(apk_path),
