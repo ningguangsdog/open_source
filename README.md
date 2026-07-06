@@ -24,7 +24,8 @@ The pipeline is designed for app-level capability review across many Android app
    - Extracts native `.so` libraries from all native-bearing APK splits.
    - Collects strings, exported symbols, JNI symbols, URLs, and capability signals.
    - Ranks high-value native targets automatically and writes a native function index.
-   - In the default `--native-depth auto` mode, optional pseudocode output is attempted only when high-value targets and a supported native decompiler are available.
+   - Writes a native toolchain preflight, decompile plan, function-level feature stream, string/xref view, and lightweight call graph.
+   - In the default `--native-depth auto` mode, optional pseudocode and function features are attempted only when high-value targets and a supported native decompiler are available.
 
 5. `phase4_resources`
    - Inventories local models, rule files, dictionaries, OCR assets, and other high-value resources.
@@ -33,7 +34,7 @@ The pipeline is designed for app-level capability review across many Android app
 
 6. `phase5_evidence`
    - Produces a compact review packet from the previous stages.
-   - Emits a JSONL evidence-unit stream, an app-level evidence graph, and a similarity-ready packet.
+   - Emits a JSONL evidence-unit stream, an app-level evidence graph, a Java/native bridge map, and a similarity-ready packet.
    - Similarity scoring is intentionally left out of this stage.
 
 ## Quick Start
@@ -62,15 +63,29 @@ python scripts/run_pipeline.py \
   --force
 ```
 
+Check native deep-analysis tool availability without running an APK:
+
+```bash
+python scripts/run_pipeline.py --native-preflight-only
+```
+
+For Colab-style environments, install or check native tools before the main run:
+
+```bash
+bash scripts/setup_native_tools_colab.sh
+python scripts/run_pipeline.py --native-preflight-only
+```
+
 ## Useful Options
 
 - `--no-decompile-all-splits`: only run JADX on the primary APK.
 - `--native-depth none`: skip native target ranking and optional native decompiler calls.
 - `--native-depth basic`: extract native metadata and ranked targets without decompiler attempts.
 - `--native-depth targeted`: extract native metadata, rank targets, and emit native evidence units.
-- `--native-depth auto`: default mode; rank native targets and automatically attempt pseudocode only when the target score and local tool availability justify it.
-- `--native-depth deep`: force a pseudocode attempt for selected native targets if a supported tool is available.
+- `--native-depth auto`: default mode; rank native targets and automatically attempt pseudocode/function-feature extraction only when the target score and local tool availability justify it.
+- `--native-depth deep`: force a pseudocode/function-feature attempt for selected native targets if a supported tool is available.
 - `--native-decompiler auto|none|rizin|radare2|ghidra|retdec`: select the optional native decompiler adapter.
+- `--native-preflight-only`: print native tool availability and exit.
 - `--native-max-libraries`: cap the number of native libraries selected for deeper review.
 - `--native-max-decompile-targets`: cap the number of native targets sent to the optional decompiler.
 - `--native-target-capabilities`: prioritize one or more capability names during native target selection.
@@ -93,7 +108,13 @@ apk_workspace/
   phase2_jadx/java_package_index.json
   phase3_native/native_analysis.json
   phase3_native/native_targets.json
+  phase3_native/native_toolchain.json
+  phase3_native/native_decompile_plan.json
+  phase3_native/native_decompilation.json
   phase3_native/native_function_index.json
+  phase3_native/native_function_features.jsonl
+  phase3_native/native_string_xrefs.json
+  phase3_native/native_callgraph.json
   phase3_native/native_evidence_units.json
   phase3_native/native_deep_summary.json
   phase4_resources/resource_inventory.json
@@ -104,7 +125,9 @@ apk_workspace/
   phase5_evidence/review_prompt.md
   phase5_evidence/evidence_units.jsonl
   phase5_evidence/evidence_graph.json
+  phase5_evidence/java_native_bridge_map.json
   phase5_evidence/similarity_ready_packet.json
+  run_manifest.json
   pipeline_summary.json
 ```
 
@@ -117,7 +140,21 @@ The most useful files for review are usually:
 - `phase2_jadx/java_evidence_units.json`
 - `phase3_native/native_targets.json`
 - `phase3_native/native_function_index.json`
+- `phase3_native/native_toolchain.json`
+- `phase3_native/native_decompile_plan.json`
+- `phase3_native/native_function_features.jsonl`
+- `phase3_native/native_string_xrefs.json`
+- `phase3_native/native_callgraph.json`
 - `phase4_resources/resource_inventory.json`
+- `phase5_evidence/java_native_bridge_map.json`
+
+## Native Deep Analysis
+
+JADX decompiles Dalvik bytecode and does not decompile native `.so` libraries. Native code requires a binary analysis tool. The automated native-deep adapter currently supports `rizin` and `radare2`.
+
+In `--native-depth auto`, the pipeline first ranks high-value native targets, writes `phase3_native/native_decompile_plan.json`, and attempts native pseudocode/function-feature extraction only when an automated adapter is available. If no adapter is available, the run still records the missing tool in `phase3_native/native_toolchain.json` and keeps the ranked target plan for follow-up.
+
+Function-level outputs include normalized instruction features, pseudocode fingerprints, basic block counts, string references, call targets, and a lightweight call graph. These are intended as evidence for downstream review and later similarity preparation, not as a complete source reconstruction.
 
 ## External Tools
 
@@ -126,6 +163,6 @@ The Python dependency list is intentionally small. Some stages use external comm
 - `jadx`: Java/Kotlin decompilation. If not installed, the runner can download the configured JADX release.
 - `strings`: native string extraction.
 - `readelf`, `llvm-readelf`, or `nm`: native symbol extraction.
-- `rizin` or `radare2`: optional targeted native pseudocode output.
+- `rizin` or `radare2`: optional targeted native pseudocode and function-feature output.
 
 If optional tools are missing, the pipeline records the missing capability in the phase output instead of stopping the whole run.

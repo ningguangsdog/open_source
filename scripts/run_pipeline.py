@@ -13,12 +13,13 @@ if str(SRC_DIR) not in sys.path:
 
 from apk_pipeline import APKPipeline, PipelineConfig
 from apk_pipeline.logging_utils import configure_logging
+from apk_pipeline.native_decompiler import detect_native_toolchain
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the APK research extraction pipeline.")
-    parser.add_argument("--apk", required=True, type=Path, help="Path to .apk, .apkm, .apks, or .xapk input.")
-    parser.add_argument("--workspace", required=True, type=Path, help="Directory for pipeline outputs.")
+    parser.add_argument("--apk", type=Path, help="Path to .apk, .apkm, .apks, or .xapk input.")
+    parser.add_argument("--workspace", type=Path, help="Directory for pipeline outputs.")
     parser.add_argument("--force", action="store_true", help="Recompute phases even when outputs already exist.")
     parser.add_argument("--jadx-version", default="1.5.0", help="JADX version to download when jadx is not installed.")
     parser.add_argument("--jadx-threads", default=4, type=int, help="Thread count passed to JADX.")
@@ -45,6 +46,11 @@ def parse_args() -> argparse.Namespace:
         choices=["auto", "none", "rizin", "radare2", "ghidra", "retdec"],
         default="auto",
         help="Preferred native decompiler adapter for auto/deep native analysis.",
+    )
+    parser.add_argument(
+        "--native-preflight-only",
+        action="store_true",
+        help="Print native toolchain availability and exit without running APK analysis.",
     )
     parser.add_argument(
         "--native-max-libraries",
@@ -98,6 +104,14 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     configure_logging(args.log_level)
+
+    if args.native_preflight_only:
+        import json
+
+        print(json.dumps(detect_native_toolchain(args.native_decompiler), indent=2, ensure_ascii=False))
+        return 0
+    if args.apk is None or args.workspace is None:
+        raise SystemExit("--apk and --workspace are required unless --native-preflight-only is used.")
 
     config = PipelineConfig(
         apk_path=args.apk,

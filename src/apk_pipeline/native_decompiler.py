@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 from collections import Counter
+import hashlib
+import json
 from pathlib import Path
+import re
 import time
 from typing import Any
 
 from .capability_taxonomy import capability_names, classify_text
-from .utils import ensure_dir, run_cmd, safe_name, safe_write_text, tool_exists
+from .evidence import token_fingerprint
+from .utils import ensure_dir, run_cmd, safe_name, safe_write_json, safe_write_text, tool_exists
 
 
 HIGH_VALUE_NAME_MARKERS = (
@@ -31,6 +35,8 @@ HIGH_VALUE_NAME_MARKERS = (
     "image",
     "model",
 )
+AUTOMATED_DECOMPILER_TOOLS = {"rizin", "radare2"}
+MAX_COMMAND_OUTPUT = 3_000_000
 
 
 def score_native_text(text: str) -> tuple[int, list[str], list[str]]:
@@ -188,35 +194,386 @@ def available_decompiler(preferred: str = "auto") -> str | None:
     return None
 
 
+def _tool_version(command: list[str], timeout: int = 10) -> str | None:
+    try:
+        completed = run_cmd(command, check=False, timeout=timeout)
+    except Exception:
+        return None
+    if completed.returncode != 0:
+        return None
+    text = (completed.stdout or completed.stderr or "").strip()
+    if not text:
+        return None
+    return text.splitlines()[0][:300]
+
+
+def detect_native_toolchain(preferred: str = "auto") -> dict[str, Any]:
+    """Return a machine-readable native analysis tool preflight."""
+
+    tools = {
+        "strings": {
+            "available": tool_exists("strings"),
+            "version": _tool_version(["strings", "--version"]) if tool_exists("strings") else None,
+        },
+        "readelf": {
+            "available": tool_exists("readelf"),
+            "version": _tool_version(["readelf", "--version"]) if tool_exists("readelf") else None,
+        },
+        "llvm-readelf": {
+            "available": tool_exists("llvm-readelf"),
+            "version": _tool_version(["llvm-readelf", "--version"]) if tool_exists("llvm-readelf") else None,
+        },
+        "nm": {
+            "available": tool_exists("nm"),
+            "version": _tool_version(["nm", "--version"]) if tool_exists("nm") else None,
+        },
+        "rizin": {
+            "available": tool_exists("rizin"),
+            "version": _tool_version(["rizin", "-v"]) if tool_exists("rizin") else None,
+            "automated_adapter": True,
+        },
+        "radare2": {
+            "available": tool_exists("r2"),
+            "version": _tool_version(["r2", "-v"]) if tool_exists("r2") else None,
+            "automated_adapter": True,
+        },
+        "retdec": {
+            "available": tool_exists("retdec-decompiler.py"),
+            "version": _tool_version(["retdec-decompiler.py", "--version"])
+            if tool_exists("retdec-decompiler.py")
+            else None,
+            "automated_adapter": False,
+        },
+        "ghidra": {
+            "available": tool_exists("analyzeHeadless"),
+            "version": _tool_version(["analyzeHeadless"]) if tool_exists("analyzeHeadless") else None,
+            "automated_adapter": False,
+        },
+    }
+    selected = available_decompiler(preferred)
+    return {
+        "preferred": preferred,
+        "selected_decompiler": selected,
+        "selected_adapter_automated": selected in AUTOMATED_DECOMPILER_TOOLS if selected else False,
+        "tools": tools,
+        "notes": [
+            "JADX handles Dalvik bytecode only; native .so files require a binary decompiler/disassembler.",
+            "The automated native-deep adapter currently uses rizin or radare2 when available.",
+        ],
+    }
+
+
+def _target_is_callable(target: dict[str, Any]) -> bool:
+    return target.get("kind") in {"jni_symbol", "exported_symbol"}
+
+
+def build_decompile_plan(
+    targets: list[dict[str, Any]],
+    *,
+    decompiler: str = "auto",
+    max_targets: int = 40,
+    max_libraries: int = 8,
+    target_capabilities: tuple[str, ...] | list[str] | set[str] = (),
+) -> dict[str, Any]:
+    """Select deterministic native targets for automated deep analysis."""
+
+    max_targets = max(1, max_targets)
+    max_libraries = max(1, max_libraries)
+    toolchain = detect_native_toolchain(decompiler)
+    selected_tool = toolchain.get("selected_decompiler")
+    desired_capabilities = {str(item) for item in target_capabilities if item}
+    callable_targets = [target for target in targets if _target_is_callable(target)]
+
+    if decompiler == "none":
+        status = "disabled"
+        reason = "Native decompilation was disabled by configuration."
+    elif not selected_tool:
+        status = "tool_missing"
+        reason = "Install rizin or radare2 to emit automated native function evidence."
+    elif selected_tool not in AUTOMATED_DECOMPILER_TOOLS:
+        status = "tool_present_not_automated"
+        reason = f"{selected_tool} is available, but this pipeline automates rizin/radare2 only."
+    else:
+        status = "ready"
+        reason = "Automated native decompiler adapter is available."
+
+    preferred_targets = [
+        target
+        for target in callable_targets
+        if not desired_capabilities or desired_capabilities.intersection(target.get("capabilities") or [])
+    ]
+    if not preferred_targets and desired_capabilities:
+        preferred_targets = callable_targets
+
+    budgeted: list[dict[str, Any]] = []
+    selection_counts: Counter[str] = Counter()
+    per_library_budget = max(1, (max_targets + max_libraries - 1) // max_libraries)
+    for target in preferred_targets:
+        library = str(target.get("library") or "")
+        if not library:
+            continue
+        if len(selection_counts) >= max_libraries and selection_counts[library] == 0:
+            continue
+        if selection_counts[library] >= per_library_budget:
+            continue
+        selection_counts[library] += 1
+        budgeted.append(target)
+        if len(budgeted) >= max_targets:
+            break
+
+    return {
+        "schema_version": "2026-07-05.native-deep-plan.v1",
+        "status": status,
+        "reason": reason,
+        "toolchain": toolchain,
+        "candidate_count": len(callable_targets),
+        "selected_target_count": len(budgeted),
+        "selected_libraries": dict(selection_counts),
+        "budgets": {
+            "max_targets": max_targets,
+            "max_libraries": max_libraries,
+            "per_library_budget": per_library_budget,
+        },
+        "target_capabilities": sorted(desired_capabilities),
+        "targets": budgeted,
+    }
+
+
+def _run_rizin_command(
+    tool: str,
+    library_path: Path,
+    commands: list[str],
+    timeout: int,
+) -> dict[str, Any]:
+    command: list[str] = [tool, "-2", "-q", "-A"]
+    for item in commands:
+        command.extend(["-c", item])
+    command.extend(["-c", "q", str(library_path)])
+    completed = run_cmd(command, check=False, timeout=timeout)
+    stdout = (completed.stdout or "")[-MAX_COMMAND_OUTPUT:]
+    stderr = (completed.stderr or "")[-20_000:]
+    return {
+        "returncode": completed.returncode,
+        "stdout": stdout,
+        "stderr": stderr,
+    }
+
+
+def _run_rizin_json(tool: str, library_path: Path, command: str, timeout: int) -> Any:
+    result = _run_rizin_command(tool, library_path, [command], timeout)
+    text = (result.get("stdout") or "").strip()
+    if not text:
+        return None
+    try:
+        return json.loads(text)
+    except Exception:
+        return None
+
+
+def _load_function_inventory(tool: str, library_path: Path, timeout: int) -> list[dict[str, Any]]:
+    payload = _run_rizin_json(tool, library_path, "aflj", timeout)
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    return []
+
+
+def _safe_seek_name(value: str) -> str:
+    if re.match(r"^[A-Za-z0-9_.$:@+-]+$", value):
+        return value
+    return safe_name(value)
+
+
+def _resolve_function_seek(target_name: str, functions: list[dict[str, Any]]) -> tuple[str, dict[str, Any] | None]:
+    for function in functions:
+        name = str(function.get("name") or "")
+        realname = str(function.get("realname") or "")
+        if target_name in {name, realname}:
+            offset = function.get("offset")
+            if isinstance(offset, int):
+                return hex(offset), function
+            return _safe_seek_name(name or target_name), function
+    for function in functions:
+        name = str(function.get("name") or "")
+        realname = str(function.get("realname") or "")
+        if target_name and (target_name in name or target_name in realname):
+            offset = function.get("offset")
+            if isinstance(offset, int):
+                return hex(offset), function
+            return _safe_seek_name(name or target_name), function
+    return _safe_seek_name(target_name), None
+
+
+def _jsonish_len(payload: Any, key: str) -> int:
+    if isinstance(payload, dict):
+        value = payload.get(key)
+        if isinstance(value, list):
+            return len(value)
+    if isinstance(payload, list):
+        return len(payload)
+    return 0
+
+
+def _ops_from_disasm(disasm_json: Any) -> list[dict[str, Any]]:
+    if isinstance(disasm_json, dict):
+        ops = disasm_json.get("ops")
+        if isinstance(ops, list):
+            return [op for op in ops if isinstance(op, dict)]
+    return []
+
+
+def _blocks_from_cfg(cfg_json: Any) -> list[dict[str, Any]]:
+    if isinstance(cfg_json, list) and cfg_json:
+        first = cfg_json[0]
+        if isinstance(first, dict) and isinstance(first.get("blocks"), list):
+            return [block for block in first["blocks"] if isinstance(block, dict)]
+    if isinstance(cfg_json, dict) and isinstance(cfg_json.get("blocks"), list):
+        return [block for block in cfg_json["blocks"] if isinstance(block, dict)]
+    return []
+
+
+def _extract_string_refs(ops: list[dict[str, Any]], pseudocode: str) -> list[str]:
+    refs: set[str] = set()
+    ref_re = re.compile(r"(?:str|aav|obj)\.[A-Za-z0-9_.$-]{3,}")
+    quoted_re = re.compile(r'"([^"\n]{4,160})"')
+    for op in ops:
+        text = " ".join(str(op.get(key) or "") for key in ("opcode", "disasm", "comment"))
+        for match in ref_re.findall(text):
+            refs.add(match)
+        for match in quoted_re.findall(text):
+            refs.add(match)
+    for match in quoted_re.findall(pseudocode):
+        refs.add(match)
+    return sorted(refs)[:100]
+
+
+def _extract_call_targets(ops: list[dict[str, Any]], xrefs_json: Any) -> list[str]:
+    calls: set[str] = set()
+    for op in ops:
+        op_type = str(op.get("type") or "")
+        opcode = str(op.get("opcode") or op.get("disasm") or "")
+        if op_type == "call" or opcode.startswith("bl ") or " call " in f" {opcode} ":
+            calls.add(opcode[:240])
+        refs = op.get("refs")
+        if isinstance(refs, list):
+            for ref in refs:
+                if isinstance(ref, dict) and str(ref.get("type") or "").lower() in {"call", "code"}:
+                    calls.add(str(ref.get("name") or ref.get("addr") or ref)[:240])
+    if isinstance(xrefs_json, list):
+        for ref in xrefs_json:
+            if not isinstance(ref, dict):
+                continue
+            ref_type = str(ref.get("type") or ref.get("perm") or "")
+            if "CALL" in ref_type.upper() or "code" in ref_type.lower():
+                calls.add(str(ref.get("name") or ref.get("from") or ref)[:240])
+    return sorted(calls)[:200]
+
+
+def _feature_hash(tokens: list[str]) -> str:
+    joined = "\n".join(tokens)
+    return hashlib.sha256(joined.encode("utf-8", errors="ignore")).hexdigest()
+
+
+def _build_function_features(
+    *,
+    target: dict[str, Any],
+    seek: str,
+    resolved_function: dict[str, Any] | None,
+    pseudocode: str,
+    function_info_json: Any,
+    disasm_json: Any,
+    cfg_json: Any,
+    xrefs_json: Any,
+) -> dict[str, Any]:
+    ops = _ops_from_disasm(disasm_json)
+    blocks = _blocks_from_cfg(cfg_json)
+    mnemonics = [
+        str(op.get("type") or str(op.get("opcode") or "").split(" ", 1)[0])
+        for op in ops
+        if op.get("type") or op.get("opcode")
+    ][:3000]
+    block_edges = 0
+    for block in blocks:
+        if block.get("jump") is not None:
+            block_edges += 1
+        if block.get("fail") is not None:
+            block_edges += 1
+    string_refs = _extract_string_refs(ops, pseudocode)
+    call_targets = _extract_call_targets(ops, xrefs_json)
+    normalized_tokens = [
+        str(target.get("library") or ""),
+        str(target.get("name") or ""),
+        *mnemonics,
+        *call_targets,
+        *string_refs,
+        token_fingerprint(pseudocode),
+    ]
+    return {
+        "schema_version": "2026-07-05.native-function-features.v1",
+        "library": target.get("library"),
+        "target_kind": target.get("kind"),
+        "name": target.get("name"),
+        "seek": seek,
+        "resolved_name": (resolved_function or {}).get("name"),
+        "resolved_offset": (resolved_function or {}).get("offset"),
+        "score": target.get("score"),
+        "capabilities": target.get("capabilities") or [],
+        "reasons": target.get("reasons") or [],
+        "instruction_count": len(ops),
+        "basic_block_count": len(blocks),
+        "cfg_edge_count": block_edges,
+        "xref_count": _jsonish_len(xrefs_json, "xrefs"),
+        "function_info_count": _jsonish_len(function_info_json, "functions"),
+        "mnemonic_sample": mnemonics[:200],
+        "call_targets": call_targets,
+        "string_refs": string_refs,
+        "pseudocode_fingerprint": token_fingerprint(pseudocode),
+        "feature_hash": _feature_hash(normalized_tokens),
+    }
+
+
 def _run_rizin_like(
     tool: str,
     library_path: Path,
-    target_name: str,
+    target: dict[str, Any],
     output_path: Path,
     timeout: int,
+    function_inventory: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    command = [
-        tool,
-        "-2",
-        "-q",
-        "-A",
-        "-c",
-        f"s {target_name}",
-        "-c",
-        "pdc",
-        "-c",
-        "q",
-        str(library_path),
-    ]
-    completed = run_cmd(command, check=False, timeout=timeout)
-    text = completed.stdout or completed.stderr
+    function_inventory = function_inventory or []
+    target_name = str(target.get("name") or "")
+    seek, resolved_function = _resolve_function_seek(target_name, function_inventory)
+    pseudo_result = _run_rizin_command(tool, library_path, [f"pdc @ {seek}"], timeout)
+    text = pseudo_result.get("stdout") or pseudo_result.get("stderr") or ""
     safe_write_text(output_path, text[-200_000:])
+    function_info_json = _run_rizin_json(tool, library_path, f"afij @ {seek}", timeout)
+    disasm_json = _run_rizin_json(tool, library_path, f"pdfj @ {seek}", timeout)
+    cfg_json = _run_rizin_json(tool, library_path, f"agfj @ {seek}", timeout)
+    xrefs_json = _run_rizin_json(tool, library_path, f"axtj @ {seek}", timeout)
+    features = _build_function_features(
+        target=target,
+        seek=seek,
+        resolved_function=resolved_function,
+        pseudocode=text,
+        function_info_json=function_info_json,
+        disasm_json=disasm_json,
+        cfg_json=cfg_json,
+        xrefs_json=xrefs_json,
+    )
     return {
-        "success": completed.returncode == 0 and bool(completed.stdout.strip()),
+        "success": int(pseudo_result.get("returncode") or 0) == 0 and bool(text.strip()),
         "tool": tool,
-        "returncode": completed.returncode,
+        "returncode": pseudo_result.get("returncode"),
         "output_path": str(output_path),
-        "stderr_tail": completed.stderr[-2000:],
+        "seek": seek,
+        "resolved_function": resolved_function,
+        "function_features": features,
+        "xrefs": xrefs_json if isinstance(xrefs_json, list) else [],
+        "cfg_summary": {
+            "basic_block_count": features["basic_block_count"],
+            "cfg_edge_count": features["cfg_edge_count"],
+            "instruction_count": features["instruction_count"],
+        },
+        "stderr_tail": str(pseudo_result.get("stderr") or "")[-2000:],
     }
 
 
@@ -236,65 +593,51 @@ def run_targeted_decompile(
     ensure_dir(output_dir)
     max_targets = max(1, max_targets)
     max_libraries = max(1, max_libraries)
-    if decompiler == "none":
+    plan = build_decompile_plan(
+        targets,
+        decompiler=decompiler,
+        max_targets=max_targets,
+        max_libraries=max_libraries,
+        target_capabilities=target_capabilities,
+    )
+    safe_write_json(output_dir / "native_decompile_plan.json", plan)
+
+    if plan["status"] == "disabled":
         return {
             "status": "disabled",
+            "plan": plan,
             "message": "Native decompilation was disabled by configuration.",
             "attempted_targets": 0,
             "results": [],
         }
 
-    tool = available_decompiler(decompiler)
-    if tool is None:
+    tool = plan.get("toolchain", {}).get("selected_decompiler")
+    if plan["status"] == "tool_missing":
         return {
             "status": "tool_missing",
+            "plan": plan,
             "requested_decompiler": decompiler,
             "message": "Install rizin, radare2, RetDec, or Ghidra headless to emit native pseudocode.",
             "attempted_targets": 0,
             "results": [],
         }
 
-    if tool in {"ghidra", "retdec"}:
+    if plan["status"] == "tool_present_not_automated":
         return {
             "status": "tool_present_not_automated",
             "tool": tool,
+            "plan": plan,
             "message": "The target selector ran; this adapter is reserved for a pinned decompiler setup.",
             "attempted_targets": 0,
             "results": [],
         }
 
     results: list[dict[str, Any]] = []
-    desired_capabilities = {str(item) for item in target_capabilities if item}
-    selected = [
-        target
-        for target in targets
-        if target.get("kind") in {"jni_symbol", "exported_symbol"}
-        and (not desired_capabilities or desired_capabilities.intersection(target.get("capabilities") or []))
-    ]
-    if not selected and desired_capabilities:
-        selected = [
-            target
-            for target in targets
-            if target.get("kind") in {"jni_symbol", "exported_symbol"}
-        ]
-
-    budgeted: list[dict[str, Any]] = []
-    selection_counts: Counter[str] = Counter()
-    for target in selected:
-        library = str(target.get("library") or "")
-        if len(selection_counts) >= max_libraries and selection_counts[library] == 0:
-            continue
-        per_library_budget = max(1, (max_targets + max_libraries - 1) // max_libraries)
-        if selection_counts[library] >= per_library_budget:
-            continue
-        selection_counts[library] += 1
-        budgeted.append(target)
-        if len(budgeted) >= max_targets:
-            break
-
     executable = "rizin" if tool == "rizin" else "r2"
     start_time = time.monotonic()
     attempted_counts: Counter[str] = Counter()
+    inventory_cache: dict[str, list[dict[str, Any]]] = {}
+    budgeted = [target for target in plan.get("targets") or [] if isinstance(target, dict)]
     for target in budgeted:
         if time.monotonic() - start_time > timeout_per_app:
             results.append(
@@ -318,14 +661,22 @@ def run_targeted_decompile(
             )
             continue
         attempted_counts[str(library_path)] += 1
+        inventory = inventory_cache.get(str(library_path))
+        if inventory is None:
+            try:
+                inventory = _load_function_inventory(executable, library_path, min(timeout_per_function, 120))
+            except Exception:
+                inventory = []
+            inventory_cache[str(library_path)] = inventory
         output_path = output_dir / f"{safe_name(library_path.name)}__{safe_name(str(target['name']))}.c"
         try:
             result = _run_rizin_like(
                 executable,
                 library_path,
-                str(target["name"]),
+                target,
                 output_path,
                 timeout_per_function,
+                function_inventory=inventory,
             )
             result["target"] = target
             results.append(result)
@@ -342,9 +693,10 @@ def run_targeted_decompile(
     return {
         "status": "completed",
         "tool": executable,
+        "plan": plan,
         "attempted_targets": len(budgeted),
         "libraries_attempted": dict(attempted_counts),
-        "libraries_selected": dict(selection_counts),
+        "libraries_selected": plan.get("selected_libraries") or {},
         "budget": {
             "max_targets": max_targets,
             "max_libraries": max_libraries,

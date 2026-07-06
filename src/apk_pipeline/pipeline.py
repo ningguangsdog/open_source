@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+from dataclasses import asdict
+from datetime import datetime, timezone
 import logging
 from pathlib import Path
+import platform
+import sys
 
 from .config import PipelineConfig
 from .input_resolver import ResolvedAPKInput, resolve_apk_input
@@ -18,6 +22,7 @@ from .utils import ensure_dir, safe_write_json
 
 
 logger = logging.getLogger(__name__)
+PIPELINE_VERSION_LABEL = "July 5 + Native Deep v1"
 
 
 def _input_resolution_dict(resolved: ResolvedAPKInput) -> dict[str, object]:
@@ -114,4 +119,25 @@ class APKPipeline:
             input_resolution=_input_resolution_dict(resolved),
         )
         safe_write_json(workspace / "pipeline_summary.json", summary.to_dict())
+        config_payload = asdict(self.config)
+        config_payload["apk_path"] = str(config_payload["apk_path"])
+        config_payload["workspace"] = str(config_payload["workspace"])
+        config_payload["native_target_capabilities"] = list(config_payload["native_target_capabilities"])
+        run_manifest = {
+            "schema_version": "2026-07-05.run-manifest.v1",
+            "pipeline_version_label": PIPELINE_VERSION_LABEL,
+            "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+            "python": sys.version.split()[0],
+            "platform": platform.platform(),
+            "config": config_payload,
+            "input_resolution": summary.input_resolution,
+            "phase_success": {phase.name: phase.success for phase in phases},
+            "phase_outputs": {
+                phase.name: [str(path) for path in phase.output_paths]
+                for phase in phases
+            },
+            "native_toolchain_path": str(workspace / "phase3_native" / "native_toolchain.json"),
+            "pipeline_summary_path": str(workspace / "pipeline_summary.json"),
+        }
+        safe_write_json(workspace / "run_manifest.json", run_manifest)
         return summary

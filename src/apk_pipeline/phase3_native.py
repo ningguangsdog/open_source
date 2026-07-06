@@ -9,9 +9,17 @@ from pathlib import Path
 from typing import Any
 
 from .capability_taxonomy import capability_names, classify_text
-from .evidence import capability_confidence, compact_list, token_fingerprint, unit_id
+from .evidence import capability_confidence, compact_list, token_fingerprint, unit_id, write_jsonl
 from .models import PhaseResult
-from .native_decompiler import available_decompiler, run_targeted_decompile, score_native_text, select_native_targets
+from .native_decompiler import (
+    AUTOMATED_DECOMPILER_TOOLS,
+    available_decompiler,
+    build_decompile_plan,
+    detect_native_toolchain,
+    run_targeted_decompile,
+    score_native_text,
+    select_native_targets,
+)
 from .utils import (
     ensure_dir,
     printable_strings_from_bytes,
@@ -29,7 +37,6 @@ MAX_STRINGS = 5000
 MAX_INTERESTING_STRINGS = 500
 AUTO_DEEP_MIN_SCORE = 18
 AUTO_DEEP_MIN_CAPABILITY_SCORE = 12
-AUTOMATED_DECOMPILER_TOOLS = {"rizin", "radare2"}
 
 
 def _native_entries(apk_path: Path) -> list[zipfile.ZipInfo]:
@@ -321,6 +328,85 @@ def _decompile_result_map(decompile_result: dict[str, Any] | None) -> dict[tuple
     return mapped
 
 
+def _collect_function_features(decompile_result: dict[str, Any] | None) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for result in (decompile_result or {}).get("results") or []:
+        features = result.get("function_features")
+        if isinstance(features, dict):
+            enriched = dict(features)
+            enriched["decompiler_success"] = result.get("success")
+            enriched["pseudocode_path"] = result.get("output_path")
+            rows.append(enriched)
+    rows.sort(
+        key=lambda item: (
+            str(item.get("library") or ""),
+            -int(item.get("score") or 0),
+            str(item.get("name") or ""),
+        )
+    )
+    return rows
+
+
+def _collect_string_xrefs(decompile_result: dict[str, Any] | None) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for result in (decompile_result or {}).get("results") or []:
+        target = result.get("target") or {}
+        features = result.get("function_features") or {}
+        string_refs = features.get("string_refs") or []
+        xrefs = result.get("xrefs") or []
+        if not string_refs and not xrefs:
+            continue
+        rows.append(
+            {
+                "library": target.get("library"),
+                "name": target.get("name"),
+                "target_kind": target.get("kind"),
+                "score": target.get("score"),
+                "capabilities": target.get("capabilities") or [],
+                "string_refs": string_refs,
+                "xrefs": xrefs[:200] if isinstance(xrefs, list) else [],
+                "pseudocode_path": result.get("output_path"),
+            }
+        )
+    return rows
+
+
+def _build_native_callgraph(decompile_result: dict[str, Any] | None) -> dict[str, Any]:
+    nodes: dict[str, dict[str, Any]] = {}
+    edges: list[dict[str, Any]] = []
+    for result in (decompile_result or {}).get("results") or []:
+        target = result.get("target") or {}
+        features = result.get("function_features") or {}
+        source = unit_id("native_function", target.get("library"), target.get("name"))
+        nodes[source] = {
+            "id": source,
+            "library": target.get("library"),
+            "name": target.get("name"),
+            "score": target.get("score"),
+            "capabilities": target.get("capabilities") or [],
+            "feature_hash": features.get("feature_hash"),
+        }
+        for call in features.get("call_targets") or []:
+            target_id = unit_id("native_call", target.get("library"), call)
+            nodes.setdefault(
+                target_id,
+                {
+                    "id": target_id,
+                    "library": target.get("library"),
+                    "name": call,
+                    "kind": "call_target",
+                },
+            )
+            edges.append({"source": source, "target": target_id, "type": "calls"})
+    return {
+        "schema_version": "2026-07-05.native-callgraph.v1",
+        "node_count": len(nodes),
+        "edge_count": len(edges),
+        "nodes": list(nodes.values()),
+        "edges": edges,
+    }
+
+
 def build_native_evidence_units(
     library_records: list[dict[str, Any]],
     targets: list[dict[str, Any]],
@@ -369,6 +455,9 @@ def build_native_evidence_units(
         key = (str(target.get("library") or ""), str(target.get("name") or ""))
         result = decompiled.get(key)
         output_path = result.get("output_path") if result else None
+        features = result.get("function_features") if result else None
+        if not isinstance(features, dict):
+            features = {}
         pseudocode_excerpt = ""
         if output_path:
             pseudocode_excerpt = safe_read_text(Path(output_path), limit=4000)
@@ -397,6 +486,13 @@ def build_native_evidence_units(
                 "decompiler_tool": result.get("tool") if result else None,
                 "pseudocode_path": output_path,
                 "pseudocode_excerpt": pseudocode_excerpt[:4000],
+                "feature_hash": features.get("feature_hash"),
+                "pseudocode_fingerprint": features.get("pseudocode_fingerprint"),
+                "instruction_count": features.get("instruction_count"),
+                "basic_block_count": features.get("basic_block_count"),
+                "cfg_edge_count": features.get("cfg_edge_count"),
+                "call_targets": compact_list(features.get("call_targets") or [], 80),
+                "string_refs": compact_list(features.get("string_refs") or [], 80),
                 "token_fingerprint": token_fingerprint(fingerprint_text),
                 "confidence": min(0.95, 0.35 + min(score, 60) / 100 + 0.05 * len(capabilities)),
             }
@@ -493,6 +589,11 @@ def run_phase3_multi(
     analysis_path = output_dir / "native_analysis.json"
     targets_path = output_dir / "native_targets.json"
     decompile_path = output_dir / "native_decompilation.json"
+    decompile_plan_path = output_dir / "native_decompile_plan.json"
+    toolchain_path = output_dir / "native_toolchain.json"
+    function_features_path = output_dir / "native_function_features.jsonl"
+    string_xrefs_path = output_dir / "native_string_xrefs.json"
+    callgraph_path = output_dir / "native_callgraph.json"
     function_index_path = output_dir / "native_function_index.json"
     evidence_units_path = output_dir / "native_evidence_units.json"
     deep_summary_path = output_dir / "native_deep_summary.json"
@@ -501,6 +602,11 @@ def run_phase3_multi(
         analysis_path,
         targets_path,
         decompile_path,
+        decompile_plan_path,
+        toolchain_path,
+        function_features_path,
+        string_xrefs_path,
+        callgraph_path,
         function_index_path,
         evidence_units_path,
         deep_summary_path,
@@ -516,6 +622,8 @@ def run_phase3_multi(
     extracted = _extract_native_libraries(apk_paths, libs_dir)
     library_records = [_analyze_library(record) for record in extracted if record.get("success")]
     extraction_errors = [record for record in extracted if not record.get("success")]
+    toolchain = detect_native_toolchain(native_decompiler)
+    safe_write_json(toolchain_path, toolchain)
 
     capability_counts: Counter[str] = Counter()
     abi_counts: Counter[str] = Counter()
@@ -546,6 +654,14 @@ def run_phase3_multi(
         "targets": targets,
     }
     safe_write_json(targets_path, target_payload)
+    decompile_plan = build_decompile_plan(
+        targets,
+        decompiler=native_decompiler if native_depth != "none" else "none",
+        max_targets=min(native_max_functions, native_max_decompile_targets),
+        max_libraries=native_max_libraries,
+        target_capabilities=native_target_capabilities,
+    )
+    safe_write_json(decompile_plan_path, decompile_plan)
 
     auto_decision = _auto_decompile_decision(targets, native_decompiler=native_decompiler)
     should_attempt_decompile = native_depth == "deep" or (
@@ -578,7 +694,17 @@ def run_phase3_multi(
             target_capabilities=native_target_capabilities,
         )
         decompile_result["auto_decision"] = auto_decision
+        if decompile_result.get("plan"):
+            decompile_plan = decompile_result["plan"]
+            safe_write_json(decompile_plan_path, decompile_plan)
     safe_write_json(decompile_path, decompile_result)
+
+    function_features = _collect_function_features(decompile_result)
+    write_jsonl(function_features_path, function_features)
+    string_xrefs = _collect_string_xrefs(decompile_result)
+    safe_write_json(string_xrefs_path, string_xrefs)
+    callgraph = _build_native_callgraph(decompile_result)
+    safe_write_json(callgraph_path, callgraph)
 
     native_evidence_units = build_native_evidence_units(library_records, targets, decompile_result)
     safe_write_json(evidence_units_path, native_evidence_units)
@@ -596,11 +722,20 @@ def run_phase3_multi(
         "should_attempt_decompile": should_attempt_decompile,
         "target_count": len(targets),
         "function_index_path": str(function_index_path),
+        "decompile_plan_path": str(decompile_plan_path),
         "evidence_units_path": str(evidence_units_path),
         "decompilation_path": str(decompile_path),
+        "toolchain_path": str(toolchain_path),
+        "function_features_path": str(function_features_path),
+        "string_xrefs_path": str(string_xrefs_path),
+        "callgraph_path": str(callgraph_path),
         "decompiler_status": decompile_result.get("status"),
         "attempted_targets": decompile_result.get("attempted_targets"),
         "successful_decompilations": sum(1 for item in decompile_result.get("results") or [] if item.get("success")),
+        "function_feature_count": len(function_features),
+        "string_xref_function_count": len(string_xrefs),
+        "callgraph_node_count": callgraph.get("node_count"),
+        "callgraph_edge_count": callgraph.get("edge_count"),
     }
     safe_write_json(deep_summary_path, deep_summary)
 
@@ -613,10 +748,16 @@ def run_phase3_multi(
         "extraction_errors": extraction_errors,
         "targets_path": str(targets_path),
         "function_index_path": str(function_index_path),
+        "decompile_plan_path": str(decompile_plan_path),
+        "toolchain_path": str(toolchain_path),
+        "function_features_path": str(function_features_path),
+        "string_xrefs_path": str(string_xrefs_path),
+        "callgraph_path": str(callgraph_path),
         "evidence_units_path": str(evidence_units_path),
         "deep_summary_path": str(deep_summary_path),
         "decompilation_path": str(decompile_path),
         "native_evidence_unit_count": len(native_evidence_units),
+        "native_function_feature_count": len(function_features),
     }
     safe_write_json(analysis_path, payload)
 

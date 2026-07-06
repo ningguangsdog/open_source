@@ -34,6 +34,23 @@ def _load_list(path: Path) -> list[dict[str, Any]]:
     return [item for item in payload if isinstance(item, dict)]
 
 
+def _load_jsonl(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    rows: list[dict[str, Any]] = []
+    for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            payload = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(payload, dict):
+            rows.append(payload)
+    return rows
+
+
 def _capability_label(name: str) -> str:
     for pattern in CAPABILITY_PATTERNS:
         if pattern.name == name:
@@ -87,6 +104,10 @@ def _extract_models(resource_inventory: dict[str, Any], max_models: int = 40) ->
                 "sha256": record.get("sha256"),
                 "format": metadata.get("format"),
                 "tflite_magic_present": metadata.get("tflite_magic_present"),
+                "tflite_magic_offsets": metadata.get("tflite_magic_offsets") or [],
+                "embedded_tflite_magic_present": metadata.get("embedded_tflite_magic_present"),
+                "likely_wrapped_or_encrypted": metadata.get("likely_wrapped_or_encrypted"),
+                "entropy_first_mb": metadata.get("entropy_first_mb"),
                 "operator_hints": metadata.get("operator_hints") or [],
                 "capabilities": capability_names((metadata.get("capabilities") or {}).keys()),
                 "strings_sample": (metadata.get("strings_sample") or [])[:20],
@@ -97,6 +118,17 @@ def _extract_models(resource_inventory: dict[str, Any], max_models: int = 40) ->
 
 def _extract_native_targets(native_targets: dict[str, Any], max_targets: int = 50) -> list[dict[str, Any]]:
     return (native_targets.get("targets") or [])[:max_targets]
+
+
+def _extract_native_deep_summary(workspace: Path) -> dict[str, Any]:
+    return {
+        "toolchain": _load_json(workspace / "phase3_native" / "native_toolchain.json"),
+        "decompile_plan": _load_json(workspace / "phase3_native" / "native_decompile_plan.json"),
+        "deep_summary": _load_json(workspace / "phase3_native" / "native_deep_summary.json"),
+        "function_features": _load_jsonl(workspace / "phase3_native" / "native_function_features.jsonl")[:100],
+        "string_xrefs": _load_list(workspace / "phase3_native" / "native_string_xrefs.json")[:100],
+        "callgraph": _load_json(workspace / "phase3_native" / "native_callgraph.json"),
+    }
 
 
 def _extract_urls(code_index: dict[str, Any], native_analysis: dict[str, Any]) -> dict[str, list[str]]:
@@ -133,6 +165,139 @@ def _collect_evidence_units(workspace: Path) -> list[dict[str, Any]]:
         )
     )
     return units
+
+
+def _lib_stems(values: list[str]) -> set[str]:
+    stems: set[str] = set()
+    for value in values:
+        text = str(value or "")
+        name = Path(text).name
+        if name.startswith("lib") and name.endswith(".so"):
+            stems.add(name[3:-3])
+        elif name.endswith(".so"):
+            stems.add(name[:-3])
+        else:
+            stems.add(name)
+    return {item for item in stems if item}
+
+
+def _jni_prefix(package: str | None, class_name: str | None, method: str) -> str:
+    package_part = str(package or "").replace(".", "_")
+    class_part = str(class_name or "").replace(".", "_").replace("$", "_")
+    base = "_".join(part for part in [package_part, class_part, method] if part)
+    return f"Java_{base}" if base else method
+
+
+def _build_java_native_bridge_map(
+    code_index: dict[str, Any],
+    native_analysis: dict[str, Any],
+    evidence_units: list[dict[str, Any]],
+) -> dict[str, Any]:
+    native_libraries: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    native_targets: list[dict[str, Any]] = []
+    for unit in evidence_units:
+        if unit.get("kind") == "native_library":
+            for stem in _lib_stems([str(unit.get("name") or ""), str(unit.get("library") or "")]):
+                native_libraries[stem].append(unit)
+        elif unit.get("kind") == "native_target":
+            native_targets.append(unit)
+
+    symbol_rows: list[dict[str, Any]] = []
+    for library in native_analysis.get("libraries") or []:
+        names = []
+        names.extend(library.get("jni_symbols") or [])
+        names.extend(library.get("exported_symbols") or [])
+        for name in names:
+            symbol_rows.append(
+                {
+                    "library": library.get("extracted_path") or library.get("entry"),
+                    "library_name": library.get("name"),
+                    "abi": library.get("abi"),
+                    "symbol": str(name),
+                }
+            )
+
+    mappings: list[dict[str, Any]] = []
+    for record in code_index.get("files") or []:
+        native_methods = record.get("native_methods") or []
+        load_libraries = record.get("load_libraries") or []
+        if not native_methods and not load_libraries:
+            continue
+        loaded_stems = _lib_stems([str(item) for item in load_libraries])
+        loaded_libraries = []
+        for stem in sorted(loaded_stems):
+            loaded_libraries.extend(native_libraries.get(stem) or [])
+
+        for method in native_methods or [None]:
+            expected = _jni_prefix(record.get("package"), record.get("class_name"), str(method or ""))
+            candidate_symbols = []
+            for row in symbol_rows:
+                row_stems = _lib_stems([str(row.get("library_name") or ""), str(row.get("library") or "")])
+                if loaded_stems and not loaded_stems.intersection(row_stems):
+                    continue
+                symbol = str(row.get("symbol") or "")
+                if method and (expected in symbol or symbol.endswith(f"_{method}") or f"_{method}__" in symbol):
+                    candidate_symbols.append(row)
+                elif not method and loaded_stems.intersection(row_stems):
+                    candidate_symbols.append(row)
+                if len(candidate_symbols) >= 40:
+                    break
+
+            candidate_targets = []
+            for target in native_targets:
+                target_stems = _lib_stems([str(target.get("library") or "")])
+                if loaded_stems and not loaded_stems.intersection(target_stems):
+                    continue
+                name = str(target.get("name") or "")
+                if method and not (
+                    expected in name or name.endswith(f"_{method}") or f"_{method}__" in name
+                ):
+                    continue
+                candidate_targets.append(
+                    {
+                        "unit_id": target.get("unit_id"),
+                        "library": target.get("library"),
+                        "name": target.get("name"),
+                        "score": target.get("score"),
+                        "feature_hash": target.get("feature_hash"),
+                        "pseudocode_path": target.get("pseudocode_path"),
+                    }
+                )
+                if len(candidate_targets) >= 40:
+                    break
+
+            mappings.append(
+                {
+                    "java_file": record.get("file"),
+                    "package": record.get("package"),
+                    "class_name": record.get("class_name"),
+                    "native_method": method,
+                    "expected_jni_prefix": expected if method else None,
+                    "load_libraries": load_libraries,
+                    "matched_native_libraries": [
+                        {
+                            "unit_id": item.get("unit_id"),
+                            "name": item.get("name"),
+                            "library": item.get("library"),
+                            "abi": item.get("abi"),
+                        }
+                        for item in loaded_libraries[:40]
+                    ],
+                    "candidate_symbols": candidate_symbols,
+                    "candidate_native_targets": candidate_targets,
+                    "confidence": "candidate" if candidate_symbols or candidate_targets else "library_only",
+                }
+            )
+
+    return {
+        "schema_version": "2026-07-05.java-native-bridge-map.v1",
+        "mapping_count": len(mappings),
+        "mappings": mappings,
+        "notes": [
+            "JNI matching is conservative and may miss obfuscated, dynamically registered, or overloaded methods.",
+            "Use candidate_symbols and candidate_native_targets as review links, not final attribution claims.",
+        ],
+    }
 
 
 def _build_evidence_graph(units: list[dict[str, Any]], manifest: dict[str, Any]) -> dict[str, Any]:
@@ -193,6 +358,9 @@ def _build_similarity_packet(
     capability_counts: dict[str, int],
     evidence_units: list[dict[str, Any]],
     graph_path: Path,
+    *,
+    native_deep_summary: dict[str, Any] | None = None,
+    bridge_map_path: Path | None = None,
 ) -> dict[str, Any]:
     kind_counts: Counter[str] = Counter(str(unit.get("kind") or "unknown") for unit in evidence_units)
     high_value = [
@@ -201,9 +369,37 @@ def _build_similarity_packet(
             "kind": unit.get("kind"),
             "phase": unit.get("phase"),
             "label": unit.get("normalized_signature") or unit.get("name") or unit.get("path") or unit.get("file"),
+            "file": unit.get("file"),
+            "path": unit.get("path"),
+            "line": unit.get("line"),
+            "apk": unit.get("apk"),
+            "entry": unit.get("entry"),
+            "split": unit.get("split"),
+            "package": unit.get("package"),
+            "class_name": unit.get("class_name"),
+            "method_names": unit.get("method_names"),
+            "native_methods": unit.get("native_methods"),
+            "native_libraries": unit.get("native_libraries"),
+            "library": unit.get("library"),
+            "target_kind": unit.get("target_kind"),
+            "name": unit.get("name"),
+            "model_path": unit.get("model_path") or unit.get("path"),
+            "sha256": unit.get("sha256"),
+            "size_bytes": unit.get("size_bytes"),
             "capabilities": unit.get("capabilities") or [],
             "confidence": unit.get("confidence"),
+            "score": unit.get("score"),
+            "reasons": unit.get("reasons"),
+            "feature_hash": unit.get("feature_hash"),
+            "pseudocode_path": unit.get("pseudocode_path"),
+            "pseudocode_fingerprint": unit.get("pseudocode_fingerprint"),
+            "instruction_count": unit.get("instruction_count"),
+            "basic_block_count": unit.get("basic_block_count"),
+            "cfg_edge_count": unit.get("cfg_edge_count"),
+            "call_targets": unit.get("call_targets"),
+            "string_refs": unit.get("string_refs"),
             "token_fingerprint": unit.get("token_fingerprint"),
+            "source_file": unit.get("source_file"),
         }
         for unit in evidence_units[:250]
     ]
@@ -223,11 +419,25 @@ def _build_similarity_packet(
         "evidence_unit_count": len(evidence_units),
         "evidence_units_by_kind": dict(sorted(kind_counts.items())),
         "high_value_units": high_value,
+        "native_deep": {
+            "decompiler_status": ((native_deep_summary or {}).get("deep_summary") or {}).get("decompiler_status"),
+            "attempted_targets": ((native_deep_summary or {}).get("deep_summary") or {}).get("attempted_targets"),
+            "successful_decompilations": ((native_deep_summary or {}).get("deep_summary") or {}).get(
+                "successful_decompilations"
+            ),
+            "selected_decompiler": ((native_deep_summary or {}).get("toolchain") or {}).get("selected_decompiler"),
+            "decompile_plan_status": ((native_deep_summary or {}).get("decompile_plan") or {}).get("status"),
+            "function_feature_count": len((native_deep_summary or {}).get("function_features") or []),
+            "string_xref_function_count": len((native_deep_summary or {}).get("string_xrefs") or []),
+            "callgraph_node_count": ((native_deep_summary or {}).get("callgraph") or {}).get("node_count"),
+            "callgraph_edge_count": ((native_deep_summary or {}).get("callgraph") or {}).get("edge_count"),
+        },
         "graph_path": str(graph_path),
+        "java_native_bridge_map_path": str(bridge_map_path) if bridge_map_path else None,
         "notes": [
             "This packet is intended for downstream review and similarity preparation.",
             "Hashes identify exact artifacts; token_fingerprint is a normalized static signal, not a similarity score.",
-            "Native pseudocode appears when auto/deep native analysis selects targets and an automated adapter is available.",
+            "Native pseudocode and function features appear when auto/deep native analysis selects targets and an automated adapter is available.",
         ],
     }
 
@@ -310,6 +520,23 @@ def _render_markdown(packet: dict[str, Any]) -> str:
         lines.append("- No high-value native targets were selected.")
     lines.append("")
 
+    native_deep = packet.get("native_deep") or {}
+    deep_summary = native_deep.get("deep_summary") or {}
+    toolchain = native_deep.get("toolchain") or {}
+    decompile_plan = native_deep.get("decompile_plan") or {}
+    lines.append("## Native Deep Evidence")
+    lines.append(f"- Selected decompiler: {toolchain.get('selected_decompiler') or 'none'}")
+    lines.append(f"- Decompile plan status: {decompile_plan.get('status') or 'unknown'}")
+    lines.append(f"- Decompiler status: {deep_summary.get('decompiler_status') or 'unknown'}")
+    lines.append(f"- Attempted targets: {deep_summary.get('attempted_targets') or 0}")
+    lines.append(f"- Successful decompilations: {deep_summary.get('successful_decompilations') or 0}")
+    lines.append(f"- Function feature rows: {len(native_deep.get('function_features') or [])}")
+    callgraph = native_deep.get("callgraph") or {}
+    lines.append(f"- Callgraph: {callgraph.get('node_count') or 0} nodes, {callgraph.get('edge_count') or 0} edges")
+    if (decompile_plan.get("status") or "") == "tool_missing":
+        lines.append("- Native pseudocode was not generated because no automated native decompiler was available.")
+    lines.append("")
+
     snippets_by_capability = packet.get("code_snippets") or {}
     lines.append("## Code Evidence")
     if snippets_by_capability:
@@ -366,6 +593,7 @@ def run_phase5_evidence(workspace: Path, *, force: bool = False) -> PhaseResult:
     evidence_jsonl_path = output_dir / "evidence_units.jsonl"
     graph_path = output_dir / "evidence_graph.json"
     similarity_packet_path = output_dir / "similarity_ready_packet.json"
+    bridge_map_path = output_dir / "java_native_bridge_map.json"
 
     output_paths = [
         packet_json_path,
@@ -374,6 +602,7 @@ def run_phase5_evidence(workspace: Path, *, force: bool = False) -> PhaseResult:
         evidence_jsonl_path,
         graph_path,
         similarity_packet_path,
+        bridge_map_path,
     ]
     if all(path.exists() for path in output_paths) and not force:
         return PhaseResult(
@@ -398,12 +627,16 @@ def run_phase5_evidence(workspace: Path, *, force: bool = False) -> PhaseResult:
     evidence_units = _collect_evidence_units(workspace)
     evidence_kind_counts = Counter(str(unit.get("kind") or "unknown") for unit in evidence_units)
     evidence_graph = _build_evidence_graph(evidence_units, manifest)
+    native_deep_summary = _extract_native_deep_summary(workspace)
+    bridge_map = _build_java_native_bridge_map(code_index, native_analysis, evidence_units)
     similarity_packet = _build_similarity_packet(
         manifest,
         split_inventory,
         capability_counts,
         evidence_units,
         graph_path,
+        native_deep_summary=native_deep_summary,
+        bridge_map_path=bridge_map_path,
     )
 
     packet = {
@@ -412,6 +645,11 @@ def run_phase5_evidence(workspace: Path, *, force: bool = False) -> PhaseResult:
         "capability_counts": capability_counts,
         "models": _extract_models(resource_inventory),
         "native_targets": _extract_native_targets(native_targets),
+        "native_deep": native_deep_summary,
+        "java_native_bridge_map": {
+            "mapping_count": bridge_map.get("mapping_count"),
+            "path": str(bridge_map_path),
+        },
         "code_snippets": _extract_code_snippets(code_index),
         "urls": _extract_urls(code_index, native_analysis),
         "evidence_units_summary": {
@@ -428,6 +666,13 @@ def run_phase5_evidence(workspace: Path, *, force: bool = False) -> PhaseResult:
             "java_evidence_units": str(workspace / "phase2_jadx" / "java_evidence_units.json"),
             "native_analysis": str(workspace / "phase3_native" / "native_analysis.json"),
             "native_targets": str(workspace / "phase3_native" / "native_targets.json"),
+            "native_toolchain": str(workspace / "phase3_native" / "native_toolchain.json"),
+            "native_decompile_plan": str(workspace / "phase3_native" / "native_decompile_plan.json"),
+            "native_decompilation": str(workspace / "phase3_native" / "native_decompilation.json"),
+            "native_function_features": str(workspace / "phase3_native" / "native_function_features.jsonl"),
+            "native_string_xrefs": str(workspace / "phase3_native" / "native_string_xrefs.json"),
+            "native_callgraph": str(workspace / "phase3_native" / "native_callgraph.json"),
+            "native_deep_summary": str(workspace / "phase3_native" / "native_deep_summary.json"),
             "native_evidence_units": str(workspace / "phase3_native" / "native_evidence_units.json"),
             "resource_inventory": str(workspace / "phase4_resources" / "resource_inventory.json"),
             "model_evidence_units": str(workspace / "phase4_resources" / "model_evidence_units.json"),
@@ -437,6 +682,7 @@ def run_phase5_evidence(workspace: Path, *, force: bool = False) -> PhaseResult:
 
     write_jsonl(evidence_jsonl_path, evidence_units)
     safe_write_json(graph_path, evidence_graph)
+    safe_write_json(bridge_map_path, bridge_map)
     safe_write_json(similarity_packet_path, similarity_packet)
     safe_write_json(packet_json_path, packet)
     safe_write_text(packet_md_path, _render_markdown(packet))
@@ -451,6 +697,7 @@ def run_phase5_evidence(workspace: Path, *, force: bool = False) -> PhaseResult:
             "model_count": len(packet["models"]),
             "native_target_count": len(packet["native_targets"]),
             "evidence_unit_count": len(evidence_units),
+            "java_native_bridge_mapping_count": bridge_map.get("mapping_count"),
             "similarity_packet": str(similarity_packet_path),
             "packet_md": str(packet_md_path),
             "prompt": str(prompt_path),
