@@ -11,7 +11,7 @@ from typing import Any
 from .capability_taxonomy import capability_names, classify_text
 from .evidence import capability_confidence, compact_list, token_fingerprint, unit_id
 from .models import PhaseResult
-from .native_decompiler import run_targeted_decompile, score_native_text, select_native_targets
+from .native_decompiler import available_decompiler, run_targeted_decompile, score_native_text, select_native_targets
 from .utils import (
     ensure_dir,
     printable_strings_from_bytes,
@@ -27,6 +27,8 @@ from .utils import (
 URL_RE = re.compile(r"https?://[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+")
 MAX_STRINGS = 5000
 MAX_INTERESTING_STRINGS = 500
+AUTO_DEEP_MIN_SCORE = 18
+AUTO_DEEP_MIN_CAPABILITY_SCORE = 12
 
 
 def _native_entries(apk_path: Path) -> list[zipfile.ZipInfo]:
@@ -409,12 +411,67 @@ def build_native_evidence_units(
     return units
 
 
+def _auto_decompile_decision(
+    targets: list[dict[str, Any]],
+    *,
+    native_decompiler: str,
+) -> dict[str, Any]:
+    callable_targets = [
+        target
+        for target in targets
+        if target.get("kind") in {"jni_symbol", "exported_symbol"}
+    ]
+    if not callable_targets:
+        return {
+            "attempt": False,
+            "reason": "no_callable_native_targets",
+            "candidate_count": 0,
+            "available_decompiler": available_decompiler(native_decompiler),
+        }
+
+    tool = available_decompiler(native_decompiler)
+    if not tool:
+        return {
+            "attempt": False,
+            "reason": "decompiler_missing",
+            "candidate_count": len(callable_targets),
+            "available_decompiler": None,
+        }
+
+    high_value_targets = [
+        target
+        for target in callable_targets
+        if int(target.get("score") or 0) >= AUTO_DEEP_MIN_SCORE
+        or (
+            bool(target.get("capabilities"))
+            and int(target.get("score") or 0) >= AUTO_DEEP_MIN_CAPABILITY_SCORE
+        )
+    ]
+    if high_value_targets:
+        return {
+            "attempt": True,
+            "reason": "high_value_native_targets",
+            "candidate_count": len(callable_targets),
+            "high_value_target_count": len(high_value_targets),
+            "available_decompiler": tool,
+            "top_score": max(int(target.get("score") or 0) for target in high_value_targets),
+        }
+
+    return {
+        "attempt": False,
+        "reason": "low_value_native_targets",
+        "candidate_count": len(callable_targets),
+        "available_decompiler": tool,
+        "top_score": max(int(target.get("score") or 0) for target in callable_targets),
+    }
+
+
 def run_phase3_multi(
     apk_paths: list[Path],
     workspace: Path,
     *,
     force: bool = False,
-    native_depth: str = "targeted",
+    native_depth: str = "auto",
     native_max_functions: int = 300,
     native_decompiler: str = "auto",
     native_max_libraries: int = 8,
@@ -482,13 +539,26 @@ def run_phase3_multi(
     }
     safe_write_json(targets_path, target_payload)
 
-    decompile_result: dict[str, Any] | None = {
+    auto_decision = _auto_decompile_decision(targets, native_decompiler=native_decompiler)
+    should_attempt_decompile = native_depth == "deep" or (
+        native_depth == "auto" and bool(auto_decision.get("attempt"))
+    )
+    decompile_result: dict[str, Any] = {
         "status": "not_requested",
-        "message": "Use --native-depth deep to attempt native pseudocode generation.",
+        "message": "Native pseudocode generation was not requested by this native_depth setting.",
+        "auto_decision": auto_decision,
         "attempted_targets": 0,
         "results": [],
     }
-    if native_depth == "deep" and targets:
+    if native_depth == "auto" and not should_attempt_decompile:
+        decompile_result = {
+            "status": "auto_skipped",
+            "message": "Auto mode skipped native pseudocode generation.",
+            "auto_decision": auto_decision,
+            "attempted_targets": 0,
+            "results": [],
+        }
+    if should_attempt_decompile and targets:
         decompile_result = run_targeted_decompile(
             targets,
             output_dir / "decompiled_targets",
@@ -499,6 +569,7 @@ def run_phase3_multi(
             max_libraries=native_max_libraries,
             target_capabilities=native_target_capabilities,
         )
+        decompile_result["auto_decision"] = auto_decision
     safe_write_json(decompile_path, decompile_result)
 
     native_evidence_units = build_native_evidence_units(library_records, targets, decompile_result)
@@ -513,6 +584,8 @@ def run_phase3_multi(
         "native_timeout_per_function": native_timeout_per_function,
         "native_timeout_per_app": native_timeout_per_app,
         "native_target_capabilities": list(native_target_capabilities),
+        "auto_decision": auto_decision,
+        "should_attempt_decompile": should_attempt_decompile,
         "target_count": len(targets),
         "function_index_path": str(function_index_path),
         "evidence_units_path": str(evidence_units_path),

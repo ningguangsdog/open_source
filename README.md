@@ -24,7 +24,7 @@ The pipeline is designed for app-level capability review across many Android app
    - Extracts native `.so` libraries from all native-bearing APK splits.
    - Collects strings, exported symbols, JNI symbols, URLs, and capability signals.
    - Ranks high-value native targets automatically and writes a native function index.
-   - Optional pseudocode output is attempted only in `--native-depth deep`.
+   - In the default `--native-depth auto` mode, optional pseudocode output is attempted only when high-value targets and a supported native decompiler are available.
 
 5. `phase4_resources`
    - Inventories local models, rule files, dictionaries, OCR assets, and other high-value resources.
@@ -68,7 +68,8 @@ python scripts/run_pipeline.py \
 - `--native-depth none`: skip native target ranking and optional native decompiler calls.
 - `--native-depth basic`: extract native metadata and ranked targets without decompiler attempts.
 - `--native-depth targeted`: extract native metadata, rank targets, and emit native evidence units.
-- `--native-depth deep`: run targeted mode and attempt native pseudocode if a supported tool is available.
+- `--native-depth auto`: default mode; rank native targets and automatically attempt pseudocode only when the target score and local tool availability justify it.
+- `--native-depth deep`: force a pseudocode attempt for selected native targets if a supported tool is available.
 - `--native-decompiler auto|none|rizin|radare2|ghidra|retdec`: select the optional native decompiler adapter.
 - `--native-max-libraries`: cap the number of native libraries selected for deeper review.
 - `--native-max-decompile-targets`: cap the number of native targets sent to the optional decompiler.

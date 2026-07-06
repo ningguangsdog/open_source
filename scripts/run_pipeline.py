@@ -30,9 +30,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--native-depth",
-        choices=["none", "basic", "targeted", "deep"],
-        default="targeted",
-        help="Native analysis depth. targeted ranks evidence; deep also attempts native pseudocode.",
+        choices=["none", "basic", "targeted", "auto", "deep"],
+        default="auto",
+        help="Native analysis depth. auto ranks evidence and attempts pseudocode only for high-value targets.",
     )
     parser.add_argument(
         "--native-max-functions",
@@ -44,7 +44,7 @@ def parse_args() -> argparse.Namespace:
         "--native-decompiler",
         choices=["auto", "none", "rizin", "radare2", "ghidra", "retdec"],
         default="auto",
-        help="Preferred native decompiler adapter for --native-depth deep.",
+        help="Preferred native decompiler adapter for auto/deep native analysis.",
     )
     parser.add_argument(
         "--native-max-libraries",

@@ -16,7 +16,7 @@ class PipelineConfig:
     decompile_all_splits: bool = True
     resource_scan: bool = True
     emit_evidence_packets: bool = True
-    native_depth: str = "targeted"
+    native_depth: str = "auto"
     native_max_functions: int = 300
     native_decompiler: str = "auto"
     native_max_libraries: int = 8
