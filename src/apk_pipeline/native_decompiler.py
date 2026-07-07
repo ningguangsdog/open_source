@@ -264,7 +264,13 @@ def detect_native_toolchain(preferred: str = "auto") -> dict[str, Any]:
 
 
 def _target_is_callable(target: dict[str, Any]) -> bool:
-    return target.get("kind") in {"jni_symbol", "exported_symbol"}
+    return target.get("kind") in {
+        "jni_symbol",
+        "exported_symbol",
+        "profile_seed",
+        "internal_callee",
+        "address",
+    }
 
 
 def build_decompile_plan(

@@ -131,6 +131,21 @@ def _extract_native_deep_summary(workspace: Path) -> dict[str, Any]:
     }
 
 
+def _collect_native_probe_summaries(workspace: Path) -> list[dict[str, Any]]:
+    probe_root = workspace / "phase3_native" / "probes"
+    summaries: list[dict[str, Any]] = []
+    if not probe_root.exists():
+        return summaries
+    for summary_path in sorted(probe_root.glob("*/native_probe_summary.json")):
+        summary = _load_json(summary_path)
+        if not summary:
+            continue
+        enriched = dict(summary)
+        enriched.setdefault("summary_path", str(summary_path))
+        summaries.append(enriched)
+    return summaries
+
+
 def _extract_urls(code_index: dict[str, Any], native_analysis: dict[str, Any]) -> dict[str, list[str]]:
     code_urls = list((code_index.get("urls") or {}).keys())[:100]
     native_urls: list[str] = []
@@ -156,6 +171,14 @@ def _collect_evidence_units(workspace: Path) -> list[dict[str, Any]]:
             enriched.setdefault("source_file", str(source))
             enriched.setdefault("unit_id", unit_id(source.name, len(units), row.get("kind"), row.get("file") or row.get("path")))
             units.append(enriched)
+    probe_root = workspace / "phase3_native" / "probes"
+    if probe_root.exists():
+        for source in sorted(probe_root.glob("*/native_probe_review_units.jsonl")):
+            for row in _load_jsonl(source):
+                enriched = dict(row)
+                enriched.setdefault("source_file", str(source))
+                enriched.setdefault("unit_id", unit_id(source.name, len(units), row.get("library"), row.get("name")))
+                units.append(enriched)
     units.sort(
         key=lambda item: (
             -float(item.get("confidence") or 0),
@@ -360,6 +383,7 @@ def _build_similarity_packet(
     graph_path: Path,
     *,
     native_deep_summary: dict[str, Any] | None = None,
+    native_probe_summaries: list[dict[str, Any]] | None = None,
     bridge_map_path: Path | None = None,
 ) -> dict[str, Any]:
     kind_counts: Counter[str] = Counter(str(unit.get("kind") or "unknown") for unit in evidence_units)
@@ -432,6 +456,7 @@ def _build_similarity_packet(
             "callgraph_node_count": ((native_deep_summary or {}).get("callgraph") or {}).get("node_count"),
             "callgraph_edge_count": ((native_deep_summary or {}).get("callgraph") or {}).get("edge_count"),
         },
+        "native_probes": native_probe_summaries or [],
         "graph_path": str(graph_path),
         "java_native_bridge_map_path": str(bridge_map_path) if bridge_map_path else None,
         "notes": [
@@ -537,6 +562,25 @@ def _render_markdown(packet: dict[str, Any]) -> str:
         lines.append("- Native pseudocode was not generated because no automated native decompiler was available.")
     lines.append("")
 
+    native_probes = packet.get("native_probes") or []
+    lines.append("## Native Deep Probes")
+    if native_probes:
+        for probe in native_probes:
+            profile = probe.get("profile") or {}
+            paths = probe.get("paths") or {}
+            lines.append(f"- Profile: `{profile.get('name') or 'unknown'}`")
+            lines.append(f"  - Seed targets: {probe.get('seed_target_count', 0)}")
+            lines.append(f"  - Expanded targets: {probe.get('expanded_target_count', 0)}")
+            lines.append(f"  - Attempted targets: {probe.get('attempted_targets', 0)}")
+            lines.append(f"  - Successful decompilations: {probe.get('successful_decompilations', 0)}")
+            lines.append(f"  - Function features: {probe.get('function_feature_count', 0)}")
+            lines.append(f"  - Outcome counts: {probe.get('outcome_counts') or {}}")
+            if paths.get("review_units"):
+                lines.append(f"  - Review units: {paths.get('review_units')}")
+    else:
+        lines.append("- No native deep probe outputs were found.")
+    lines.append("")
+
     snippets_by_capability = packet.get("code_snippets") or {}
     lines.append("## Code Evidence")
     if snippets_by_capability:
@@ -628,6 +672,7 @@ def run_phase5_evidence(workspace: Path, *, force: bool = False) -> PhaseResult:
     evidence_kind_counts = Counter(str(unit.get("kind") or "unknown") for unit in evidence_units)
     evidence_graph = _build_evidence_graph(evidence_units, manifest)
     native_deep_summary = _extract_native_deep_summary(workspace)
+    native_probe_summaries = _collect_native_probe_summaries(workspace)
     bridge_map = _build_java_native_bridge_map(code_index, native_analysis, evidence_units)
     similarity_packet = _build_similarity_packet(
         manifest,
@@ -636,6 +681,7 @@ def run_phase5_evidence(workspace: Path, *, force: bool = False) -> PhaseResult:
         evidence_units,
         graph_path,
         native_deep_summary=native_deep_summary,
+        native_probe_summaries=native_probe_summaries,
         bridge_map_path=bridge_map_path,
     )
 
@@ -646,6 +692,7 @@ def run_phase5_evidence(workspace: Path, *, force: bool = False) -> PhaseResult:
         "models": _extract_models(resource_inventory),
         "native_targets": _extract_native_targets(native_targets),
         "native_deep": native_deep_summary,
+        "native_probes": native_probe_summaries,
         "java_native_bridge_map": {
             "mapping_count": bridge_map.get("mapping_count"),
             "path": str(bridge_map_path),
@@ -677,6 +724,7 @@ def run_phase5_evidence(workspace: Path, *, force: bool = False) -> PhaseResult:
             "resource_inventory": str(workspace / "phase4_resources" / "resource_inventory.json"),
             "model_evidence_units": str(workspace / "phase4_resources" / "model_evidence_units.json"),
             "resource_evidence_units": str(workspace / "phase4_resources" / "resource_evidence_units.json"),
+            "native_probes": str(workspace / "phase3_native" / "probes"),
         },
     }
 
@@ -696,6 +744,7 @@ def run_phase5_evidence(workspace: Path, *, force: bool = False) -> PhaseResult:
             "capabilities": capability_names(packet["capability_counts"].keys()),
             "model_count": len(packet["models"]),
             "native_target_count": len(packet["native_targets"]),
+            "native_probe_count": len(native_probe_summaries),
             "evidence_unit_count": len(evidence_units),
             "java_native_bridge_mapping_count": bridge_map.get("mapping_count"),
             "similarity_packet": str(similarity_packet_path),

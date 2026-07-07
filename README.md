@@ -115,6 +115,8 @@ apk_workspace/
   phase3_native/native_function_features.jsonl
   phase3_native/native_string_xrefs.json
   phase3_native/native_callgraph.json
+  phase3_native/probes/<profile>/native_probe_summary.json
+  phase3_native/probes/<profile>/native_probe_review_units.jsonl
   phase3_native/native_evidence_units.json
   phase3_native/native_deep_summary.json
   phase4_resources/resource_inventory.json
@@ -145,6 +147,8 @@ The most useful files for review are usually:
 - `phase3_native/native_function_features.jsonl`
 - `phase3_native/native_string_xrefs.json`
 - `phase3_native/native_callgraph.json`
+- `phase3_native/probes/<profile>/native_probe_summary.json`
+- `phase3_native/probes/<profile>/native_probe_review_units.jsonl`
 - `phase4_resources/resource_inventory.json`
 - `phase5_evidence/java_native_bridge_map.json`
 
@@ -155,6 +159,36 @@ JADX decompiles Dalvik bytecode and does not decompile native `.so` libraries. N
 In `--native-depth auto`, the pipeline first ranks high-value native targets, writes `phase3_native/native_decompile_plan.json`, and attempts native pseudocode/function-feature extraction only when an automated adapter is available. If no adapter is available, the run still records the missing tool in `phase3_native/native_toolchain.json` and keeps the ranked target plan for follow-up.
 
 Function-level outputs include normalized instruction features, pseudocode fingerprints, basic block counts, string references, call targets, and a lightweight call graph. These are intended as evidence for downstream review and later similarity preparation, not as a complete source reconstruction.
+
+## Focused Native Probes
+
+After a full pipeline run has produced `phase3_native/native_function_index.json`, a focused native-only probe can re-use the workspace and run deeper target selection without rerunning manifest, JADX, or resource extraction.
+
+The initial focused profile is `adobe_acrobat_deep`. It is an experiment profile for Adobe Acrobat samples and is kept separate from the default general pipeline.
+
+```bash
+python scripts/run_native_deep_probe.py \
+  --workspace ./apk_workspace \
+  --profile adobe_acrobat_deep \
+  --force
+```
+
+The probe writes its results under:
+
+```text
+phase3_native/probes/adobe_acrobat_deep/
+```
+
+Key probe outputs:
+
+- `native_probe_targets.json`: profile-selected seed targets.
+- `native_probe_decompile_plan.json`: decompiler plan and budgets.
+- `native_probe_decompilation.json`: target-level decompiler results.
+- `native_probe_function_features.jsonl`: function-level features from successful outputs.
+- `native_probe_review_units.jsonl`: per-target outcome classification for review.
+- `native_probe_summary.json`: summary counts and output paths.
+
+When the probe completes, phase 5 evidence packets are refreshed by default so the probe review units are included in `phase5_evidence/evidence_units.jsonl` and `phase5_evidence/similarity_ready_packet.json`.
 
 ## External Tools
 
