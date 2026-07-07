@@ -86,13 +86,14 @@
     "compression",
     "crypto"
   ],
+  "default_feature_detail": "pseudocode",
   "default_limits": {
     "max_seed_targets": 80,
-    "max_decompile_targets": 48,
-    "max_libraries": 8,
-    "timeout_per_function": 120,
-    "timeout_per_app": 7200,
+    "max_decompile_targets": 24,
+    "max_libraries": 6,
+    "timeout_per_function": 60,
+    "timeout_per_app": 3600,
     "expansion_rounds": 1,
-    "max_expanded_targets": 24
+    "max_expanded_targets": 8
   }
 }

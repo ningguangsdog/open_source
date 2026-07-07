@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 import re
 import time
-from typing import Any
+from typing import Any, Callable
 
 from .capability_taxonomy import capability_names
 from .evidence import unit_id, write_jsonl
@@ -20,6 +20,14 @@ from .phase3_native import (
 from .phase5_evidence import run_phase5_evidence
 from .profiles import NativeProbeProfile, load_native_probe_profile
 from .utils import ensure_dir, safe_name, safe_write_json
+
+
+ProgressCallback = Callable[[dict[str, Any]], None]
+
+
+def _emit_progress(callback: ProgressCallback | None, payload: dict[str, Any]) -> None:
+    if callback is not None:
+        callback(payload)
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -261,6 +269,12 @@ def classify_probe_outcome(result: dict[str, Any]) -> dict[str, Any]:
     blocks = int(features.get("basic_block_count") or 0)
     name = str(target.get("name") or "")
     if instructions == 0:
+        if int(features.get("pseudocode_nonempty_line_count") or 0) >= 10:
+            return {
+                "outcome": "technical_success",
+                "outcome_class": "pseudocode_only_structure",
+                "research_value": "pseudocode_structure",
+            }
         return {
             "outcome": "empty_feature",
             "outcome_class": "technical_success_semantic_empty",
@@ -362,12 +376,15 @@ def run_native_deep_probe(
     timeout_per_app: int | None = None,
     expansion_rounds: int | None = None,
     max_expanded_targets: int | None = None,
+    native_feature_detail: str | None = None,
     refresh_phase5: bool = True,
     force: bool = False,
+    progress_callback: ProgressCallback | None = None,
 ) -> dict[str, Any]:
     workspace = workspace.expanduser().resolve()
     profile = load_native_probe_profile(profile_name)
     limits = profile.default_limits
+    native_feature_detail = native_feature_detail or str(profile.raw.get("default_feature_detail") or "pseudocode")
     max_seed_targets = max_seed_targets or limits.get("max_seed_targets", 80)
     max_decompile_targets = max_decompile_targets or limits.get("max_decompile_targets", 48)
     max_libraries = max_libraries or limits.get("max_libraries", 8)
@@ -379,12 +396,26 @@ def run_native_deep_probe(
     output_dir = ensure_dir(workspace / "phase3_native" / "probes" / safe_name(profile.name))
     summary_path = output_dir / "native_probe_summary.json"
     if summary_path.exists() and not force:
+        _emit_progress(progress_callback, {"event": "probe_cached", "summary_path": str(summary_path)})
         return _load_json(summary_path)
 
     function_index_path = workspace / "phase3_native" / "native_function_index.json"
     function_index = _load_json(function_index_path)
     if not function_index:
         raise FileNotFoundError(f"Missing native function index: {function_index_path}")
+    _emit_progress(
+        progress_callback,
+        {
+            "event": "probe_start",
+            "profile": profile.name,
+            "workspace": str(workspace),
+            "feature_detail": native_feature_detail,
+            "max_decompile_targets": max_decompile_targets,
+            "max_libraries": max_libraries,
+            "timeout_per_function": timeout_per_function,
+            "timeout_per_app": timeout_per_app,
+        },
+    )
 
     seed_targets = build_profile_seed_targets(
         function_index,
@@ -392,6 +423,14 @@ def run_native_deep_probe(
         max_targets=max_seed_targets,
     )
     safe_write_json(output_dir / "native_probe_targets.json", {"profile": profile.raw, "targets": seed_targets})
+    _emit_progress(
+        progress_callback,
+        {
+            "event": "seed_targets_ready",
+            "seed_target_count": len(seed_targets),
+            "targets_path": str(output_dir / "native_probe_targets.json"),
+        },
+    )
 
     plan = build_decompile_plan(
         seed_targets,
@@ -401,8 +440,19 @@ def run_native_deep_probe(
         target_capabilities=profile.capability_priorities,
     )
     safe_write_json(output_dir / "native_probe_decompile_plan.json", plan)
+    _emit_progress(
+        progress_callback,
+        {
+            "event": "probe_plan_ready",
+            "status": plan.get("status"),
+            "selected_target_count": plan.get("selected_target_count"),
+            "selected_libraries": plan.get("selected_libraries") or {},
+            "plan_path": str(output_dir / "native_probe_decompile_plan.json"),
+        },
+    )
 
     start = time.monotonic()
+    _emit_progress(progress_callback, {"event": "decompile_round_start", "round": "seed"})
     first_result = run_targeted_decompile(
         seed_targets,
         output_dir / "decompiled_targets",
@@ -412,6 +462,17 @@ def run_native_deep_probe(
         max_targets=max_decompile_targets,
         max_libraries=max_libraries,
         target_capabilities=profile.capability_priorities,
+        feature_detail=native_feature_detail,
+        progress_callback=progress_callback,
+    )
+    _emit_progress(
+        progress_callback,
+        {
+            "event": "decompile_round_finish",
+            "round": "seed",
+            "attempted_targets": first_result.get("attempted_targets"),
+            "successful_decompilations": sum(1 for item in first_result.get("results") or [] if item.get("success")),
+        },
     )
 
     expanded_targets: list[dict[str, Any]] = []
@@ -419,8 +480,24 @@ def run_native_deep_probe(
     if expansion_rounds > 0 and first_result.get("results"):
         expanded_targets = build_expanded_callee_targets(first_result, max_targets=max_expanded_targets)
         safe_write_json(output_dir / "native_probe_expanded_targets.json", {"targets": expanded_targets})
+        _emit_progress(
+            progress_callback,
+            {
+                "event": "expanded_targets_ready",
+                "expanded_target_count": len(expanded_targets),
+                "targets_path": str(output_dir / "native_probe_expanded_targets.json"),
+            },
+        )
         remaining_budget = max(60, timeout_per_app - int(time.monotonic() - start))
         if expanded_targets and remaining_budget > 60:
+            _emit_progress(
+                progress_callback,
+                {
+                    "event": "decompile_round_start",
+                    "round": "expanded",
+                    "remaining_budget": remaining_budget,
+                },
+            )
             second_result = run_targeted_decompile(
                 expanded_targets,
                 output_dir / "decompiled_expanded_targets",
@@ -430,6 +507,19 @@ def run_native_deep_probe(
                 max_targets=max_expanded_targets,
                 max_libraries=max_libraries,
                 target_capabilities=profile.capability_priorities,
+                feature_detail=native_feature_detail,
+                progress_callback=progress_callback,
+            )
+            _emit_progress(
+                progress_callback,
+                {
+                    "event": "decompile_round_finish",
+                    "round": "expanded",
+                    "attempted_targets": second_result.get("attempted_targets"),
+                    "successful_decompilations": sum(
+                        1 for item in second_result.get("results") or [] if item.get("success")
+                    ),
+                },
             )
 
     merged_result = _merge_decompile_results(first_result, second_result)
@@ -449,6 +539,7 @@ def run_native_deep_probe(
     summary = {
         "schema_version": "2026-07-07.native-probe-summary.v1",
         "profile": profile.raw,
+        "native_feature_detail": native_feature_detail,
         "workspace": str(workspace),
         "function_index_path": str(function_index_path),
         "seed_target_count": len(seed_targets),
@@ -475,9 +566,28 @@ def run_native_deep_probe(
     safe_write_json(summary_path, summary)
 
     if refresh_phase5:
+        _emit_progress(progress_callback, {"event": "phase5_refresh_start"})
         result = run_phase5_evidence(workspace, force=True)
         summary["phase5_refreshed"] = result.success
         summary["phase5_details"] = result.details
         safe_write_json(summary_path, summary)
+        _emit_progress(
+            progress_callback,
+            {
+                "event": "phase5_refresh_finish",
+                "success": result.success,
+                "details": result.details,
+            },
+        )
 
+    _emit_progress(
+        progress_callback,
+        {
+            "event": "probe_finish",
+            "summary_path": str(summary_path),
+            "attempted_targets": summary.get("attempted_targets"),
+            "successful_decompilations": summary.get("successful_decompilations"),
+            "outcome_counts": summary.get("outcome_counts"),
+        },
+    )
     return summary

@@ -8,7 +8,7 @@ import json
 from pathlib import Path
 import re
 import time
-from typing import Any
+from typing import Any, Callable
 
 from .capability_taxonomy import capability_names, classify_text
 from .evidence import token_fingerprint
@@ -37,6 +37,12 @@ HIGH_VALUE_NAME_MARKERS = (
 )
 AUTOMATED_DECOMPILER_TOOLS = {"rizin", "radare2"}
 MAX_COMMAND_OUTPUT = 3_000_000
+ProgressCallback = Callable[[dict[str, Any]], None]
+
+
+def _emit_progress(callback: ProgressCallback | None, payload: dict[str, Any]) -> None:
+    if callback is not None:
+        callback(payload)
 
 
 def score_native_text(text: str) -> tuple[int, list[str], list[str]]:
@@ -492,6 +498,7 @@ def _build_function_features(
 ) -> dict[str, Any]:
     ops = _ops_from_disasm(disasm_json)
     blocks = _blocks_from_cfg(cfg_json)
+    pseudocode_lines = [line for line in pseudocode.splitlines() if line.strip()]
     mnemonics = [
         str(op.get("type") or str(op.get("opcode") or "").split(" ", 1)[0])
         for op in ops
@@ -529,6 +536,8 @@ def _build_function_features(
         "cfg_edge_count": block_edges,
         "xref_count": _jsonish_len(xrefs_json, "xrefs"),
         "function_info_count": _jsonish_len(function_info_json, "functions"),
+        "pseudocode_line_count": len(pseudocode.splitlines()),
+        "pseudocode_nonempty_line_count": len(pseudocode_lines),
         "mnemonic_sample": mnemonics[:200],
         "call_targets": call_targets,
         "string_refs": string_refs,
@@ -544,34 +553,45 @@ def _run_rizin_like(
     output_path: Path,
     timeout: int,
     function_inventory: list[dict[str, Any]] | None = None,
+    feature_detail: str = "full",
 ) -> dict[str, Any]:
     function_inventory = function_inventory or []
     target_name = str(target.get("name") or "")
     seek, resolved_function = _resolve_function_seek(target_name, function_inventory)
     pseudo_result = _run_rizin_command(tool, library_path, [f"pdc @ {seek}"], timeout)
-    text = pseudo_result.get("stdout") or pseudo_result.get("stderr") or ""
+    pseudocode = pseudo_result.get("stdout") or ""
+    text = pseudocode or pseudo_result.get("stderr") or ""
     safe_write_text(output_path, text[-200_000:])
-    function_info_json = _run_rizin_json(tool, library_path, f"afij @ {seek}", timeout)
-    disasm_json = _run_rizin_json(tool, library_path, f"pdfj @ {seek}", timeout)
-    cfg_json = _run_rizin_json(tool, library_path, f"agfj @ {seek}", timeout)
-    xrefs_json = _run_rizin_json(tool, library_path, f"axtj @ {seek}", timeout)
+    if feature_detail not in {"pseudocode", "standard", "full"}:
+        raise ValueError(f"Unknown native feature detail: {feature_detail}")
+    function_info_json = None
+    disasm_json = None
+    cfg_json = None
+    xrefs_json = None
+    if feature_detail in {"standard", "full"}:
+        function_info_json = _run_rizin_json(tool, library_path, f"afij @ {seek}", timeout)
+        disasm_json = _run_rizin_json(tool, library_path, f"pdfj @ {seek}", timeout)
+    if feature_detail == "full":
+        cfg_json = _run_rizin_json(tool, library_path, f"agfj @ {seek}", timeout)
+        xrefs_json = _run_rizin_json(tool, library_path, f"axtj @ {seek}", timeout)
     features = _build_function_features(
         target=target,
         seek=seek,
         resolved_function=resolved_function,
-        pseudocode=text,
+        pseudocode=pseudocode,
         function_info_json=function_info_json,
         disasm_json=disasm_json,
         cfg_json=cfg_json,
         xrefs_json=xrefs_json,
     )
     return {
-        "success": int(pseudo_result.get("returncode") or 0) == 0 and bool(text.strip()),
+        "success": int(pseudo_result.get("returncode") or 0) == 0 and bool(pseudocode.strip()),
         "tool": tool,
         "returncode": pseudo_result.get("returncode"),
         "output_path": str(output_path),
         "seek": seek,
         "resolved_function": resolved_function,
+        "feature_detail": feature_detail,
         "function_features": features,
         "xrefs": xrefs_json if isinstance(xrefs_json, list) else [],
         "cfg_summary": {
@@ -593,6 +613,8 @@ def run_targeted_decompile(
     max_targets: int = 40,
     max_libraries: int = 8,
     target_capabilities: tuple[str, ...] | list[str] | set[str] = (),
+    feature_detail: str = "full",
+    progress_callback: ProgressCallback | None = None,
 ) -> dict[str, Any]:
     """Run optional native decompilation for ranked targets when a tool is installed."""
 
@@ -607,8 +629,19 @@ def run_targeted_decompile(
         target_capabilities=target_capabilities,
     )
     safe_write_json(output_dir / "native_decompile_plan.json", plan)
+    _emit_progress(
+        progress_callback,
+        {
+            "event": "decompile_plan",
+            "status": plan.get("status"),
+            "selected_target_count": plan.get("selected_target_count"),
+            "selected_libraries": plan.get("selected_libraries") or {},
+            "feature_detail": feature_detail,
+        },
+    )
 
     if plan["status"] == "disabled":
+        _emit_progress(progress_callback, {"event": "decompile_skipped", "status": "disabled"})
         return {
             "status": "disabled",
             "plan": plan,
@@ -619,6 +652,7 @@ def run_targeted_decompile(
 
     tool = plan.get("toolchain", {}).get("selected_decompiler")
     if plan["status"] == "tool_missing":
+        _emit_progress(progress_callback, {"event": "decompile_skipped", "status": "tool_missing"})
         return {
             "status": "tool_missing",
             "plan": plan,
@@ -629,6 +663,7 @@ def run_targeted_decompile(
         }
 
     if plan["status"] == "tool_present_not_automated":
+        _emit_progress(progress_callback, {"event": "decompile_skipped", "status": "tool_present_not_automated"})
         return {
             "status": "tool_present_not_automated",
             "tool": tool,
@@ -644,8 +679,10 @@ def run_targeted_decompile(
     attempted_counts: Counter[str] = Counter()
     inventory_cache: dict[str, list[dict[str, Any]]] = {}
     budgeted = [target for target in plan.get("targets") or [] if isinstance(target, dict)]
-    for target in budgeted:
+    total_targets = len(budgeted)
+    for index, target in enumerate(budgeted, start=1):
         if time.monotonic() - start_time > timeout_per_app:
+            _emit_progress(progress_callback, {"event": "app_timeout", "attempted": len(results), "total": total_targets})
             results.append(
                 {
                     "success": False,
@@ -657,6 +694,18 @@ def run_targeted_decompile(
             break
         library_path = Path(str(target["library"]))
         if not library_path.exists():
+            _emit_progress(
+                progress_callback,
+                {
+                    "event": "target_finish",
+                    "index": index,
+                    "total": total_targets,
+                    "success": False,
+                    "error": "library_not_found",
+                    "library": str(library_path),
+                    "name": target.get("name"),
+                },
+            )
             results.append(
                 {
                     "success": False,
@@ -669,12 +718,44 @@ def run_targeted_decompile(
         attempted_counts[str(library_path)] += 1
         inventory = inventory_cache.get(str(library_path))
         if inventory is None:
+            _emit_progress(
+                progress_callback,
+                {
+                    "event": "inventory_start",
+                    "library": str(library_path),
+                    "tool": executable,
+                    "timeout": min(timeout_per_function, 120),
+                },
+            )
             try:
                 inventory = _load_function_inventory(executable, library_path, min(timeout_per_function, 120))
             except Exception:
                 inventory = []
             inventory_cache[str(library_path)] = inventory
+            _emit_progress(
+                progress_callback,
+                {
+                    "event": "inventory_finish",
+                    "library": str(library_path),
+                    "function_count": len(inventory),
+                },
+            )
         output_path = output_dir / f"{safe_name(library_path.name)}__{safe_name(str(target['name']))}.c"
+        target_start = time.monotonic()
+        _emit_progress(
+            progress_callback,
+            {
+                "event": "target_start",
+                "index": index,
+                "total": total_targets,
+                "library": str(library_path),
+                "name": target.get("name"),
+                "score": target.get("score"),
+                "timeout": timeout_per_function,
+                "tool": executable,
+                "feature_detail": feature_detail,
+            },
+        )
         try:
             result = _run_rizin_like(
                 executable,
@@ -683,10 +764,41 @@ def run_targeted_decompile(
                 output_path,
                 timeout_per_function,
                 function_inventory=inventory,
+                feature_detail=feature_detail,
             )
             result["target"] = target
             results.append(result)
+            _emit_progress(
+                progress_callback,
+                {
+                    "event": "target_finish",
+                    "index": index,
+                    "total": total_targets,
+                    "success": result.get("success"),
+                    "library": str(library_path),
+                    "name": target.get("name"),
+                    "output_path": result.get("output_path"),
+                    "elapsed_seconds": round(time.monotonic() - target_start, 2),
+                    "pseudocode_nonempty_line_count": (result.get("function_features") or {}).get(
+                        "pseudocode_nonempty_line_count"
+                    ),
+                    "instruction_count": (result.get("function_features") or {}).get("instruction_count"),
+                },
+            )
         except Exception as exc:
+            _emit_progress(
+                progress_callback,
+                {
+                    "event": "target_finish",
+                    "index": index,
+                    "total": total_targets,
+                    "success": False,
+                    "library": str(library_path),
+                    "name": target.get("name"),
+                    "error": repr(exc),
+                    "elapsed_seconds": round(time.monotonic() - target_start, 2),
+                },
+            )
             results.append(
                 {
                     "success": False,
@@ -708,6 +820,7 @@ def run_targeted_decompile(
             "max_libraries": max_libraries,
             "timeout_per_function": timeout_per_function,
             "timeout_per_app": timeout_per_app,
+            "feature_detail": feature_detail,
         },
         "results": results,
     }

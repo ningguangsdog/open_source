@@ -173,6 +173,8 @@ python scripts/run_native_deep_probe.py \
   --force
 ```
 
+Focused probes print live progress by default. The Adobe profile starts with `pseudocode` detail, which runs one native decompiler pass per selected target before refreshing the phase 5 evidence packet. Use `--native-feature-detail standard` or `--native-feature-detail full` when more disassembly, CFG, or xref detail is needed after the first pass.
+
 The probe writes its results under:
 
 ```text
