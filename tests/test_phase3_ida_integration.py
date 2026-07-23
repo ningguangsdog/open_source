@@ -4,6 +4,7 @@ import json
 import subprocess
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
@@ -20,7 +21,11 @@ from apk_pipeline.native_decompiler import (
     select_native_targets,
 )
 from apk_pipeline.native_semantics import classify_native_semantics
-from apk_pipeline.phase3_native import _extract_symbols, build_native_function_index
+from apk_pipeline.phase3_native import (
+    _extract_native_libraries,
+    _extract_symbols,
+    build_native_function_index,
+)
 from apk_pipeline.phase5_evidence import run_phase5_evidence
 from apk_pipeline.utils import safe_write_json, sha256_file
 
@@ -45,6 +50,30 @@ def _symbol(
 
 
 class Phase3IDAIntegrationTests(unittest.TestCase):
+    def test_native_extraction_records_workspace_relative_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace = Path(temp_dir) / "workspace"
+            apk_path = workspace / "base.apk"
+            apk_path.parent.mkdir(parents=True)
+            with zipfile.ZipFile(apk_path, "w") as archive:
+                archive.writestr("lib/arm64-v8a/libcore.so", b"\x7fELFcore")
+
+            records = _extract_native_libraries(
+                [apk_path],
+                workspace / "phase3_native" / "libs",
+            )
+
+            self.assertEqual(len(records), 1)
+            self.assertTrue(records[0]["success"])
+            self.assertTrue(
+                records[0]["workspace_relative_path"].startswith(
+                    "phase3_native/libs/"
+                )
+            )
+            self.assertTrue(
+                (workspace / records[0]["workspace_relative_path"]).is_file()
+            )
+
     def test_symbol_extraction_preserves_elf_addresses_and_sizes(self) -> None:
         output = "\n".join(
             [
@@ -252,6 +281,64 @@ class Phase3IDAIntegrationTests(unittest.TestCase):
                 max_libraries=2,
             )
             self.assertEqual(summary["selected_library_count"], 2)
+            self.assertTrue(
+                (workspace / "phase3_native" / "ida_handoff.zip").is_file()
+            )
+
+    def test_ida_handoff_skips_missing_library_without_losing_valid_output(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace = Path(temp_dir) / "workspace"
+            valid = workspace / "phase3_native" / "libs" / "libvalid.so"
+            valid.parent.mkdir(parents=True)
+            valid.write_bytes(b"\x7fELFvalid")
+            valid_sha = sha256_file(valid)
+            missing_sha = "f" * 64
+            candidates = [
+                {
+                    "task_id": "valid",
+                    "library": str(valid),
+                    "workspace_relative_path": "libs/libvalid.so",
+                    "library_name": "libvalid.so",
+                    "library_sha256": valid_sha,
+                    "abi": "arm64-v8a",
+                },
+                {
+                    "task_id": "missing",
+                    "library": str(
+                        workspace
+                        / "phase3_native"
+                        / "libs"
+                        / "libmissing.so"
+                    ),
+                    "workspace_relative_path": (
+                        "phase3_native/libs/libmissing.so"
+                    ),
+                    "library_name": "libmissing.so",
+                    "library_sha256": missing_sha,
+                    "abi": "arm64-v8a",
+                },
+            ]
+            manifest = {
+                "schema_version": "test",
+                "library_count": 2,
+                "candidates": candidates,
+                "review_queue": [
+                    {"rank": 1, "task_id": "valid"},
+                    {"rank": 2, "task_id": "missing"},
+                ],
+            }
+
+            summary = export_ida_handoff(
+                workspace,
+                manifest,
+                max_libraries=2,
+            )
+
+            self.assertEqual(summary["status"], "partial")
+            self.assertEqual(summary["selected_library_count"], 1)
+            self.assertEqual(summary["skipped_library_count"], 1)
             self.assertTrue(
                 (workspace / "phase3_native" / "ida_handoff.zip").is_file()
             )

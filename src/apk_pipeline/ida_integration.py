@@ -638,6 +638,8 @@ def export_ida_handoff(
     }
     selected_libraries: list[dict[str, Any]] = []
     selected_keys: set[tuple[str, str]] = set()
+    attempted_keys: set[tuple[str, str]] = set()
+    skipped_libraries: list[dict[str, Any]] = []
     selected_tasks: list[dict[str, Any]] = []
 
     for queued in task_manifest.get("review_queue") or []:
@@ -651,32 +653,49 @@ def export_ida_handoff(
             str(candidate.get("abi") or ""),
         )
         if key not in selected_keys:
+            if key in attempted_keys:
+                continue
             if len(selected_keys) >= max_libraries:
                 continue
-            source_path = _resolve_library_binary(workspace, candidate)
-            actual_sha = sha256_file(source_path).lower()
-            if actual_sha != key[0]:
-                raise ValueError(
-                    f"IDA handoff hash mismatch for {source_path}: {actual_sha} != {key[0]}"
+            attempted_keys.add(key)
+            try:
+                source_path = _resolve_library_binary(workspace, candidate)
+                actual_sha = sha256_file(source_path).lower()
+                if actual_sha != key[0]:
+                    raise ValueError(
+                        f"hash mismatch: {actual_sha} != {key[0]}"
+                    )
+                destination_name = "__".join(
+                    (
+                        f"{len(selected_keys) + 1:02d}",
+                        safe_name(key[1] or "unknown_abi"),
+                        safe_name(
+                            Path(
+                                str(
+                                    candidate.get("library_name")
+                                    or source_path.name
+                                )
+                            ).stem
+                        ),
+                        actual_sha[:12],
+                    )
+                ) + ".so"
+                destination = binaries_dir / destination_name
+                shutil.copy2(source_path, destination)
+            except (OSError, ValueError) as exc:
+                skipped_libraries.append(
+                    {
+                        "library_name": candidate.get("library_name"),
+                        "abi": key[1],
+                        "library_sha256": key[0],
+                        "workspace_relative_path": candidate.get(
+                            "workspace_relative_path"
+                        ),
+                        "error": str(exc),
+                    }
                 )
+                continue
             selected_keys.add(key)
-            destination_name = "__".join(
-                (
-                    f"{len(selected_keys):02d}",
-                    safe_name(key[1] or "unknown_abi"),
-                    safe_name(
-                        Path(
-                            str(
-                                candidate.get("library_name")
-                                or source_path.name
-                            )
-                        ).stem
-                    ),
-                    actual_sha[:12],
-                )
-            ) + ".so"
-            destination = binaries_dir / destination_name
-            shutil.copy2(source_path, destination)
             binary_record = {
                 "library_rank": len(selected_keys),
                 "library_name": candidate.get("library_name"),
@@ -693,8 +712,17 @@ def export_ida_handoff(
             selected_tasks.append(dict(queued))
 
     handoff_manifest = {
-        "schema_version": "2026-07-23.ida-handoff.v1",
+        "schema_version": "2026-07-23.ida-handoff.v2",
         "source_task_schema": task_manifest.get("schema_version"),
+        "status": (
+            "partial"
+            if skipped_libraries and selected_libraries
+            else "failed"
+            if skipped_libraries
+            else "success"
+            if selected_libraries
+            else "empty"
+        ),
         "selection_policy": (
             "first ranked unique library-and-ABI pairs from the diversified review queue"
         ),
@@ -705,6 +733,8 @@ def export_ida_handoff(
             int(task_manifest.get("library_count") or 0) - len(selected_libraries),
         ),
         "selected_task_count": len(selected_tasks),
+        "skipped_library_count": len(skipped_libraries),
+        "skipped_libraries": skipped_libraries,
         "libraries": selected_libraries,
         "review_queue": selected_tasks,
     }
@@ -855,23 +885,30 @@ def _resolve_library_binary(
     library: dict[str, Any],
 ) -> Path:
     candidates: list[Path] = []
+    workspace_root = workspace.resolve()
     relative = library.get("workspace_relative_path")
     if relative:
-        workspace_root = workspace.resolve()
-        relative_candidate = (workspace_root / str(relative)).resolve()
-        if (
-            relative_candidate == workspace_root
-            or workspace_root in relative_candidate.parents
-        ):
-            candidates.append(relative_candidate)
-    extracted = library.get("extracted_path")
-    if extracted:
-        candidates.append(Path(str(extracted)).expanduser().resolve())
+        for root in (workspace_root, workspace_root / "phase3_native"):
+            relative_candidate = (root / str(relative)).resolve()
+            if (
+                relative_candidate == workspace_root
+                or workspace_root in relative_candidate.parents
+            ):
+                candidates.append(relative_candidate)
+    for field in ("library", "extracted_path"):
+        value = library.get(field)
+        if not value:
+            continue
+        candidate = Path(str(value)).expanduser()
+        if not candidate.is_absolute():
+            candidate = workspace_root / candidate
+        candidates.append(candidate.resolve())
     for candidate in candidates:
         if candidate.is_file():
             return candidate
     raise FileNotFoundError(
-        "The extracted library is missing; rerun Phase 3 or restore the complete workspace."
+        "The extracted library is missing at every recorded path; "
+        "rerun Phase 3 or restore the complete workspace."
     )
 
 

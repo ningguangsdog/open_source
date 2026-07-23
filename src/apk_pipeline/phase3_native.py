@@ -62,7 +62,7 @@ MAX_INTERESTING_STRINGS = 500
 NATIVE_TOOL_TIMEOUT_SECONDS = 120
 AUTO_DEEP_MIN_SCORE = 18
 AUTO_DEEP_MIN_CAPABILITY_SCORE = 12
-PHASE_SCHEMA = "2026-07-23.phase3.v4"
+PHASE_SCHEMA = "2026-07-23.phase3.v5"
 NATIVE_DEPTHS = {"none", "basic", "targeted", "auto", "deep"}
 NATIVE_DECOMPILERS = {"auto", "none", "rizin", "radare2", "ghidra", "retdec"}
 
@@ -147,7 +147,7 @@ def _extract_native_libraries(apk_paths: list[Path], libs_dir: Path) -> list[dic
                         "extracted_path": str(output_path),
                         "workspace_relative_path": str(
                             output_path.resolve().relative_to(
-                                libs_dir.parent.resolve()
+                                libs_dir.parent.parent.resolve()
                             )
                         ),
                         "size_bytes": info.file_size,
@@ -1223,12 +1223,17 @@ def run_phase3_multi(
         "partial",
         "failed",
     }
+    ida_handoff_incomplete = ida_handoff.get("status") in {
+        "partial",
+        "failed",
+    }
     if extraction_errors and not library_records:
         status = "failed"
     elif (
         extraction_errors
         or requested_decompile_incomplete
         or manual_ida_import_incomplete
+        or ida_handoff_incomplete
     ):
         status = "partial"
     else:
@@ -1247,6 +1252,11 @@ def run_phase3_multi(
     if manual_ida_import_incomplete:
         warnings.append(
             "One or more manual IDA results failed identity or content validation."
+        )
+    if ida_handoff_incomplete:
+        warnings.append(
+            "One or more ranked native libraries could not be packaged for IDA; "
+            "see ida_handoff_manifest.json."
         )
     result = PhaseResult(
         name="phase3_native",
@@ -1269,6 +1279,10 @@ def run_phase3_multi(
             "ida_review_queue_count": ida_manifest.get("review_queue_count"),
             "ida_handoff_library_count": ida_handoff.get(
                 "selected_library_count"
+            ),
+            "ida_handoff_status": ida_handoff.get("status"),
+            "ida_handoff_skipped_library_count": ida_handoff.get(
+                "skipped_library_count"
             ),
             "manual_ida_status": manual_ida_import.get("status"),
             "manual_ida_accepted_count": manual_ida_import.get("accepted_count"),
