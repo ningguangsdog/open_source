@@ -9,15 +9,21 @@ The pipeline is designed for app-level capability review across many Android app
 1. `phase0_split_inventory`
    - Resolves APK bundles into concrete APK files.
    - Classifies base APKs, ABI splits, density splits, language/config splits, and dynamic feature modules.
-   - Records hashes, dex presence, native libraries, model files, and high-value resource candidates.
+   - Validates each APK archive and its manifest before later phases consume it.
+   - Records hashes, dex presence, native libraries, model files, and every matching high-value resource label.
 
 2. `phase1_manifest`
    - Extracts package identity, version metadata, SDK levels, permissions, and Android components.
+   - Records field-level parse status, warnings, critical failures, and a weighted completeness score.
    - Writes a base manifest summary and a split-level manifest summary.
 
 3. `phase2_jadx`
    - Runs JADX on all dex-bearing splits by default.
-   - Builds a code index with capability signals, native method declarations, `System.loadLibrary` calls, URLs, imports, and short source snippets.
+   - Enforces a per-APK timeout while retaining usable partial output from interrupted or non-zero JADX runs.
+   - Records generated source counts, diagnostic counts, DEX class counts, and a reproducible coverage proxy.
+   - Builds a complete, chunked code index with capability signals, native method declarations, `System.loadLibrary` calls, URLs, imports, and short source snippets.
+   - Classifies Java/Kotlin code as first-party, third-party, platform, or unknown. Decompiled XML remains in the complete discovery index but is excluded from Java/Kotlin implementation counts.
+   - Complete source metadata remains in the index; snippet limits apply only to the compact review layer.
    - Emits Java evidence units and a package-level index for downstream review.
 
 4. `phase3_native`
@@ -25,6 +31,7 @@ The pipeline is designed for app-level capability review across many Android app
    - Collects strings, exported symbols, JNI symbols, URLs, and capability signals.
    - Ranks high-value native targets automatically and writes a native function index.
    - Writes a native toolchain preflight, decompile plan, function-level feature stream, string/xref view, and lightweight call graph.
+   - Attributes native libraries using application JNI prefixes, conservative known-runtime names, and optional SHA-256 registries. Ambiguous product-specific names remain `unknown` and stay in comparison evidence.
    - In the default `--native-depth auto` mode, optional pseudocode and function features are attempted only when high-value targets and a supported native decompiler are available.
 
 5. `phase4_resources`
@@ -35,6 +42,7 @@ The pipeline is designed for app-level capability review across many Android app
 6. `phase5_evidence`
    - Produces a compact review packet from the previous stages.
    - Emits a JSONL evidence-unit stream, an app-level evidence graph, a Java/native bridge map, and a similarity-ready packet.
+   - Excludes third-party and platform Java/native evidence from comparison-facing capability counts by default while reporting dependency evidence separately.
    - Similarity scoring is intentionally left out of this stage.
 
 ## Quick Start
@@ -50,16 +58,24 @@ Run the pipeline:
 ```bash
 python scripts/run_pipeline.py \
   --apk path/to/app.apk \
-  --workspace ./apk_workspace \
+  --workspace ./runs \
+  --isolated-workspace \
   --force
 ```
+
+`--isolated-workspace` treats `--workspace` as a run root and stores results under
+`<workspace>/<input-name>/<input-sha-prefix>/`. This mode is recommended when
+processing multiple apps or app versions. Without the flag, `--workspace`
+continues to refer to an exact output directory. An exact workspace cannot be
+reused for different APK content.
 
 For APK bundles:
 
 ```bash
 python scripts/run_pipeline.py \
   --apk path/to/app.apkm \
-  --workspace ./apk_workspace \
+  --workspace ./runs \
+  --isolated-workspace \
   --force
 ```
 
@@ -79,6 +95,8 @@ python scripts/run_pipeline.py --native-preflight-only
 ## Useful Options
 
 - `--no-decompile-all-splits`: only run JADX on the primary APK.
+- `--jadx-timeout-per-apk`: set the timeout for each dex-bearing APK or split; partial source is retained.
+- `--isolated-workspace`: create a content-addressed workspace for each APK or bundle.
 - `--native-depth none`: skip native target ranking and optional native decompiler calls.
 - `--native-depth basic`: extract native metadata and ranked targets without decompiler attempts.
 - `--native-depth targeted`: extract native metadata, rank targets, and emit native evidence units.
@@ -92,6 +110,10 @@ python scripts/run_pipeline.py --native-preflight-only
 - `--no-resource-scan`: skip raw model/resource inventory.
 - `--no-evidence-packets`: skip the final review packet.
 - `--no-jadx-download`: require a preinstalled `jadx` binary instead of downloading it.
+- `--first-party-prefixes`: add comma-separated first-party Java/Kotlin package prefixes.
+- `--third-party-prefixes`: add comma-separated dependency package prefixes.
+- `--first-party-native-hashes`: add comma-separated first-party native SHA-256 values.
+- `--third-party-native-hashes`: add comma-separated dependency native SHA-256 values.
 
 ## Main Outputs
 
@@ -99,9 +121,16 @@ After a successful run, the workspace contains:
 
 ```text
 apk_workspace/
+  run_context.json
+  run_manifest.json
+  pipeline_summary.json
+  run_records/<run-id>.json
+  phase0_split_inventory/cache_manifest.json
   phase0_split_inventory/split_inventory.json
+  phase1_manifest/cache_manifest.json
   phase1_manifest/manifest_summary.json
   phase1_manifest/split_manifest_summary.json
+  phase2_jadx/cache_manifest.json
   phase2_jadx/jadx_summary.json
   phase2_jadx/code_index.json
   phase2_jadx/java_evidence_units.json
@@ -119,6 +148,7 @@ apk_workspace/
   phase3_native/probes/<profile>/native_probe_review_units.jsonl
   phase3_native/native_evidence_units.json
   phase3_native/native_deep_summary.json
+  phase4_resources/cache_manifest.json
   phase4_resources/resource_inventory.json
   phase4_resources/model_evidence_units.json
   phase4_resources/resource_evidence_units.json
@@ -129,9 +159,36 @@ apk_workspace/
   phase5_evidence/evidence_graph.json
   phase5_evidence/java_native_bridge_map.json
   phase5_evidence/similarity_ready_packet.json
-  run_manifest.json
-  pipeline_summary.json
+  phase5_evidence/cache_manifest.json
 ```
+
+`run_context.json` records the current execution ID, stable analysis ID, input
+hashes, analysis configuration hash, pipeline revision, Python/package versions,
+and detected external toolchain. `run_records/` preserves one status record for
+each invocation, including runs that were interrupted after initialization.
+Each phase cache manifest binds its outputs to the input, relevant configuration,
+upstream artifacts, and output hashes. A cached phase is reused only when all of
+those values still match.
+
+Phase results use four statuses:
+
+- `success`: required work completed and outputs passed validation.
+- `partial`: usable artifacts were produced, but some required work or inputs failed.
+- `failed`: the phase could not produce a complete required result.
+- `skipped`: the phase was intentionally not run.
+
+Phase 5 includes an evidence-completeness section. Missing, invalid, or
+non-success upstream evidence prevents the final packet from being marked
+successful.
+
+`phase2_jadx/code_index.json` is the complete source metadata index. It records
+all discovered Java, Kotlin, and decompiled XML files, including read failures
+and explicit snippet-selection telemetry. `phase5_evidence/review_packet.json`
+is intentionally compact. For comparison preparation, first-party and unknown
+code are included by default; third-party and platform signals are retained in
+separate attribution and dependency sections. The compact similarity-ready
+packet uses stratified sampling across phases, evidence kinds, and capabilities;
+its selection telemetry points back to the complete JSONL evidence stream.
 
 The most useful files for review are usually:
 

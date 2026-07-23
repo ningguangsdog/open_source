@@ -8,7 +8,12 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
-from .capability_taxonomy import capability_names, classify_text
+from .capability_taxonomy import (
+    CAPABILITY_PATTERNS,
+    capability_names,
+    classify_text,
+)
+from .code_ownership import classify_native_ownership, normalize_hashes
 from .evidence import capability_confidence, compact_list, token_fingerprint, unit_id, write_jsonl
 from .models import PhaseResult
 from .native_decompiler import (
@@ -19,6 +24,12 @@ from .native_decompiler import (
     run_targeted_decompile,
     score_native_text,
     select_native_targets,
+)
+from .run_context import (
+    build_phase_cache_spec,
+    cached_phase_result,
+    load_valid_phase_cache,
+    write_phase_cache,
 )
 from .utils import (
     ensure_dir,
@@ -37,6 +48,21 @@ MAX_STRINGS = 5000
 MAX_INTERESTING_STRINGS = 500
 AUTO_DEEP_MIN_SCORE = 18
 AUTO_DEEP_MIN_CAPABILITY_SCORE = 12
+PHASE_SCHEMA = "2026-07-23.phase3.v3"
+NATIVE_DEPTHS = {"none", "basic", "targeted", "auto", "deep"}
+NATIVE_DECOMPILERS = {"auto", "none", "rizin", "radare2", "ghidra", "retdec"}
+
+
+def _load_manifest_package(workspace: Path) -> str | None:
+    path = workspace / "phase1_manifest" / "manifest_summary.json"
+    try:
+        import json
+
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    package = payload.get("package") if isinstance(payload, dict) else None
+    return str(package).strip() if package else None
 
 
 def _native_entries(apk_path: Path) -> list[zipfile.ZipInfo]:
@@ -45,7 +71,7 @@ def _native_entries(apk_path: Path) -> list[zipfile.ZipInfo]:
             info
             for info in zf.infolist()
             if not info.is_dir()
-            and info.filename.startswith("lib/")
+            and info.filename.lower().startswith("lib/")
             and info.filename.lower().endswith(".so")
         ]
 
@@ -66,7 +92,10 @@ def _extract_native_libraries(apk_paths: list[Path], libs_dir: Path) -> list[dic
             )
             continue
 
-        apk_out_dir = ensure_dir(libs_dir / safe_name(apk_path.stem))
+        apk_out_dir = ensure_dir(
+            libs_dir
+            / f"{safe_name(apk_path.stem)}-{sha256_file(apk_path)[:12]}"
+        )
         with zipfile.ZipFile(apk_path, "r") as zf:
             for info in entries:
                 parts = [safe_name(part) for part in Path(info.filename).parts]
@@ -293,6 +322,7 @@ def build_native_function_index(
                 "sha256": record.get("sha256"),
                 "size_bytes": record.get("size_bytes"),
                 "capabilities": library_caps,
+                "ownership": record.get("ownership") or {},
                 "capability_counts": record.get("capability_counts") or {},
                 "exported_symbol_count": record.get("exported_symbol_count") or 0,
                 "jni_symbol_count": record.get("jni_symbol_count") or 0,
@@ -443,6 +473,7 @@ def build_native_evidence_units(
                 "sha256": record.get("sha256"),
                 "size_bytes": record.get("size_bytes"),
                 "capabilities": capabilities,
+                "ownership": record.get("ownership") or {},
                 "exported_symbol_count": record.get("exported_symbol_count") or 0,
                 "jni_symbol_count": record.get("jni_symbol_count") or 0,
                 "interesting_strings": compact_list(interesting_strings, 80),
@@ -481,6 +512,7 @@ def build_native_evidence_units(
                 "name": target.get("name"),
                 "score": score,
                 "capabilities": capabilities,
+                "ownership": target.get("ownership") or {},
                 "reasons": target.get("reasons") or [],
                 "decompiler_success": result.get("success") if result else None,
                 "decompiler_tool": result.get("tool") if result else None,
@@ -583,7 +615,82 @@ def run_phase3_multi(
     native_timeout_per_function: int = 90,
     native_timeout_per_app: int = 3600,
     native_target_capabilities: tuple[str, ...] = (),
+    first_party_native_hashes: tuple[str, ...] = (),
+    third_party_native_hashes: tuple[str, ...] = (),
+    run_context: dict[str, Any] | None = None,
 ) -> PhaseResult:
+    if native_depth not in NATIVE_DEPTHS:
+        raise ValueError(
+            "native_depth must be one of: " + ", ".join(sorted(NATIVE_DEPTHS))
+        )
+    if native_decompiler not in NATIVE_DECOMPILERS:
+        raise ValueError(
+            "native_decompiler must be one of: "
+            + ", ".join(sorted(NATIVE_DECOMPILERS))
+        )
+    positive_values = {
+        "native_max_functions": native_max_functions,
+        "native_max_libraries": native_max_libraries,
+        "native_max_decompile_targets": native_max_decompile_targets,
+        "native_timeout_per_function": native_timeout_per_function,
+        "native_timeout_per_app": native_timeout_per_app,
+    }
+    invalid_values = [
+        name for name, value in positive_values.items() if value <= 0
+    ]
+    if invalid_values:
+        raise ValueError(
+            "Native limits and timeout values must be positive: "
+            + ", ".join(invalid_values)
+        )
+    native_target_capabilities = tuple(
+        sorted(
+            {
+                value.strip()
+                for value in native_target_capabilities
+                if value and value.strip()
+            }
+        )
+    )
+    valid_capabilities = {pattern.name for pattern in CAPABILITY_PATTERNS}
+    unknown_capabilities = sorted(
+        set(native_target_capabilities) - valid_capabilities
+    )
+    if unknown_capabilities:
+        raise ValueError(
+            "Unknown native target capabilities: "
+            + ", ".join(unknown_capabilities)
+        )
+    raw_first_party_hashes = tuple(
+        value.strip().lower()
+        for value in first_party_native_hashes
+        if value.strip()
+    )
+    raw_third_party_hashes = tuple(
+        value.strip().lower()
+        for value in third_party_native_hashes
+        if value.strip()
+    )
+    first_party_native_hashes = tuple(sorted(normalize_hashes(raw_first_party_hashes)))
+    third_party_native_hashes = tuple(sorted(normalize_hashes(raw_third_party_hashes)))
+    invalid_hashes = sorted(
+        set(raw_first_party_hashes + raw_third_party_hashes)
+        - set(first_party_native_hashes)
+        - set(third_party_native_hashes)
+    )
+    if invalid_hashes:
+        raise ValueError(
+            "Native ownership hashes must be 64-character hexadecimal SHA-256 values: "
+            + ", ".join(invalid_hashes)
+        )
+    conflicting_hashes = set(first_party_native_hashes).intersection(
+        third_party_native_hashes
+    )
+    if conflicting_hashes:
+        raise ValueError(
+            "Native hashes cannot be both first-party and third-party: "
+            + ", ".join(sorted(conflicting_hashes))
+        )
     output_dir = ensure_dir(workspace / "phase3_native")
     libs_dir = output_dir / "libs"
     analysis_path = output_dir / "native_analysis.json"
@@ -597,6 +704,9 @@ def run_phase3_multi(
     function_index_path = output_dir / "native_function_index.json"
     evidence_units_path = output_dir / "native_evidence_units.json"
     deep_summary_path = output_dir / "native_deep_summary.json"
+    cache_path = output_dir / "cache_manifest.json"
+    manifest_path = workspace / "phase1_manifest" / "manifest_summary.json"
+    app_package = _load_manifest_package(workspace)
 
     output_paths = [
         analysis_path,
@@ -611,25 +721,61 @@ def run_phase3_multi(
         evidence_units_path,
         deep_summary_path,
     ]
-    if all(path.exists() for path in output_paths) and not force:
-        return PhaseResult(
-            name="phase3_native",
-            success=True,
-            output_paths=output_paths,
-            details={"cached": True},
-        )
+    cache_spec = build_phase_cache_spec(
+        phase="phase3_native",
+        phase_schema=PHASE_SCHEMA,
+        phase_config={
+            "native_depth": native_depth,
+            "native_max_functions": native_max_functions,
+            "native_decompiler": native_decompiler,
+            "native_max_libraries": native_max_libraries,
+            "native_max_decompile_targets": native_max_decompile_targets,
+            "native_timeout_per_function": native_timeout_per_function,
+            "native_timeout_per_app": native_timeout_per_app,
+            "native_target_capabilities": list(native_target_capabilities),
+            "app_package": app_package,
+            "first_party_native_hashes": sorted(first_party_native_hashes),
+            "third_party_native_hashes": sorted(third_party_native_hashes),
+        },
+        input_paths=apk_paths,
+        upstream_paths=[manifest_path],
+        run_context=run_context,
+    )
+    if not force:
+        cached = load_valid_phase_cache(cache_path, cache_spec, output_paths)
+        if cached:
+            return cached_phase_result("phase3_native", output_paths, cached)
 
     extracted = _extract_native_libraries(apk_paths, libs_dir)
     library_records = [_analyze_library(record) for record in extracted if record.get("success")]
+    for record in library_records:
+        record["ownership"] = classify_native_ownership(
+            record.get("name"),
+            record.get("sha256"),
+            app_package=app_package,
+            jni_symbols=record.get("jni_symbols") or [],
+            first_party_hashes=first_party_native_hashes,
+            third_party_hashes=third_party_native_hashes,
+        ).to_dict()
     extraction_errors = [record for record in extracted if not record.get("success")]
     toolchain = detect_native_toolchain(native_decompiler)
     safe_write_json(toolchain_path, toolchain)
 
     capability_counts: Counter[str] = Counter()
+    comparison_capability_counts: Counter[str] = Counter()
+    dependency_capability_counts: Counter[str] = Counter()
     abi_counts: Counter[str] = Counter()
+    ownership_library_counts: Counter[str] = Counter()
     for record in library_records:
         abi_counts.update([str(record.get("abi"))])
-        capability_counts.update(record.get("capability_counts") or {})
+        record_capabilities = record.get("capability_counts") or {}
+        capability_counts.update(record_capabilities)
+        ownership = (record.get("ownership") or {}).get("category") or "unknown"
+        ownership_library_counts[ownership] += 1
+        if ownership in {"first_party", "unknown"}:
+            comparison_capability_counts.update(record_capabilities)
+        else:
+            dependency_capability_counts.update(record_capabilities)
 
     function_index = build_native_function_index(library_records)
     safe_write_json(function_index_path, function_index)
@@ -744,6 +890,24 @@ def run_phase3_multi(
         "native_library_count": len(library_records),
         "abi_counts": dict(sorted(abi_counts.items())),
         "capability_counts": dict(sorted(capability_counts.items())),
+        "comparison_capability_counts": dict(
+            sorted(comparison_capability_counts.items())
+        ),
+        "excluded_dependency_capability_counts": dict(
+            sorted(dependency_capability_counts.items())
+        ),
+        "ownership_library_counts": dict(
+            sorted(ownership_library_counts.items())
+        ),
+        "ownership_policy": {
+            "comparison_included": ["first_party", "unknown"],
+            "comparison_excluded_by_default": ["third_party", "platform"],
+            "app_package": app_package,
+            "hash_attribution": {
+                "first_party_hash_count": len(first_party_native_hashes),
+                "third_party_hash_count": len(third_party_native_hashes),
+            },
+        },
         "libraries": library_records,
         "extraction_errors": extraction_errors,
         "targets_path": str(targets_path),
@@ -761,19 +925,55 @@ def run_phase3_multi(
     }
     safe_write_json(analysis_path, payload)
 
-    return PhaseResult(
+    decompile_results = decompile_result.get("results") or []
+    decompile_failures = [item for item in decompile_results if not item.get("success")]
+    requested_decompile_incomplete = bool(
+        should_attempt_decompile
+        and targets
+        and (
+            decompile_result.get("status") != "completed"
+            or decompile_failures
+        )
+    )
+    if extraction_errors and not library_records:
+        status = "failed"
+    elif extraction_errors or requested_decompile_incomplete:
+        status = "partial"
+    else:
+        status = "success"
+    warnings: list[str] = []
+    if not library_records and not extraction_errors:
+        warnings.append("No native libraries found.")
+    warnings.extend(
+        f"{item.get('apk')}: {item.get('error') or 'native_extraction_failed'}"
+        for item in extraction_errors
+    )
+    if requested_decompile_incomplete:
+        warnings.append(
+            "Requested native pseudocode generation did not complete for every selected target."
+        )
+    result = PhaseResult(
         name="phase3_native",
-        success=True,
+        success=status == "success",
+        status=status,
         output_paths=output_paths,
         details={
             "native_library_count": len(library_records),
             "target_count": len(targets),
             "native_evidence_unit_count": len(native_evidence_units),
             "capability_counts": payload["capability_counts"],
+            "comparison_capability_counts": payload[
+                "comparison_capability_counts"
+            ],
+            "ownership_library_counts": payload["ownership_library_counts"],
             "decompiler_status": (decompile_result or {}).get("status"),
+            "extraction_error_count": len(extraction_errors),
+            "decompile_failure_count": len(decompile_failures),
         },
-        warnings=["No native libraries found."] if not library_records else [],
+        warnings=warnings,
     )
+    write_phase_cache(cache_path, cache_spec, output_paths, result)
+    return result
 
 
 def run_phase3(apk_path: Path, workspace: Path, *, force: bool = False) -> PhaseResult:

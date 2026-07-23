@@ -10,6 +10,12 @@ from typing import Any
 from .capability_taxonomy import capability_names, classify_path, classify_text
 from .evidence import capability_confidence, compact_list, token_fingerprint, unit_id
 from .models import PhaseResult
+from .run_context import (
+    build_phase_cache_spec,
+    cached_phase_result,
+    load_valid_phase_cache,
+    write_phase_cache,
+)
 from .tflite_parser import MODEL_EXTENSIONS, parse_model_metadata
 from .utils import ensure_dir, read_zip_entry_prefix, safe_write_json, zip_entry_sha256
 
@@ -32,6 +38,7 @@ RESOURCE_EXTENSIONS = (
 MAX_RESOURCE_CANDIDATES_PER_APK = 800
 MODEL_READ_LIMIT = 8_000_000
 RESOURCE_READ_LIMIT = 500_000
+PHASE_SCHEMA = "2026-07-23.phase4.v2"
 
 
 def _entry_record(apk_path: Path, info: zipfile.ZipInfo, *, kind: str) -> dict[str, Any]:
@@ -220,20 +227,30 @@ def run_phase4_resources(
     workspace: Path,
     *,
     force: bool = False,
+    run_context: dict[str, Any] | None = None,
 ) -> PhaseResult:
     output_dir = ensure_dir(workspace / "phase4_resources")
     output_path = output_dir / "resource_inventory.json"
     model_units_path = output_dir / "model_evidence_units.json"
     resource_units_path = output_dir / "resource_evidence_units.json"
+    cache_path = output_dir / "cache_manifest.json"
 
     output_paths = [output_path, model_units_path, resource_units_path]
-    if all(path.exists() for path in output_paths) and not force:
-        return PhaseResult(
-            name="phase4_resources",
-            success=True,
-            output_paths=output_paths,
-            details={"cached": True},
-        )
+    cache_spec = build_phase_cache_spec(
+        phase="phase4_resources",
+        phase_schema=PHASE_SCHEMA,
+        phase_config={
+            "model_read_limit": MODEL_READ_LIMIT,
+            "resource_read_limit": RESOURCE_READ_LIMIT,
+            "max_resource_candidates_per_apk": MAX_RESOURCE_CANDIDATES_PER_APK,
+        },
+        input_paths=all_apks,
+        run_context=run_context,
+    )
+    if not force:
+        cached = load_valid_phase_cache(cache_path, cache_spec, output_paths)
+        if cached:
+            return cached_phase_result("phase4_resources", output_paths, cached)
 
     all_records: list[dict[str, Any]] = []
     summaries: list[dict[str, Any]] = []
@@ -269,11 +286,22 @@ def run_phase4_resources(
     safe_write_json(model_units_path, model_units)
     safe_write_json(resource_units_path, resource_units)
 
-    return PhaseResult(
+    successful_apk_count = len(summaries)
+    failed_apk_count = len(all_apks) - successful_apk_count
+    if all_apks and successful_apk_count == 0:
+        status = "failed"
+    elif failed_apk_count:
+        status = "partial"
+    else:
+        status = "success"
+    result = PhaseResult(
         name="phase4_resources",
-        success=True,
+        success=status == "success",
+        status=status,
         output_paths=output_paths,
         details={
+            "successful_apk_count": successful_apk_count,
+            "failed_apk_count": failed_apk_count,
             "records_count": len(all_records),
             "model_count": sum(item["model_count"] for item in summaries),
             "resource_candidate_count": sum(item["resource_candidate_count"] for item in summaries),
@@ -283,3 +311,5 @@ def run_phase4_resources(
         },
         warnings=warnings,
     )
+    write_phase_cache(cache_path, cache_spec, output_paths, result)
+    return result

@@ -113,6 +113,7 @@ def select_native_targets(
                         "score": library_score,
                         "capabilities": capabilities,
                         "reasons": reasons,
+                        "ownership": library.get("ownership") or {},
                     }
                 )
             continue
@@ -148,6 +149,7 @@ def select_native_targets(
                     "score": score,
                     "capabilities": capability_names(capabilities),
                     "reasons": sorted(set(reasons))[:12],
+                    "ownership": library.get("ownership") or {},
                 }
             )
 

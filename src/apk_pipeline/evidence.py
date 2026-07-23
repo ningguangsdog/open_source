@@ -8,6 +8,8 @@ import re
 from pathlib import Path
 from typing import Any, Iterable
 
+from .utils import atomic_text_writer
+
 
 TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*|[0-9]+|[^\sA-Za-z0-9_]")
 IDENTIFIER_RE = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*\b")
@@ -60,9 +62,8 @@ def read_json(path: Path) -> Any:
 
 
 def write_jsonl(path: Path, rows: Iterable[dict[str, Any]]) -> int:
-    path.parent.mkdir(parents=True, exist_ok=True)
     count = 0
-    with path.open("w", encoding="utf-8") as fh:
+    with atomic_text_writer(path) as fh:
         for row in rows:
             fh.write(json.dumps(row, ensure_ascii=False, sort_keys=True))
             fh.write("\n")

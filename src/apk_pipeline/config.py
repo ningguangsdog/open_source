@@ -9,8 +9,10 @@ class PipelineConfig:
     apk_path: Path
     workspace: Path
     force: bool = False
+    isolated_workspace: bool = False
     jadx_version: str = "1.5.0"
     jadx_threads: int = 4
+    jadx_timeout_per_apk: int = 1800
     jadx_download: bool = True
     log_level: str = "INFO"
     decompile_all_splits: bool = True
@@ -25,3 +27,7 @@ class PipelineConfig:
     native_timeout_per_app: int = 3600
     native_target_capabilities: tuple[str, ...] = ()
     max_snippets_per_capability: int = 40
+    first_party_prefixes: tuple[str, ...] = ()
+    third_party_prefixes: tuple[str, ...] = ()
+    first_party_native_hashes: tuple[str, ...] = ()
+    third_party_native_hashes: tuple[str, ...] = ()

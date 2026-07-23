@@ -5,7 +5,15 @@ import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 
-from .utils import ensure_dir, safe_extract_zip, safe_name, zip_contains
+from .utils import (
+    ensure_dir,
+    reset_dir,
+    safe_extract_zip,
+    safe_name,
+    safe_write_json,
+    sha256_file,
+    zip_contains,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +42,59 @@ def _has_dex(path: Path) -> bool:
 
 
 def _has_native_libs(path: Path) -> bool:
-    return _apk_contains(path, lambda n: n.startswith("lib/") and n.endswith(".so"))
+    return _apk_contains(
+        path,
+        lambda n: n.lower().startswith("lib/") and n.lower().endswith(".so"),
+    )
+
+
+def _nested_apks(root: Path) -> list[Path]:
+    return sorted(
+        path
+        for path in root.rglob("*")
+        if path.is_file() and path.suffix.lower() == ".apk"
+    )
+
+
+def _extracted_apk_records(root: Path) -> list[dict[str, object]]:
+    return [
+        {
+            "relative_path": str(path.relative_to(root)),
+            "size_bytes": path.stat().st_size,
+            "sha256": sha256_file(path),
+        }
+        for path in _nested_apks(root)
+    ]
+
+
+def _bundle_cache_valid(
+    root: Path,
+    cached: dict[str, object],
+    current_source: dict[str, object],
+) -> bool:
+    if (
+        cached.get("source_sha256") != current_source["source_sha256"]
+        or cached.get("source_size_bytes") != current_source["source_size_bytes"]
+    ):
+        return False
+    records = cached.get("extracted_apks")
+    if not isinstance(records, list) or not records:
+        return False
+    for record in records:
+        if not isinstance(record, dict):
+            return False
+        relative_path = record.get("relative_path")
+        if not isinstance(relative_path, str):
+            return False
+        path = root / relative_path
+        if not path.is_file():
+            return False
+        if (
+            path.stat().st_size != record.get("size_bytes")
+            or sha256_file(path) != record.get("sha256")
+        ):
+            return False
+    return len(_nested_apks(root)) == len(records)
 
 
 def _select_primary_apk(apk_files: list[Path]) -> Path:
@@ -42,7 +102,7 @@ def _select_primary_apk(apk_files: list[Path]) -> Path:
         raise FileNotFoundError("No nested APK files found in bundle.")
 
     for apk in apk_files:
-        if apk.name == "base.apk":
+        if apk.name.lower() == "base.apk":
             return apk
 
     dex_candidates = [apk for apk in apk_files if _has_dex(apk)]
@@ -71,7 +131,9 @@ def resolve_apk_input(
 
     notes: list[str] = []
     suffix = input_path.suffix.lower()
-    looks_like_bundle = suffix in {".apkm", ".apks", ".xapk"} or _is_zip_with_nested_apks(input_path)
+    looks_like_bundle = suffix in {".apkm", ".apks", ".xapk"} or (
+        suffix != ".apk" and _is_zip_with_nested_apks(input_path)
+    )
 
     if not looks_like_bundle:
         return ResolvedAPKInput(
@@ -88,18 +150,41 @@ def resolve_apk_input(
         raise ValueError(f"Input has bundle-like extension but is not a valid zip file: {input_path}")
 
     bundle_dir = ensure_dir(workspace / "input_bundle" / safe_name(input_path.stem))
+    bundle_manifest_path = bundle_dir / ".bundle_source.json"
+    current_bundle_identity = {
+        "source_path": str(input_path),
+        "source_size_bytes": input_path.stat().st_size,
+        "source_sha256": sha256_file(input_path),
+    }
+    cached_bundle_identity: dict[str, object] = {}
+    if bundle_manifest_path.exists():
+        try:
+            import json
 
-    if force and bundle_dir.exists():
-        import shutil
+            cached_bundle_identity = json.loads(bundle_manifest_path.read_text(encoding="utf-8"))
+        except Exception:
+            cached_bundle_identity = {}
 
-        shutil.rmtree(bundle_dir)
-        bundle_dir.mkdir(parents=True, exist_ok=True)
+    cache_matches = _bundle_cache_valid(
+        bundle_dir,
+        cached_bundle_identity,
+        current_bundle_identity,
+    )
+    if force or not cache_matches:
+        reset_dir(bundle_dir)
 
-    if not any(bundle_dir.rglob("*.apk")):
+    if not _nested_apks(bundle_dir):
         logger.info("Extracting APK bundle: %s", input_path.name)
         safe_extract_zip(input_path, bundle_dir)
+        safe_write_json(
+            bundle_manifest_path,
+            {
+                **current_bundle_identity,
+                "extracted_apks": _extracted_apk_records(bundle_dir),
+            },
+        )
 
-    nested_apks = sorted(bundle_dir.rglob("*.apk"))
+    nested_apks = _nested_apks(bundle_dir)
     if not nested_apks:
         raise FileNotFoundError(f"No APK files found inside bundle: {input_path}")
 
