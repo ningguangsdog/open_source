@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 import zipfile
 from collections import Counter
@@ -15,6 +17,13 @@ from .capability_taxonomy import (
 )
 from .code_ownership import classify_native_ownership, normalize_hashes
 from .evidence import capability_confidence, compact_list, token_fingerprint, unit_id, write_jsonl
+from .ida_integration import (
+    build_ida_task_manifest,
+    build_java_native_hints,
+    import_manual_ida_results,
+    normalize_address,
+    prepare_manual_ida_workspace,
+)
 from .models import PhaseResult
 from .native_decompiler import (
     AUTOMATED_DECOMPILER_TOOLS,
@@ -48,7 +57,7 @@ MAX_STRINGS = 5000
 MAX_INTERESTING_STRINGS = 500
 AUTO_DEEP_MIN_SCORE = 18
 AUTO_DEEP_MIN_CAPABILITY_SCORE = 12
-PHASE_SCHEMA = "2026-07-23.phase3.v3"
+PHASE_SCHEMA = "2026-07-23.phase3.v4"
 NATIVE_DEPTHS = {"none", "basic", "targeted", "auto", "deep"}
 NATIVE_DECOMPILERS = {"auto", "none", "rizin", "radare2", "ghidra", "retdec"}
 
@@ -56,13 +65,32 @@ NATIVE_DECOMPILERS = {"auto", "none", "rizin", "radare2", "ghidra", "retdec"}
 def _load_manifest_package(workspace: Path) -> str | None:
     path = workspace / "phase1_manifest" / "manifest_summary.json"
     try:
-        import json
-
         payload = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return None
     package = payload.get("package") if isinstance(payload, dict) else None
     return str(package).strip() if package else None
+
+
+def _load_json_object(path: Path) -> dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _manual_ida_input_fingerprint(results_dir: Path) -> str:
+    digest = hashlib.sha256()
+    if not results_dir.exists():
+        return digest.hexdigest()
+    for path in sorted(item for item in results_dir.rglob("*") if item.is_file()):
+        relative = path.relative_to(results_dir).as_posix()
+        digest.update(relative.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(sha256_file(path).encode("ascii"))
+        digest.update(b"\0")
+    return digest.hexdigest()
 
 
 def _native_entries(apk_path: Path) -> list[zipfile.ZipInfo]:
@@ -129,9 +157,12 @@ def _run_strings(path: Path) -> list[str]:
     return printable_strings_from_bytes(data, min_length=4, limit=MAX_STRINGS)
 
 
-def _extract_symbols(path: Path) -> tuple[list[str], list[str], list[str]]:
+def _extract_symbols(
+    path: Path,
+) -> tuple[list[str], list[str], list[dict[str, Any]], list[str]]:
     exported: set[str] = set()
     jni: set[str] = set()
+    symbol_records: dict[tuple[str, str], dict[str, Any]] = {}
     warnings: list[str] = []
 
     commands: list[list[str]] = []
@@ -157,18 +188,56 @@ def _extract_symbols(path: Path) -> tuple[list[str], list[str], list[str]]:
             parts = line.split()
             if not parts:
                 continue
-            name = parts[-1].split("@@")[0].split("@")[0]
+            if command[0] == "nm":
+                if len(parts) < 3:
+                    continue
+                raw_address, symbol_type, raw_name = parts[0], parts[-2], parts[-1]
+                raw_size = None
+                binding = None
+                section = None
+            else:
+                if len(parts) < 8:
+                    continue
+                raw_address, raw_size = parts[1], parts[2]
+                symbol_type, binding, section = parts[3], parts[4], parts[6]
+                raw_name = parts[7]
+                if symbol_type != "FUNC" or section == "UND":
+                    continue
+            name = raw_name.split("@@")[0].split("@")[0]
             if not name or name in {"UND", "ABS"}:
                 continue
             if len(name) > 200:
                 continue
+            address = normalize_address(f"0x{raw_address}")
+            try:
+                size_bytes = int(raw_size) if raw_size is not None else None
+            except (TypeError, ValueError):
+                size_bytes = None
             exported.add(name)
             if name.startswith("Java_") or "JNI" in name or "jni" in name:
                 jni.add(name)
+            key = (name, str(address or ""))
+            symbol_records[key] = {
+                "name": name,
+                "address": address,
+                "size_bytes": size_bytes,
+                "symbol_type": symbol_type,
+                "binding": binding,
+                "section": section,
+                "symbol_source": command[0],
+                "is_jni": name in jni,
+            }
         if exported:
             break
 
-    return sorted(exported)[:2000], sorted(jni)[:1000], warnings
+    records = sorted(
+        symbol_records.values(),
+        key=lambda item: (
+            str(item.get("address") or ""),
+            str(item.get("name") or ""),
+        ),
+    )
+    return sorted(exported), sorted(jni), records, warnings
 
 
 def _interesting_strings(strings: list[str]) -> tuple[list[dict[str, Any]], list[str], dict[str, int]]:
@@ -205,7 +274,12 @@ def _analyze_library(record: dict[str, Any]) -> dict[str, Any]:
     path = Path(str(record["extracted_path"]))
     strings = _run_strings(path)
     interesting, urls, capability_counts = _interesting_strings(strings)
-    exported_symbols, jni_symbols, symbol_warnings = _extract_symbols(path)
+    (
+        exported_symbols,
+        jni_symbols,
+        symbol_records,
+        symbol_warnings,
+    ) = _extract_symbols(path)
 
     enriched = dict(record)
     enriched.update(
@@ -215,9 +289,11 @@ def _analyze_library(record: dict[str, Any]) -> dict[str, Any]:
             "urls": urls,
             "capability_counts": capability_counts,
             "exported_symbol_count": len(exported_symbols),
-            "exported_symbols": exported_symbols[:500],
+            "exported_symbols": exported_symbols,
             "jni_symbol_count": len(jni_symbols),
-            "jni_symbols": jni_symbols[:500],
+            "jni_symbols": jni_symbols,
+            "symbol_record_count": len(symbol_records),
+            "symbol_records": symbol_records,
             "warnings": symbol_warnings,
         }
     )
@@ -250,7 +326,7 @@ def _target_score(kind: str, library_path: str, name: str) -> tuple[int, list[st
 def build_native_function_index(
     library_records: list[dict[str, Any]],
     *,
-    max_entries_per_library: int = 1500,
+    max_entries_per_library: int | None = None,
 ) -> dict[str, Any]:
     libraries: list[dict[str, Any]] = []
     aggregate_capabilities: Counter[str] = Counter()
@@ -260,37 +336,69 @@ def build_native_function_index(
         library_caps = capability_names((record.get("capability_counts") or {}).keys())
         aggregate_capabilities.update(library_caps)
         functions: list[dict[str, Any]] = []
-        seen_names: set[tuple[str, str]] = set()
+        seen_symbols: set[tuple[str, str]] = set()
 
-        for symbol in record.get("jni_symbols") or []:
-            name = str(symbol)
-            score, capabilities, reasons = _target_score("jni_symbol", library_path, name)
-            seen_names.add(("jni_symbol", name))
-            functions.append(
-                {
-                    "kind": "jni_symbol",
-                    "name": name,
-                    "score": score,
-                    "capabilities": capabilities,
-                    "reasons": reasons,
-                }
-            )
-
-        for symbol in record.get("exported_symbols") or []:
-            name = str(symbol)
-            if ("jni_symbol", name) in seen_names:
+        for symbol_record in record.get("symbol_records") or []:
+            if not isinstance(symbol_record, dict):
                 continue
-            score, capabilities, reasons = _target_score("exported_symbol", library_path, name)
-            seen_names.add(("exported_symbol", name))
+            name = str(symbol_record.get("name") or "")
+            address = normalize_address(symbol_record.get("address"))
+            if not name:
+                continue
+            symbol_key = (name, str(address or ""))
+            if symbol_key in seen_symbols:
+                continue
+            seen_symbols.add(symbol_key)
+            kind = (
+                "jni_symbol"
+                if symbol_record.get("is_jni") or name in (record.get("jni_symbols") or [])
+                else "exported_symbol"
+            )
+            score, capabilities, reasons = _target_score(kind, library_path, name)
             functions.append(
                 {
-                    "kind": "exported_symbol",
+                    "kind": kind,
                     "name": name,
+                    "address": address,
+                    "size_bytes": symbol_record.get("size_bytes"),
+                    "symbol_type": symbol_record.get("symbol_type"),
+                    "binding": symbol_record.get("binding"),
+                    "section": symbol_record.get("section"),
+                    "symbol_source": symbol_record.get("symbol_source"),
                     "score": score,
                     "capabilities": capabilities,
                     "reasons": reasons,
                 }
             )
+
+        if not seen_symbols:
+            for kind, symbols in (
+                ("jni_symbol", record.get("jni_symbols") or []),
+                ("exported_symbol", record.get("exported_symbols") or []),
+            ):
+                for symbol in symbols:
+                    name = str(symbol)
+                    symbol_key = (name, "")
+                    if symbol_key in seen_symbols:
+                        continue
+                    seen_symbols.add(symbol_key)
+                    score, capabilities, reasons = _target_score(
+                        kind,
+                        library_path,
+                        name,
+                    )
+                    functions.append(
+                        {
+                            "kind": kind,
+                            "name": name,
+                            "address": None,
+                            "size_bytes": None,
+                            "symbol_source": "legacy_name_list",
+                            "score": score,
+                            "capabilities": capabilities,
+                            "reasons": reasons,
+                        }
+                    )
 
         for item in record.get("interesting_strings") or []:
             value = item.get("value") if isinstance(item, dict) else item
@@ -310,7 +418,19 @@ def build_native_function_index(
                 }
             )
 
-        functions.sort(key=lambda item: (-int(item.get("score") or 0), item.get("kind") or "", item.get("name") or ""))
+        functions.sort(
+            key=lambda item: (
+                -int(item.get("score") or 0),
+                item.get("kind") or "",
+                item.get("address") or "",
+                item.get("name") or "",
+            )
+        )
+        retained_functions = (
+            functions
+            if max_entries_per_library is None
+            else functions[:max_entries_per_library]
+        )
         libraries.append(
             {
                 "library_id": _library_id(record),
@@ -327,9 +447,13 @@ def build_native_function_index(
                 "exported_symbol_count": record.get("exported_symbol_count") or 0,
                 "jni_symbol_count": record.get("jni_symbol_count") or 0,
                 "interesting_string_count": len(record.get("interesting_strings") or []),
-                "function_count_indexed": min(len(functions), max_entries_per_library),
-                "functions": functions[:max_entries_per_library],
-                "functions_truncated": len(functions) > max_entries_per_library,
+                "function_count_discovered": len(functions),
+                "function_count_indexed": len(retained_functions),
+                "functions": retained_functions,
+                "functions_truncated": (
+                    max_entries_per_library is not None
+                    and len(functions) > max_entries_per_library
+                ),
             }
         )
 
@@ -614,6 +738,7 @@ def run_phase3_multi(
     native_max_decompile_targets: int = 40,
     native_timeout_per_function: int = 90,
     native_timeout_per_app: int = 3600,
+    ida_review_limit: int = 120,
     native_target_capabilities: tuple[str, ...] = (),
     first_party_native_hashes: tuple[str, ...] = (),
     third_party_native_hashes: tuple[str, ...] = (),
@@ -634,6 +759,7 @@ def run_phase3_multi(
         "native_max_decompile_targets": native_max_decompile_targets,
         "native_timeout_per_function": native_timeout_per_function,
         "native_timeout_per_app": native_timeout_per_app,
+        "ida_review_limit": ida_review_limit,
     }
     invalid_values = [
         name for name, value in positive_values.items() if value <= 0
@@ -704,8 +830,11 @@ def run_phase3_multi(
     function_index_path = output_dir / "native_function_index.json"
     evidence_units_path = output_dir / "native_evidence_units.json"
     deep_summary_path = output_dir / "native_deep_summary.json"
+    ida_manifest_path = output_dir / "ida_target_manifest.json"
+    manual_ida_paths = prepare_manual_ida_workspace(output_dir / "manual_ida")
     cache_path = output_dir / "cache_manifest.json"
     manifest_path = workspace / "phase1_manifest" / "manifest_summary.json"
+    code_index_path = workspace / "phase2_jadx" / "code_index.json"
     app_package = _load_manifest_package(workspace)
 
     output_paths = [
@@ -720,6 +849,11 @@ def run_phase3_multi(
         function_index_path,
         evidence_units_path,
         deep_summary_path,
+        ida_manifest_path,
+        manual_ida_paths["template"],
+        manual_ida_paths["readme"],
+        manual_ida_paths["import_summary"],
+        manual_ida_paths["evidence_units"],
     ]
     cache_spec = build_phase_cache_spec(
         phase="phase3_native",
@@ -732,13 +866,17 @@ def run_phase3_multi(
             "native_max_decompile_targets": native_max_decompile_targets,
             "native_timeout_per_function": native_timeout_per_function,
             "native_timeout_per_app": native_timeout_per_app,
+            "ida_review_limit": ida_review_limit,
             "native_target_capabilities": list(native_target_capabilities),
             "app_package": app_package,
             "first_party_native_hashes": sorted(first_party_native_hashes),
             "third_party_native_hashes": sorted(third_party_native_hashes),
+            "manual_ida_input_fingerprint": _manual_ida_input_fingerprint(
+                manual_ida_paths["results_dir"]
+            ),
         },
         input_paths=apk_paths,
-        upstream_paths=[manifest_path],
+        upstream_paths=[manifest_path, code_index_path],
         run_context=run_context,
     )
     if not force:
@@ -779,6 +917,8 @@ def run_phase3_multi(
 
     function_index = build_native_function_index(library_records)
     safe_write_json(function_index_path, function_index)
+    code_index = _load_json_object(code_index_path)
+    java_native_hints = build_java_native_hints(code_index, library_records)
 
     targets = (
         []
@@ -789,6 +929,7 @@ def run_phase3_multi(
             max_libraries=native_max_libraries,
             per_library_limit=max(20, native_max_functions // max(1, native_max_libraries)),
             target_capabilities=native_target_capabilities,
+            java_native_hints=java_native_hints,
         )
     )
     target_payload = {
@@ -854,6 +995,20 @@ def run_phase3_multi(
 
     native_evidence_units = build_native_evidence_units(library_records, targets, decompile_result)
     safe_write_json(evidence_units_path, native_evidence_units)
+    ida_manifest = build_ida_task_manifest(
+        library_records,
+        function_index,
+        targets,
+        code_index=code_index,
+        automated_callgraph=callgraph,
+        review_limit=ida_review_limit,
+    )
+    safe_write_json(ida_manifest_path, ida_manifest)
+    manual_ida_import = import_manual_ida_results(
+        workspace,
+        task_manifest=ida_manifest,
+        library_records=library_records,
+    )
 
     deep_summary = {
         "native_depth": native_depth,
@@ -863,6 +1018,7 @@ def run_phase3_multi(
         "native_max_decompile_targets": native_max_decompile_targets,
         "native_timeout_per_function": native_timeout_per_function,
         "native_timeout_per_app": native_timeout_per_app,
+        "ida_review_limit": ida_review_limit,
         "native_target_capabilities": list(native_target_capabilities),
         "auto_decision": auto_decision,
         "should_attempt_decompile": should_attempt_decompile,
@@ -875,6 +1031,9 @@ def run_phase3_multi(
         "function_features_path": str(function_features_path),
         "string_xrefs_path": str(string_xrefs_path),
         "callgraph_path": str(callgraph_path),
+        "ida_target_manifest_path": str(ida_manifest_path),
+        "manual_ida_import_path": str(manual_ida_paths["import_summary"]),
+        "manual_ida_evidence_path": str(manual_ida_paths["evidence_units"]),
         "decompiler_status": decompile_result.get("status"),
         "attempted_targets": decompile_result.get("attempted_targets"),
         "successful_decompilations": sum(1 for item in decompile_result.get("results") or [] if item.get("success")),
@@ -882,6 +1041,9 @@ def run_phase3_multi(
         "string_xref_function_count": len(string_xrefs),
         "callgraph_node_count": callgraph.get("node_count"),
         "callgraph_edge_count": callgraph.get("edge_count"),
+        "ida_candidate_count": ida_manifest.get("candidate_count"),
+        "ida_review_queue_count": ida_manifest.get("review_queue_count"),
+        "manual_ida_import": manual_ida_import,
     }
     safe_write_json(deep_summary_path, deep_summary)
 
@@ -918,10 +1080,16 @@ def run_phase3_multi(
         "string_xrefs_path": str(string_xrefs_path),
         "callgraph_path": str(callgraph_path),
         "evidence_units_path": str(evidence_units_path),
+        "ida_target_manifest_path": str(ida_manifest_path),
+        "manual_ida_import_path": str(manual_ida_paths["import_summary"]),
+        "manual_ida_evidence_path": str(manual_ida_paths["evidence_units"]),
         "deep_summary_path": str(deep_summary_path),
         "decompilation_path": str(decompile_path),
         "native_evidence_unit_count": len(native_evidence_units),
         "native_function_feature_count": len(function_features),
+        "ida_candidate_count": ida_manifest.get("candidate_count"),
+        "ida_review_queue_count": ida_manifest.get("review_queue_count"),
+        "manual_ida_import": manual_ida_import,
     }
     safe_write_json(analysis_path, payload)
 
@@ -935,9 +1103,17 @@ def run_phase3_multi(
             or decompile_failures
         )
     )
+    manual_ida_import_incomplete = manual_ida_import.get("status") in {
+        "partial",
+        "failed",
+    }
     if extraction_errors and not library_records:
         status = "failed"
-    elif extraction_errors or requested_decompile_incomplete:
+    elif (
+        extraction_errors
+        or requested_decompile_incomplete
+        or manual_ida_import_incomplete
+    ):
         status = "partial"
     else:
         status = "success"
@@ -951,6 +1127,10 @@ def run_phase3_multi(
     if requested_decompile_incomplete:
         warnings.append(
             "Requested native pseudocode generation did not complete for every selected target."
+        )
+    if manual_ida_import_incomplete:
+        warnings.append(
+            "One or more manual IDA results failed identity or content validation."
         )
     result = PhaseResult(
         name="phase3_native",
@@ -969,6 +1149,11 @@ def run_phase3_multi(
             "decompiler_status": (decompile_result or {}).get("status"),
             "extraction_error_count": len(extraction_errors),
             "decompile_failure_count": len(decompile_failures),
+            "ida_candidate_count": ida_manifest.get("candidate_count"),
+            "ida_review_queue_count": ida_manifest.get("review_queue_count"),
+            "manual_ida_status": manual_ida_import.get("status"),
+            "manual_ida_accepted_count": manual_ida_import.get("accepted_count"),
+            "manual_ida_rejected_count": manual_ida_import.get("rejected_count"),
         },
         warnings=warnings,
     )

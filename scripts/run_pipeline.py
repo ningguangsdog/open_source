@@ -109,6 +109,15 @@ def parse_args() -> argparse.Namespace:
         help="Total timeout budget in seconds for optional native decompilation.",
     )
     parser.add_argument(
+        "--ida-review-limit",
+        type=positive_int,
+        default=120,
+        help=(
+            "Number of highest-priority native functions placed in the manual "
+            "IDA review queue. The full candidate inventory is still retained."
+        ),
+    )
+    parser.add_argument(
         "--native-target-capabilities",
         default="",
         help="Comma-separated capability names to prioritize during native target selection.",
@@ -197,6 +206,7 @@ def main() -> int:
         native_max_decompile_targets=args.native_max_decompile_targets,
         native_timeout_per_function=args.native_timeout_per_function,
         native_timeout_per_app=args.native_timeout_per_app,
+        ida_review_limit=args.ida_review_limit,
         native_target_capabilities=tuple(
             item.strip()
             for item in args.native_target_capabilities.split(",")

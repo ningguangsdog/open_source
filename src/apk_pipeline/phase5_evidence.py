@@ -19,7 +19,7 @@ from .run_context import (
 from .utils import ensure_dir, safe_write_json, safe_write_text
 
 
-PHASE_SCHEMA = "2026-07-23.phase5.v4"
+PHASE_SCHEMA = "2026-07-23.phase5.v5"
 SIMILARITY_UNIT_LIMIT = 250
 
 
@@ -335,6 +335,12 @@ def _extract_native_deep_summary(workspace: Path) -> dict[str, Any]:
         "function_features": _load_jsonl(workspace / "phase3_native" / "native_function_features.jsonl")[:100],
         "string_xrefs": _load_list(workspace / "phase3_native" / "native_string_xrefs.json")[:100],
         "callgraph": _load_json(workspace / "phase3_native" / "native_callgraph.json"),
+        "ida_target_manifest": _load_json(
+            workspace / "phase3_native" / "ida_target_manifest.json"
+        ),
+        "manual_ida_import": _load_json(
+            workspace / "phase3_native" / "manual_ida" / "import_summary.json"
+        ),
     }
 
 
@@ -368,6 +374,7 @@ def _collect_evidence_units(workspace: Path) -> list[dict[str, Any]]:
     sources = [
         workspace / "phase2_jadx" / "java_evidence_units.json",
         workspace / "phase3_native" / "native_evidence_units.json",
+        workspace / "phase3_native" / "manual_ida" / "evidence_units.json",
         workspace / "phase4_resources" / "model_evidence_units.json",
         workspace / "phase4_resources" / "resource_evidence_units.json",
     ]
@@ -429,21 +436,30 @@ def _build_java_native_bridge_map(
         if unit.get("kind") == "native_library":
             for stem in _lib_stems([str(unit.get("name") or ""), str(unit.get("library") or "")]):
                 native_libraries[stem].append(unit)
-        elif unit.get("kind") == "native_target":
+        elif unit.get("kind") in {"native_target", "manual_ida_function"}:
             native_targets.append(unit)
 
     symbol_rows: list[dict[str, Any]] = []
     for library in native_analysis.get("libraries") or []:
-        names = []
-        names.extend(library.get("jni_symbols") or [])
-        names.extend(library.get("exported_symbols") or [])
-        for name in names:
+        symbol_records = [
+            item
+            for item in library.get("symbol_records") or []
+            if isinstance(item, dict)
+        ]
+        if not symbol_records:
+            names: list[Any] = []
+            names.extend(library.get("jni_symbols") or [])
+            names.extend(library.get("exported_symbols") or [])
+            symbol_records = [{"name": name} for name in names]
+        for symbol_record in symbol_records:
             symbol_rows.append(
                 {
                     "library": library.get("extracted_path") or library.get("entry"),
                     "library_name": library.get("name"),
+                    "library_sha256": library.get("sha256"),
                     "abi": library.get("abi"),
-                    "symbol": str(name),
+                    "symbol": str(symbol_record.get("name") or ""),
+                    "address": symbol_record.get("address"),
                 }
             )
 
@@ -478,7 +494,7 @@ def _build_java_native_bridge_map(
                 target_stems = _lib_stems([str(target.get("library") or "")])
                 if loaded_stems and not loaded_stems.intersection(target_stems):
                     continue
-                name = str(target.get("name") or "")
+                name = str(target.get("name") or target.get("symbol") or "")
                 if method and not (
                     expected in name or name.endswith(f"_{method}") or f"_{method}__" in name
                 ):
@@ -487,10 +503,21 @@ def _build_java_native_bridge_map(
                     {
                         "unit_id": target.get("unit_id"),
                         "library": target.get("library"),
-                        "name": target.get("name"),
+                        "name": target.get("name") or target.get("symbol"),
+                        "address": target.get("address"),
+                        "abi": target.get("abi"),
                         "score": target.get("score"),
                         "feature_hash": target.get("feature_hash"),
                         "pseudocode_path": target.get("pseudocode_path"),
+                        "evidence_source": target.get("evidence_source"),
+                        "identity_verification": target.get(
+                            "identity_verification"
+                        ),
+                        "semantic_role": target.get("semantic_role"),
+                        "decompiled": target.get("decompiled"),
+                        "algorithm_recovered": target.get(
+                            "algorithm_recovered"
+                        ),
                     }
                 )
                 if len(candidate_targets) >= 40:
@@ -520,7 +547,7 @@ def _build_java_native_bridge_map(
             )
 
     return {
-        "schema_version": "2026-07-05.java-native-bridge-map.v1",
+        "schema_version": "2026-07-23.java-native-bridge-map.v2",
         "mapping_count": len(mappings),
         "mappings": mappings,
         "notes": [
@@ -569,10 +596,20 @@ def _build_evidence_graph(units: list[dict[str, Any]], manifest: dict[str, Any])
                     if target:
                         edges.append({"source": unit["unit_id"], "target": target, "type": "loads_native_library"})
                         break
-        if unit.get("kind") == "native_target":
+        if unit.get("kind") in {"native_target", "manual_ida_function"}:
             target_library = native_libraries.get(Path(str(unit.get("library") or "")).name)
             if target_library:
-                edges.append({"source": target_library, "target": unit["unit_id"], "type": "has_native_target"})
+                edges.append(
+                    {
+                        "source": target_library,
+                        "target": unit["unit_id"],
+                        "type": (
+                            "has_manual_ida_function"
+                            if unit.get("kind") == "manual_ida_function"
+                            else "has_native_target"
+                        ),
+                    }
+                )
 
     return {
         "node_count": len(nodes),
@@ -686,8 +723,13 @@ def _build_similarity_packet(
             "native_methods": unit.get("native_methods"),
             "native_libraries": unit.get("native_libraries"),
             "library": unit.get("library"),
+            "library_name": unit.get("library_name"),
+            "library_sha256": unit.get("library_sha256"),
+            "abi": unit.get("abi"),
+            "address": unit.get("address"),
+            "symbol": unit.get("symbol"),
             "target_kind": unit.get("target_kind"),
-            "name": unit.get("name"),
+            "name": unit.get("name") or unit.get("symbol"),
             "model_path": unit.get("model_path") or unit.get("path"),
             "sha256": unit.get("sha256"),
             "size_bytes": unit.get("size_bytes"),
@@ -697,7 +739,15 @@ def _build_similarity_packet(
             "reasons": unit.get("reasons"),
             "feature_hash": unit.get("feature_hash"),
             "pseudocode_path": unit.get("pseudocode_path"),
+            "pseudocode_excerpt": unit.get("pseudocode_excerpt"),
             "pseudocode_fingerprint": unit.get("pseudocode_fingerprint"),
+            "evidence_source": unit.get("evidence_source"),
+            "identity_verification": unit.get("identity_verification"),
+            "decompiled": unit.get("decompiled"),
+            "algorithm_recovered": unit.get("algorithm_recovered"),
+            "semantic_role": unit.get("semantic_role"),
+            "semantic_confidence": unit.get("semantic_confidence"),
+            "semantic_reasons": unit.get("semantic_reasons"),
             "instruction_count": unit.get("instruction_count"),
             "basic_block_count": unit.get("basic_block_count"),
             "cfg_edge_count": unit.get("cfg_edge_count"),
@@ -723,7 +773,7 @@ def _build_similarity_packet(
         for unit in selected_units
     )
     return {
-        "schema_version": "2026-07-23.similarity-ready.v2",
+        "schema_version": "2026-07-23.similarity-ready.v3",
         "app": {
             "package": manifest.get("package"),
             "app_name": manifest.get("app_name"),
@@ -777,6 +827,15 @@ def _build_similarity_packet(
             "string_xref_function_count": len((native_deep_summary or {}).get("string_xrefs") or []),
             "callgraph_node_count": ((native_deep_summary or {}).get("callgraph") or {}).get("node_count"),
             "callgraph_edge_count": ((native_deep_summary or {}).get("callgraph") or {}).get("edge_count"),
+            "ida_candidate_count": (
+                (native_deep_summary or {}).get("ida_target_manifest") or {}
+            ).get("candidate_count"),
+            "ida_review_queue_count": (
+                (native_deep_summary or {}).get("ida_target_manifest") or {}
+            ).get("review_queue_count"),
+            "manual_ida_import": (
+                native_deep_summary or {}
+            ).get("manual_ida_import") or {},
         },
         "native_probes": native_probe_summaries or [],
         "graph_path": str(graph_path),
@@ -785,6 +844,8 @@ def _build_similarity_packet(
             "This packet is intended for downstream review and similarity preparation.",
             "Hashes identify exact artifacts; token_fingerprint is a normalized static signal, not a similarity score.",
             "Native pseudocode and function features appear when auto/deep native analysis selects targets and an automated adapter is available.",
+            "Manual IDA evidence is identity-verified and remains distinct from automated radare2/rizin evidence.",
+            "decompiled=true records pseudocode production; algorithm_recovered is a separate conservative semantic label.",
             "Java capability counts exclude code classified as third-party or platform by default; dependency signals are reported separately.",
         ],
     }
@@ -914,7 +975,9 @@ def _render_markdown(packet: dict[str, Any]) -> str:
             reasons = ", ".join(target.get("reasons") or [])
             lines.append(
                 f"- `{target.get('name')}` in `{target.get('library')}` "
-                f"(score={target.get('score')}, kind={target.get('kind')}, capabilities={caps or 'unknown'}, reasons={reasons})"
+                f"(abi={target.get('abi') or 'unknown'}, address={target.get('address') or 'unknown'}, "
+                f"score={target.get('score')}, kind={target.get('kind')}, "
+                f"capabilities={caps or 'unknown'}, reasons={reasons})"
             )
     else:
         lines.append("- No high-value native targets were selected.")
@@ -935,6 +998,30 @@ def _render_markdown(packet: dict[str, Any]) -> str:
     lines.append(f"- Callgraph: {callgraph.get('node_count') or 0} nodes, {callgraph.get('edge_count') or 0} edges")
     if (decompile_plan.get("status") or "") == "tool_missing":
         lines.append("- Native pseudocode was not generated because no automated native decompiler was available.")
+    lines.append("")
+
+    manual_ida = packet.get("manual_ida") or {}
+    ida_manifest = manual_ida.get("target_manifest") or {}
+    ida_import = manual_ida.get("import") or {}
+    lines.append("## Manual IDA Classroom Evidence")
+    lines.append(
+        f"- Candidate inventory: {ida_manifest.get('candidate_count') or 0}; "
+        f"priority review queue: {ida_manifest.get('review_queue_count') or 0}"
+    )
+    lines.append(
+        f"- Import status: {ida_import.get('status') or 'no_results'}; "
+        f"accepted={ida_import.get('accepted_count') or 0}; "
+        f"rejected={ida_import.get('rejected_count') or 0}"
+    )
+    role_counts = ida_import.get("semantic_role_counts") or {}
+    lines.append(f"- Semantic roles: {role_counts or {}}")
+    lines.append(
+        "- A verified IDA pseudocode export is recorded as decompiled; only a "
+        "separate substantive-body classification can mark algorithm_recovered=true."
+    )
+    lines.append(
+        "- Manual IDA evidence is stored separately from automated radare2/rizin evidence."
+    )
     lines.append("")
 
     native_probes = packet.get("native_probes") or []
@@ -996,8 +1083,10 @@ def _render_prompt(packet_path: Path) -> str:
             "1. Identify which capabilities appear to run locally on-device.",
             "2. Separate local implementation evidence from cloud/service/dependency evidence.",
             "3. Flag native libraries, model files, and resource files that deserve manual follow-up.",
-            "4. State what cannot be concluded from the available decompiled evidence.",
-            "5. Do not perform open-source similarity scoring unless separate comparison material is provided.",
+            "4. Review manual IDA evidence separately from automated native evidence.",
+            "5. Distinguish pseudocode produced from substantive algorithm recovered.",
+            "6. State what cannot be concluded from the available decompiled evidence.",
+            "7. Do not perform open-source similarity scoring unless separate comparison material is provided.",
             "",
             f"Evidence packet: {packet_path}",
         ]
@@ -1050,6 +1139,9 @@ def run_phase5_evidence(
         workspace / "phase2_jadx" / "cache_manifest.json",
         workspace / "phase3_native" / "native_analysis.json",
         workspace / "phase3_native" / "native_evidence_units.json",
+        workspace / "phase3_native" / "ida_target_manifest.json",
+        workspace / "phase3_native" / "manual_ida" / "import_summary.json",
+        workspace / "phase3_native" / "manual_ida" / "evidence_units.json",
         workspace / "phase3_native" / "cache_manifest.json",
     ]
     if require_resources:
@@ -1177,6 +1269,23 @@ def run_phase5_evidence(
             ownership_categories={"third_party", "platform"},
         ),
         "native_deep": native_deep_summary,
+        "manual_ida": {
+            "target_manifest": {
+                "schema_version": (
+                    native_deep_summary.get("ida_target_manifest") or {}
+                ).get("schema_version"),
+                "candidate_count": (
+                    native_deep_summary.get("ida_target_manifest") or {}
+                ).get("candidate_count"),
+                "review_queue_count": (
+                    native_deep_summary.get("ida_target_manifest") or {}
+                ).get("review_queue_count"),
+                "all_candidates_retained": (
+                    native_deep_summary.get("ida_target_manifest") or {}
+                ).get("all_candidates_retained"),
+            },
+            "import": native_deep_summary.get("manual_ida_import") or {},
+        },
         "native_probes": native_probe_summaries,
         "java_native_bridge_map": {
             "mapping_count": bridge_map.get("mapping_count"),
@@ -1216,6 +1325,21 @@ def run_phase5_evidence(
             "native_callgraph": str(workspace / "phase3_native" / "native_callgraph.json"),
             "native_deep_summary": str(workspace / "phase3_native" / "native_deep_summary.json"),
             "native_evidence_units": str(workspace / "phase3_native" / "native_evidence_units.json"),
+            "ida_target_manifest": str(
+                workspace / "phase3_native" / "ida_target_manifest.json"
+            ),
+            "manual_ida_import": str(
+                workspace
+                / "phase3_native"
+                / "manual_ida"
+                / "import_summary.json"
+            ),
+            "manual_ida_evidence_units": str(
+                workspace
+                / "phase3_native"
+                / "manual_ida"
+                / "evidence_units.json"
+            ),
             "resource_inventory": str(workspace / "phase4_resources" / "resource_inventory.json"),
             "model_evidence_units": str(workspace / "phase4_resources" / "model_evidence_units.json"),
             "resource_evidence_units": str(workspace / "phase4_resources" / "resource_evidence_units.json"),
@@ -1242,13 +1366,19 @@ def run_phase5_evidence(
         warnings.append(
             "Evidence packet is incomplete; inspect the completeness section before review."
         )
+    packet_capability_counts = packet.get("capability_counts")
+    packet_capability_names = (
+        [str(name) for name in packet_capability_counts]
+        if isinstance(packet_capability_counts, dict)
+        else []
+    )
     result = PhaseResult(
         name="phase5_evidence",
         success=status == "success",
         status=status,
         output_paths=output_paths,
         details={
-            "capabilities": capability_names(packet["capability_counts"].keys()),
+            "capabilities": capability_names(packet_capability_names),
             "model_count": len(packet["models"]),
             "native_target_count": len(packet["native_targets"]),
             "native_probe_count": len(native_probe_summaries),

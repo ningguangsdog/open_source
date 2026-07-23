@@ -208,7 +208,7 @@ def run_phase0(
             return cached_phase_result("phase0_split_inventory", [output_path], cached)
 
     records = [_summarize_apk(path, primary_apk) for path in all_apks]
-    payload = {
+    payload: dict[str, Any] = {
         "primary_apk": str(primary_apk),
         "apk_count": len(records),
         "splits": records,

@@ -33,7 +33,7 @@ from .utils import ensure_dir, safe_write_json
 
 logger = logging.getLogger(__name__)
 PIPELINE_VERSION_LABEL = (
-    "July 5 + Native Deep v1 + Run Integrity v1 + Evidence Quality v1"
+    "July 5 + Native Deep v1 + Run Integrity v1 + Evidence Quality v1 + IDA Review v1"
 )
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -152,6 +152,7 @@ class APKPipeline:
                     native_max_decompile_targets=self.config.native_max_decompile_targets,
                     native_timeout_per_function=self.config.native_timeout_per_function,
                     native_timeout_per_app=self.config.native_timeout_per_app,
+                    ida_review_limit=self.config.ida_review_limit,
                     native_target_capabilities=self.config.native_target_capabilities,
                     first_party_native_hashes=self.config.first_party_native_hashes,
                     third_party_native_hashes=self.config.third_party_native_hashes,

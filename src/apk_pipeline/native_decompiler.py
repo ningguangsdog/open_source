@@ -12,6 +12,8 @@ from typing import Any, Callable
 
 from .capability_taxonomy import capability_names, classify_text
 from .evidence import token_fingerprint
+from .ida_integration import normalize_address
+from .native_semantics import abi_analysis_role, classify_native_semantics
 from .utils import ensure_dir, run_cmd, safe_name, safe_write_json, safe_write_text, tool_exists
 
 
@@ -53,9 +55,20 @@ def score_native_text(text: str) -> tuple[int, list[str], list[str]]:
     lowered = text.lower()
 
     for capability, details in classified.items():
+        if not isinstance(details, dict):
+            continue
         capabilities.append(capability)
-        score += int(details.get("score", 0))
-        strong_hits = [str(item) for item in details.get("strong_hits", [])]
+        raw_score = details.get("score")
+        try:
+            score += int(raw_score) if isinstance(raw_score, (int, float, str)) else 0
+        except (TypeError, ValueError):
+            pass
+        raw_strong_hits = details.get("strong_hits")
+        strong_hits = (
+            [str(item) for item in raw_strong_hits]
+            if isinstance(raw_strong_hits, (list, tuple, set))
+            else []
+        )
         if strong_hits:
             reasons.append(f"strong:{','.join(strong_hits[:5])}")
 
@@ -74,12 +87,31 @@ def select_native_targets(
     max_libraries: int | None = None,
     per_library_limit: int = 80,
     target_capabilities: tuple[str, ...] | list[str] | set[str] = (),
+    java_native_hints: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
-    """Rank native functions/libraries that are likely useful for deeper review."""
+    """Rank callable native functions using identity, ABI, and cross-layer evidence."""
 
     targets: list[dict[str, Any]] = []
-    seen: set[tuple[str, str]] = set()
+    seen: set[tuple[str, str, str]] = set()
     desired_capabilities = {str(item) for item in target_capabilities if item}
+    java_native_hints = java_native_hints or []
+    hints_by_target: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+    hints_by_symbol: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    hints_by_library: dict[str, list[dict[str, Any]]] = {}
+    for hint in java_native_hints:
+        hint_library = str(hint.get("library") or "")
+        symbol = str(hint.get("symbol") or "")
+        address = str(normalize_address(hint.get("address")) or "")
+        hints_by_target.setdefault((hint_library, symbol, address), []).append(
+            hint
+        )
+        hints_by_library.setdefault(hint_library, []).append(hint)
+        if symbol:
+            hints_by_symbol.setdefault((hint_library, symbol), []).append(hint)
+    arm64_available = any(
+        str(library.get("abi") or "").lower() == "arm64-v8a"
+        for library in library_records
+    )
     if max_libraries is not None:
         max_libraries = max(1, max_libraries)
     per_library_limit = max(1, per_library_limit)
@@ -88,90 +120,241 @@ def select_native_targets(
         lib_path = library.get("extracted_path") or library.get("path") or library.get("entry")
         if not lib_path:
             continue
+        library_path = str(lib_path)
+        abi = str(library.get("abi") or "")
+        abi_role = abi_analysis_role(abi, arm64_available=arm64_available)
+        model_signal_text = " ".join(
+            str(item.get("value") if isinstance(item, dict) else item)
+            for item in library.get("interesting_strings") or []
+        )
+        model_capabilities = capability_names(
+            (library.get("capability_counts") or {}).keys()
+        )
+        model_dependency_signal = (
+            "local_ml" in model_capabilities
+            or any(
+                marker in model_signal_text.lower()
+                for marker in (
+                    "tflite",
+                    "tensorflow",
+                    "onnx",
+                    "mediapipe",
+                    "interpreter",
+                    "tensor",
+                )
+            )
+        )
 
-        candidates: list[tuple[str, str]] = []
-        for symbol in library.get("jni_symbols") or []:
-            candidates.append(("jni_symbol", str(symbol)))
-        for symbol in library.get("exported_symbols") or []:
-            candidates.append(("exported_symbol", str(symbol)))
-        for item in library.get("interesting_strings") or []:
-            value = item.get("value") if isinstance(item, dict) else item
-            if value:
-                candidates.append(("string", str(value)))
+        candidates: list[dict[str, Any]] = []
+        symbol_records = [
+            item
+            for item in library.get("symbol_records") or []
+            if isinstance(item, dict) and item.get("name")
+        ]
+        if symbol_records:
+            for symbol_record in symbol_records:
+                name = str(symbol_record.get("name") or "")
+                candidates.append(
+                    {
+                        "kind": (
+                            "jni_symbol"
+                            if symbol_record.get("is_jni")
+                            or name in (library.get("jni_symbols") or [])
+                            else "exported_symbol"
+                        ),
+                        "name": name,
+                        "address": normalize_address(symbol_record.get("address")),
+                        "size_bytes": symbol_record.get("size_bytes"),
+                        "symbol_source": symbol_record.get("symbol_source"),
+                    }
+                )
+        else:
+            for kind, symbols in (
+                ("jni_symbol", library.get("jni_symbols") or []),
+                ("exported_symbol", library.get("exported_symbols") or []),
+            ):
+                for symbol in symbols:
+                    candidates.append(
+                        {
+                            "kind": kind,
+                            "name": str(symbol),
+                            "address": None,
+                            "size_bytes": None,
+                            "symbol_source": "legacy_name_list",
+                        }
+                    )
 
         if not candidates:
-            library_score, capabilities, reasons = score_native_text(str(lib_path))
+            library_score, capabilities, reasons = score_native_text(
+                f"{library_path} {model_signal_text[:100000]}"
+            )
+            if abi_role == "primary_production":
+                library_score += 16
+                reasons.append("primary_production_abi")
+            if model_dependency_signal:
+                library_score += 10
+                reasons.append("model_dependency_signal")
             if library_score > 0:
                 if desired_capabilities and desired_capabilities.intersection(capabilities):
                     library_score += 8
                     reasons.append("target_capability")
                 targets.append(
                     {
-                        "library": str(lib_path),
+                        "library": library_path,
                         "kind": "library",
-                        "name": Path(str(lib_path)).name,
+                        "name": Path(library_path).name,
+                        "address": None,
                         "score": library_score,
                         "capabilities": capabilities,
-                        "reasons": reasons,
+                        "reasons": sorted(set(reasons)),
                         "ownership": library.get("ownership") or {},
+                        "library_sha256": library.get("sha256"),
+                        "abi": abi,
+                        "abi_analysis_role": abi_role,
+                        "model_dependency_signal": model_dependency_signal,
+                        "semantic_role_prior": {
+                            "role": "uncertain",
+                            "confidence": "low",
+                            "reasons": ["library_level_discovery_required"],
+                        },
+                        "associated_java_methods": [
+                            hint
+                            for hint in java_native_hints
+                            if str(hint.get("library") or "") == library_path
+                        ],
                     }
                 )
             continue
 
-        for kind, name in candidates:
-            key = (str(lib_path), name)
+        for candidate in candidates:
+            kind = str(candidate.get("kind") or "")
+            name = str(candidate.get("name") or "")
+            address = str(normalize_address(candidate.get("address")) or "")
+            key = (library_path, name, address)
             if key in seen:
                 continue
             seen.add(key)
 
-            score, capabilities, reasons = score_native_text(f"{lib_path} {name}")
+            score, capabilities, reasons = score_native_text(
+                f"{library_path} {name}"
+            )
+            score_components: dict[str, int] = {"native_text_score": score}
             if kind == "jni_symbol":
                 score += 10
+                score_components["jni_symbol_bonus"] = 10
                 reasons.append("jni_symbol")
             elif kind == "exported_symbol":
                 score += 4
+                score_components["exported_symbol_bonus"] = 4
                 reasons.append("exported_symbol")
-            elif kind == "string":
-                score += 2
-                reasons.append("matched_string")
             if desired_capabilities and desired_capabilities.intersection(capabilities):
                 score += 8
+                score_components["target_capability_bonus"] = 8
                 reasons.append("target_capability")
+            if abi_role == "primary_production":
+                score += 16
+                score_components["primary_abi_bonus"] = 16
+                reasons.append("primary_production_abi")
+            elif abi_role == "secondary_production":
+                score += 6
+                score_components["secondary_abi_bonus"] = 6
+                reasons.append("secondary_production_abi")
+            if model_dependency_signal:
+                score += 10
+                score_components["model_dependency_bonus"] = 10
+                reasons.append("model_dependency_signal")
+
+            exact_java = (
+                hints_by_target.get(key)
+                or hints_by_symbol.get((library_path, name))
+                or []
+            )
+            associated_java = exact_java or [
+                hint
+                for hint in hints_by_library.get(library_path) or []
+                if hint.get("match_type") == "load_library"
+            ]
+            if associated_java:
+                java_bonus = (
+                    min(24, 12 * len(associated_java))
+                    if exact_java
+                    else min(8, 4 * len(associated_java))
+                )
+                score += java_bonus
+                score_components["java_jni_bridge_bonus"] = java_bonus
+                reasons.append(
+                    "java_jni_bridge" if exact_java else "java_load_library"
+                )
+
+            semantic_prior = classify_native_semantics(name)
+            if semantic_prior.get("role") == "wrapper":
+                score -= 18
+                score_components["wrapper_penalty"] = -18
+                reasons.append("wrapper_or_trampoline_penalty")
+            ownership = library.get("ownership") or {}
+            if ownership.get("category") in {"third_party", "platform"}:
+                score -= 6
+                score_components["dependency_penalty"] = -6
+                reasons.append("dependency_or_platform_penalty")
 
             if score <= 0:
                 continue
 
             targets.append(
                 {
-                    "library": str(lib_path),
+                    "library": library_path,
                     "kind": kind,
                     "name": name,
+                    "address": normalize_address(candidate.get("address")),
+                    "size_bytes": candidate.get("size_bytes"),
+                    "symbol_source": candidate.get("symbol_source"),
                     "score": score,
                     "capabilities": capability_names(capabilities),
                     "reasons": sorted(set(reasons))[:12],
-                    "ownership": library.get("ownership") or {},
+                    "score_components": score_components,
+                    "ownership": ownership,
+                    "library_sha256": library.get("sha256"),
+                    "abi": abi,
+                    "abi_analysis_role": abi_role,
+                    "model_dependency_signal": model_dependency_signal,
+                    "semantic_role_prior": semantic_prior,
+                    "associated_java_methods": associated_java,
                 }
             )
 
-    targets.sort(key=lambda item: (-int(item["score"]), item["library"], item["name"]))
+    targets.sort(
+        key=lambda item: (
+            -int(item["score"]),
+            0 if item.get("abi_analysis_role") == "primary_production" else 1,
+            item["library"],
+            item.get("address") or "",
+            item["name"],
+        )
+    )
     if max_libraries:
         best_by_library: dict[str, int] = {}
         for target in targets:
-            library = str(target.get("library") or "")
-            best_by_library[library] = max(best_by_library.get(library, 0), int(target.get("score") or 0))
+            target_library = str(target.get("library") or "")
+            best_by_library[target_library] = max(
+                best_by_library.get(target_library, 0),
+                int(target.get("score") or 0),
+            )
         allowed_libraries = {
-            library
-            for library, _ in sorted(best_by_library.items(), key=lambda item: (-item[1], item[0]))[:max_libraries]
+            library_name
+            for library_name, _ in sorted(
+                best_by_library.items(),
+                key=lambda item: (-item[1], item[0]),
+            )[:max_libraries]
         }
         targets = [target for target in targets if str(target.get("library") or "") in allowed_libraries]
 
     grouped: Counter[str] = Counter()
     budgeted: list[dict[str, Any]] = []
     for target in targets:
-        library = str(target.get("library") or "")
-        if grouped[library] >= per_library_limit:
+        target_library = str(target.get("library") or "")
+        if grouped[target_library] >= per_library_limit:
             continue
-        grouped[library] += 1
+        grouped[target_library] += 1
         budgeted.append(target)
         if len(budgeted) >= max_targets:
             break
@@ -397,7 +580,18 @@ def _safe_seek_name(value: str) -> str:
     return safe_name(value)
 
 
-def _resolve_function_seek(target_name: str, functions: list[dict[str, Any]]) -> tuple[str, dict[str, Any] | None]:
+def _resolve_function_seek(
+    target_name: str,
+    target_address: Any,
+    functions: list[dict[str, Any]],
+) -> tuple[str, dict[str, Any] | None]:
+    normalized_address = normalize_address(target_address)
+    if normalized_address:
+        expected_offset = int(normalized_address, 16)
+        for function in functions:
+            if function.get("offset") == expected_offset:
+                return normalized_address, function
+        return normalized_address, None
     for function in functions:
         name = str(function.get("name") or "")
         realname = str(function.get("realname") or "")
@@ -525,8 +719,11 @@ def _build_function_features(
     return {
         "schema_version": "2026-07-05.native-function-features.v1",
         "library": target.get("library"),
+        "library_sha256": target.get("library_sha256"),
+        "abi": target.get("abi"),
         "target_kind": target.get("kind"),
         "name": target.get("name"),
+        "address": target.get("address"),
         "seek": seek,
         "resolved_name": (resolved_function or {}).get("name"),
         "resolved_offset": (resolved_function or {}).get("offset"),
@@ -559,7 +756,11 @@ def _run_rizin_like(
 ) -> dict[str, Any]:
     function_inventory = function_inventory or []
     target_name = str(target.get("name") or "")
-    seek, resolved_function = _resolve_function_seek(target_name, function_inventory)
+    seek, resolved_function = _resolve_function_seek(
+        target_name,
+        target.get("address"),
+        function_inventory,
+    )
     pseudo_result = _run_rizin_command(tool, library_path, [f"pdc @ {seek}"], timeout)
     pseudocode = pseudo_result.get("stdout") or ""
     text = pseudocode or pseudo_result.get("stderr") or ""

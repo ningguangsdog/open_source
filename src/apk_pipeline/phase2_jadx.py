@@ -334,8 +334,19 @@ def _snippet_lines(
 ) -> dict[str, Any]:
     wanted_keywords: dict[str, dict[str, bool]] = defaultdict(dict)
     for capability, details in capability_hits.items():
-        strong_hits = {str(hit).lower() for hit in details.get("strong_hits", [])}
-        for hit in details.get("hits", []):
+        raw_strong_hits = details.get("strong_hits")
+        raw_hits = details.get("hits")
+        strong_hits = {
+            str(hit).lower()
+            for hit in (
+                raw_strong_hits
+                if isinstance(raw_strong_hits, (list, tuple, set))
+                else []
+            )
+        }
+        for hit in (
+            raw_hits if isinstance(raw_hits, (list, tuple, set)) else []
+        ):
             keyword = str(hit).lower()
             wanted_keywords[capability][keyword] = (
                 keyword in strong_hits and keyword in SYMBOL_AFFIX_KEYWORDS
@@ -1130,6 +1141,7 @@ def run_phase2_multi(
     try:
         jadx_cmd = _ensure_jadx(workspace, jadx_version, no_jadx_download)
     except Exception as exc:
+        error_text = f"{type(exc).__name__}: {exc}"
         code_index = build_code_index(
             decompile_root,
             max_snippets_per_capability=max_snippets_per_capability,
@@ -1143,7 +1155,7 @@ def run_phase2_multi(
             "runs": [],
             "success": False,
             "status": "failed",
-            "error": f"{type(exc).__name__}: {exc}",
+            "error": error_text,
             "code_index_path": str(index_path),
             "java_evidence_units_path": str(evidence_path),
             "java_package_index_path": str(package_index_path),
@@ -1158,7 +1170,7 @@ def run_phase2_multi(
             status="failed",
             output_paths=output_paths,
             details={"target_count": len(targets), "usable_target_count": 0},
-            error=payload["error"],
+            error=error_text,
         )
         write_phase_cache(cache_path, cache_spec, output_paths, result)
         return result

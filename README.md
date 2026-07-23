@@ -28,9 +28,12 @@ The pipeline is designed for app-level capability review across many Android app
 
 4. `phase3_native`
    - Extracts native `.so` libraries from all native-bearing APK splits.
-   - Collects strings, exported symbols, JNI symbols, URLs, and capability signals.
-   - Ranks high-value native targets automatically and writes a native function index.
+   - Collects strings, exported/JNI symbols, ELF addresses and sizes, URLs, and capability signals.
+   - Ranks high-value native targets with ABI priority, Java/JNI relationships, model dependencies, call-graph centrality, and conservative wrapper penalties.
+   - Keeps the complete callable candidate inventory while placing only the highest-priority functions in the manual review queue.
    - Writes a native toolchain preflight, decompile plan, function-level feature stream, string/xref view, and lightweight call graph.
+   - Produces an identity-bound IDA Classroom task manifest and validates manually exported pseudocode against the exact library SHA-256, ABI, symbol, and address.
+   - Stores automated `rizin`/`radare2` evidence separately from manual IDA evidence. Producing pseudocode does not by itself establish that a core algorithm was recovered.
    - Attributes native libraries using application JNI prefixes, conservative known-runtime names, and optional SHA-256 registries. Ambiguous product-specific names remain `unknown` and stay in comparison evidence.
    - In the default `--native-depth auto` mode, optional pseudocode and function features are attempted only when high-value targets and a supported native decompiler are available.
 
@@ -106,6 +109,7 @@ python scripts/run_pipeline.py --native-preflight-only
 - `--native-preflight-only`: print native tool availability and exit.
 - `--native-max-libraries`: cap the number of native libraries selected for deeper review.
 - `--native-max-decompile-targets`: cap the number of native targets sent to the optional decompiler.
+- `--ida-review-limit`: cap the priority IDA review queue; the complete candidate inventory remains in the manifest.
 - `--native-target-capabilities`: prioritize one or more capability names during native target selection.
 - `--no-resource-scan`: skip raw model/resource inventory.
 - `--no-evidence-packets`: skip the final review packet.
@@ -144,6 +148,12 @@ apk_workspace/
   phase3_native/native_function_features.jsonl
   phase3_native/native_string_xrefs.json
   phase3_native/native_callgraph.json
+  phase3_native/ida_target_manifest.json
+  phase3_native/manual_ida/README.txt
+  phase3_native/manual_ida/result_template.json
+  phase3_native/manual_ida/results/
+  phase3_native/manual_ida/import_summary.json
+  phase3_native/manual_ida/evidence_units.json
   phase3_native/probes/<profile>/native_probe_summary.json
   phase3_native/probes/<profile>/native_probe_review_units.jsonl
   phase3_native/native_evidence_units.json
@@ -204,6 +214,9 @@ The most useful files for review are usually:
 - `phase3_native/native_function_features.jsonl`
 - `phase3_native/native_string_xrefs.json`
 - `phase3_native/native_callgraph.json`
+- `phase3_native/ida_target_manifest.json`
+- `phase3_native/manual_ida/import_summary.json`
+- `phase3_native/manual_ida/evidence_units.json`
 - `phase3_native/probes/<profile>/native_probe_summary.json`
 - `phase3_native/probes/<profile>/native_probe_review_units.jsonl`
 - `phase4_resources/resource_inventory.json`
@@ -216,6 +229,38 @@ JADX decompiles Dalvik bytecode and does not decompile native `.so` libraries. N
 In `--native-depth auto`, the pipeline first ranks high-value native targets, writes `phase3_native/native_decompile_plan.json`, and attempts native pseudocode/function-feature extraction only when an automated adapter is available. If no adapter is available, the run still records the missing tool in `phase3_native/native_toolchain.json` and keeps the ranked target plan for follow-up.
 
 Function-level outputs include normalized instruction features, pseudocode fingerprints, basic block counts, string references, call targets, and a lightweight call graph. These are intended as evidence for downstream review and later similarity preparation, not as a complete source reconstruction.
+
+## Manual IDA Classroom Review
+
+`phase3_native/ida_target_manifest.json` is the handoff from the automated
+pipeline to IDA. ARM64 production libraries are prioritized; x86 and x86_64
+variants are retained for cross-validation. Each task records the library
+SHA-256, ABI, symbol, address, selection reasons, semantic prior, and related
+Java native methods. The `review_queue` is bounded for practical review, while
+`candidates` retains every callable candidate discovered by the pipeline.
+
+For each reviewed function:
+
+1. Save the pseudocode as UTF-8 text under
+   `phase3_native/manual_ida/results/`.
+2. Create a JSON metadata file from
+   `phase3_native/manual_ida/result_template.json`.
+3. Copy the exact library SHA-256, ABI, function address, symbol, and IDA
+   version from the task and IDA database.
+4. Import and refresh the final evidence packet:
+
+```bash
+python scripts/import_ida_results.py \
+  --workspace ./apk_workspace \
+  --refresh-phase5
+```
+
+The importer rejects results that do not match the current workspace or whose
+symbol and address identify different functions. Accepted functions are labeled
+independently as `wrapper`, `orchestration`, `algorithm`, `model_runtime`,
+`utility`, or `uncertain`. `decompiled=true` means that verified pseudocode was
+produced; `algorithm_recovered=true` is reserved for a substantive algorithm
+body rather than a wrapper or runtime call.
 
 ## Focused Native Probes
 

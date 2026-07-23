@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable as IterableABC
 from dataclasses import dataclass
 from typing import Iterable
 
@@ -319,9 +320,8 @@ def capability_names(names: Iterable[object] | object | None = None) -> list[str
         return ordered
     if isinstance(names, (str, bytes)):
         selected = {str(names)}
+    elif isinstance(names, IterableABC):
+        selected = {str(name) for name in names}
     else:
-        try:
-            selected = {str(name) for name in names}  # type: ignore[arg-type]
-        except TypeError:
-            selected = {str(names)}
+        selected = {str(names)}
     return [name for name in ordered if name in selected]
