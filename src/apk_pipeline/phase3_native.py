@@ -20,6 +20,7 @@ from .evidence import capability_confidence, compact_list, token_fingerprint, un
 from .ida_integration import (
     build_ida_task_manifest,
     build_java_native_hints,
+    export_ida_handoff,
     import_manual_ida_results,
     normalize_address,
     prepare_manual_ida_workspace,
@@ -43,18 +44,22 @@ from .run_context import (
 from .utils import (
     ensure_dir,
     printable_strings_from_bytes,
+    reset_dir,
     run_cmd,
     safe_name,
     safe_read_text,
+    safe_zip_target,
     safe_write_json,
     sha256_file,
     tool_exists,
+    validate_zip,
 )
 
 
 URL_RE = re.compile(r"https?://[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+")
-MAX_STRINGS = 5000
+MAX_STRINGS = 20000
 MAX_INTERESTING_STRINGS = 500
+NATIVE_TOOL_TIMEOUT_SECONDS = 120
 AUTO_DEEP_MIN_SCORE = 18
 AUTO_DEEP_MIN_CAPABILITY_SCORE = 12
 PHASE_SCHEMA = "2026-07-23.phase3.v4"
@@ -94,10 +99,11 @@ def _manual_ida_input_fingerprint(results_dir: Path) -> str:
 
 
 def _native_entries(apk_path: Path) -> list[zipfile.ZipInfo]:
+    infos = validate_zip(apk_path)
     with zipfile.ZipFile(apk_path, "r") as zf:
         return [
             info
-            for info in zf.infolist()
+            for info in infos
             if not info.is_dir()
             and info.filename.lower().startswith("lib/")
             and info.filename.lower().endswith(".so")
@@ -127,7 +133,7 @@ def _extract_native_libraries(apk_paths: list[Path], libs_dir: Path) -> list[dic
         with zipfile.ZipFile(apk_path, "r") as zf:
             for info in entries:
                 parts = [safe_name(part) for part in Path(info.filename).parts]
-                output_path = apk_out_dir.joinpath(*parts)
+                output_path = safe_zip_target(apk_out_dir, "/".join(parts))
                 ensure_dir(output_path.parent)
                 with zf.open(info, "r") as src, output_path.open("wb") as dst:
                     for chunk in iter(lambda: src.read(1024 * 1024), b""):
@@ -139,6 +145,11 @@ def _extract_native_libraries(apk_paths: list[Path], libs_dir: Path) -> list[dic
                         "abi": Path(info.filename).parts[1] if len(Path(info.filename).parts) > 1 else None,
                         "name": Path(info.filename).name,
                         "extracted_path": str(output_path),
+                        "workspace_relative_path": str(
+                            output_path.resolve().relative_to(
+                                libs_dir.parent.resolve()
+                            )
+                        ),
                         "size_bytes": info.file_size,
                         "sha256": sha256_file(output_path),
                         "success": True,
@@ -147,14 +158,65 @@ def _extract_native_libraries(apk_paths: list[Path], libs_dir: Path) -> list[dic
     return records
 
 
-def _run_strings(path: Path) -> list[str]:
-    if tool_exists("strings"):
-        completed = run_cmd(["strings", "-a", str(path)], check=False)
-        if completed.returncode == 0:
-            return completed.stdout.splitlines()[:MAX_STRINGS]
+def _stratified_values(values: list[str], limit: int) -> list[str]:
+    if len(values) <= limit:
+        return values
+    if limit <= 1:
+        return values[:limit]
+    indexes = {
+        round(index * (len(values) - 1) / (limit - 1))
+        for index in range(limit)
+    }
+    return [values[index] for index in sorted(indexes)]
 
-    data = path.read_bytes()[:20_000_000]
-    return printable_strings_from_bytes(data, min_length=4, limit=MAX_STRINGS)
+
+def _sample_binary_bytes(path: Path, *, window_size: int = 8_000_000) -> bytes:
+    size = path.stat().st_size
+    if size <= window_size * 3:
+        return path.read_bytes()
+    offsets = (0, max(0, (size - window_size) // 2), size - window_size)
+    chunks: list[bytes] = []
+    with path.open("rb") as fh:
+        for offset in offsets:
+            fh.seek(offset)
+            chunks.append(fh.read(window_size))
+    return b"\0".join(chunks)
+
+
+def _run_strings(path: Path) -> tuple[list[str], dict[str, Any]]:
+    if tool_exists("strings"):
+        try:
+            completed = run_cmd(
+                ["strings", "-a", str(path)],
+                check=False,
+                timeout=NATIVE_TOOL_TIMEOUT_SECONDS,
+            )
+            if completed.returncode == 0:
+                all_strings = completed.stdout.splitlines()
+                selected = _stratified_values(all_strings, MAX_STRINGS)
+                return selected, {
+                    "method": "gnu_strings_stratified",
+                    "discovered_count": len(all_strings),
+                    "selected_count": len(selected),
+                    "excluded_count": max(0, len(all_strings) - len(selected)),
+                    "selection_rule": "evenly_spaced_across_complete_strings_output",
+                }
+        except Exception:
+            pass
+
+    data = _sample_binary_bytes(path)
+    selected = printable_strings_from_bytes(
+        data,
+        min_length=4,
+        limit=MAX_STRINGS,
+    )
+    return selected, {
+        "method": "binary_head_middle_tail_windows",
+        "discovered_count": None,
+        "selected_count": len(selected),
+        "excluded_count": None,
+        "selection_rule": "8MB windows from head, middle, and tail",
+    }
 
 
 def _extract_symbols(
@@ -175,7 +237,11 @@ def _extract_symbols(
 
     for command in commands:
         try:
-            completed = run_cmd(command, check=False)
+            completed = run_cmd(
+                command,
+                check=False,
+                timeout=NATIVE_TOOL_TIMEOUT_SECONDS,
+            )
         except Exception as exc:
             warnings.append(f"{command[0]} failed: {exc!r}")
             continue
@@ -240,7 +306,9 @@ def _extract_symbols(
     return sorted(exported), sorted(jni), records, warnings
 
 
-def _interesting_strings(strings: list[str]) -> tuple[list[dict[str, Any]], list[str], dict[str, int]]:
+def _interesting_strings(
+    strings: list[str],
+) -> tuple[list[dict[str, Any]], list[str], dict[str, int], dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     capability_counts: Counter[str] = Counter()
     urls: set[str] = set()
@@ -254,17 +322,27 @@ def _interesting_strings(strings: list[str]) -> tuple[list[dict[str, Any]], list
         for capability in capabilities:
             capability_counts[capability] += 1
         urls.update(found_urls)
-        rows.append(
-            {
-                "value": value[:500],
-                "capabilities": capabilities,
-                "urls": found_urls[:20],
-            }
-        )
-        if len(rows) >= MAX_INTERESTING_STRINGS:
-            break
+        if len(rows) < MAX_INTERESTING_STRINGS:
+            rows.append(
+                {
+                    "value": value[:500],
+                    "capabilities": capabilities,
+                    "urls": found_urls[:20],
+                }
+            )
 
-    return rows, sorted(urls)[:200], dict(capability_counts)
+    discovered_count = sum(capability_counts.values())
+    return (
+        rows,
+        sorted(urls)[:200],
+        dict(capability_counts),
+        {
+            "matched_capability_occurrence_count": discovered_count,
+            "selected_string_count": len(rows),
+            "selection_limit": MAX_INTERESTING_STRINGS,
+            "selection_rule": "first_matching_strings_from_stratified_input",
+        },
+    )
 
 
 def _analyze_library(record: dict[str, Any]) -> dict[str, Any]:
@@ -272,8 +350,10 @@ def _analyze_library(record: dict[str, Any]) -> dict[str, Any]:
         return record
 
     path = Path(str(record["extracted_path"]))
-    strings = _run_strings(path)
-    interesting, urls, capability_counts = _interesting_strings(strings)
+    strings, string_selection = _run_strings(path)
+    interesting, urls, capability_counts, interesting_selection = _interesting_strings(
+        strings
+    )
     (
         exported_symbols,
         jni_symbols,
@@ -285,6 +365,8 @@ def _analyze_library(record: dict[str, Any]) -> dict[str, Any]:
     enriched.update(
         {
             "string_count_sampled": len(strings),
+            "string_selection": string_selection,
+            "interesting_string_selection": interesting_selection,
             "interesting_strings": interesting,
             "urls": urls,
             "capability_counts": capability_counts,
@@ -471,14 +553,17 @@ def build_native_function_index(
     }
 
 
-def _decompile_result_map(decompile_result: dict[str, Any] | None) -> dict[tuple[str, str], dict[str, Any]]:
-    mapped: dict[tuple[str, str], dict[str, Any]] = {}
+def _decompile_result_map(
+    decompile_result: dict[str, Any] | None,
+) -> dict[tuple[str, str, str], dict[str, Any]]:
+    mapped: dict[tuple[str, str, str], dict[str, Any]] = {}
     for result in (decompile_result or {}).get("results") or []:
         target = result.get("target") or {}
         library = str(target.get("library") or "")
         name = str(target.get("name") or "")
+        address = str(normalize_address(target.get("address")) or "")
         if library and name:
-            mapped[(library, name)] = result
+            mapped[(library, name, address)] = result
     return mapped
 
 
@@ -607,7 +692,11 @@ def build_native_evidence_units(
         )
 
     for target in targets:
-        key = (str(target.get("library") or ""), str(target.get("name") or ""))
+        key = (
+            str(target.get("library") or ""),
+            str(target.get("name") or ""),
+            str(normalize_address(target.get("address")) or ""),
+        )
         result = decompiled.get(key)
         output_path = result.get("output_path") if result else None
         features = result.get("function_features") if result else None
@@ -628,7 +717,13 @@ def build_native_evidence_units(
         )
         units.append(
             {
-                "unit_id": unit_id("native_target", target.get("library"), target.get("kind"), target.get("name")),
+                "unit_id": unit_id(
+                    "native_target",
+                    target.get("library"),
+                    target.get("kind"),
+                    target.get("name"),
+                    normalize_address(target.get("address")),
+                ),
                 "phase": "phase3_native",
                 "kind": "native_target",
                 "library": target.get("library"),
@@ -739,6 +834,7 @@ def run_phase3_multi(
     native_timeout_per_function: int = 90,
     native_timeout_per_app: int = 3600,
     ida_review_limit: int = 120,
+    ida_handoff_max_libraries: int = 12,
     native_target_capabilities: tuple[str, ...] = (),
     first_party_native_hashes: tuple[str, ...] = (),
     third_party_native_hashes: tuple[str, ...] = (),
@@ -760,6 +856,7 @@ def run_phase3_multi(
         "native_timeout_per_function": native_timeout_per_function,
         "native_timeout_per_app": native_timeout_per_app,
         "ida_review_limit": ida_review_limit,
+        "ida_handoff_max_libraries": ida_handoff_max_libraries,
     }
     invalid_values = [
         name for name, value in positive_values.items() if value <= 0
@@ -831,6 +928,8 @@ def run_phase3_multi(
     evidence_units_path = output_dir / "native_evidence_units.json"
     deep_summary_path = output_dir / "native_deep_summary.json"
     ida_manifest_path = output_dir / "ida_target_manifest.json"
+    ida_handoff_manifest_path = output_dir / "ida_handoff" / "ida_handoff_manifest.json"
+    ida_handoff_zip_path = output_dir / "ida_handoff.zip"
     manual_ida_paths = prepare_manual_ida_workspace(output_dir / "manual_ida")
     cache_path = output_dir / "cache_manifest.json"
     manifest_path = workspace / "phase1_manifest" / "manifest_summary.json"
@@ -850,6 +949,8 @@ def run_phase3_multi(
         evidence_units_path,
         deep_summary_path,
         ida_manifest_path,
+        ida_handoff_manifest_path,
+        ida_handoff_zip_path,
         manual_ida_paths["template"],
         manual_ida_paths["readme"],
         manual_ida_paths["import_summary"],
@@ -867,6 +968,7 @@ def run_phase3_multi(
             "native_timeout_per_function": native_timeout_per_function,
             "native_timeout_per_app": native_timeout_per_app,
             "ida_review_limit": ida_review_limit,
+            "ida_handoff_max_libraries": ida_handoff_max_libraries,
             "native_target_capabilities": list(native_target_capabilities),
             "app_package": app_package,
             "first_party_native_hashes": sorted(first_party_native_hashes),
@@ -884,6 +986,8 @@ def run_phase3_multi(
         if cached:
             return cached_phase_result("phase3_native", output_paths, cached)
 
+    reset_dir(libs_dir)
+    reset_dir(output_dir / "decompiled_targets")
     extracted = _extract_native_libraries(apk_paths, libs_dir)
     library_records = [_analyze_library(record) for record in extracted if record.get("success")]
     for record in library_records:
@@ -1004,6 +1108,11 @@ def run_phase3_multi(
         review_limit=ida_review_limit,
     )
     safe_write_json(ida_manifest_path, ida_manifest)
+    ida_handoff = export_ida_handoff(
+        workspace,
+        ida_manifest,
+        max_libraries=ida_handoff_max_libraries,
+    )
     manual_ida_import = import_manual_ida_results(
         workspace,
         task_manifest=ida_manifest,
@@ -1019,6 +1128,7 @@ def run_phase3_multi(
         "native_timeout_per_function": native_timeout_per_function,
         "native_timeout_per_app": native_timeout_per_app,
         "ida_review_limit": ida_review_limit,
+        "ida_handoff_max_libraries": ida_handoff_max_libraries,
         "native_target_capabilities": list(native_target_capabilities),
         "auto_decision": auto_decision,
         "should_attempt_decompile": should_attempt_decompile,
@@ -1032,6 +1142,9 @@ def run_phase3_multi(
         "string_xrefs_path": str(string_xrefs_path),
         "callgraph_path": str(callgraph_path),
         "ida_target_manifest_path": str(ida_manifest_path),
+        "ida_handoff_manifest_path": str(ida_handoff_manifest_path),
+        "ida_handoff_zip_path": str(ida_handoff_zip_path),
+        "ida_handoff": ida_handoff,
         "manual_ida_import_path": str(manual_ida_paths["import_summary"]),
         "manual_ida_evidence_path": str(manual_ida_paths["evidence_units"]),
         "decompiler_status": decompile_result.get("status"),
@@ -1081,6 +1194,8 @@ def run_phase3_multi(
         "callgraph_path": str(callgraph_path),
         "evidence_units_path": str(evidence_units_path),
         "ida_target_manifest_path": str(ida_manifest_path),
+        "ida_handoff_manifest_path": str(ida_handoff_manifest_path),
+        "ida_handoff_zip_path": str(ida_handoff_zip_path),
         "manual_ida_import_path": str(manual_ida_paths["import_summary"]),
         "manual_ida_evidence_path": str(manual_ida_paths["evidence_units"]),
         "deep_summary_path": str(deep_summary_path),
@@ -1089,6 +1204,7 @@ def run_phase3_multi(
         "native_function_feature_count": len(function_features),
         "ida_candidate_count": ida_manifest.get("candidate_count"),
         "ida_review_queue_count": ida_manifest.get("review_queue_count"),
+        "ida_handoff_library_count": ida_handoff.get("selected_library_count"),
         "manual_ida_import": manual_ida_import,
     }
     safe_write_json(analysis_path, payload)
@@ -1151,6 +1267,9 @@ def run_phase3_multi(
             "decompile_failure_count": len(decompile_failures),
             "ida_candidate_count": ida_manifest.get("candidate_count"),
             "ida_review_queue_count": ida_manifest.get("review_queue_count"),
+            "ida_handoff_library_count": ida_handoff.get(
+                "selected_library_count"
+            ),
             "manual_ida_status": manual_ida_import.get("status"),
             "manual_ida_accepted_count": manual_ida_import.get("accepted_count"),
             "manual_ida_rejected_count": manual_ida_import.get("rejected_count"),

@@ -170,6 +170,7 @@ def classify_code_ownership(
     explicit_first = normalize_prefixes(first_party_prefixes)
     inferred_first = infer_first_party_prefixes(app_package)
     explicit_third = normalize_prefixes(third_party_prefixes)
+    normalized_app_package = (app_package or "").strip().strip(".")
 
     if normalized_package:
         for prefix in explicit_first:
@@ -180,14 +181,16 @@ def classify_code_ownership(
                     "Matched an explicitly configured first-party package prefix.",
                     prefix,
                 )
-        for prefix in inferred_first:
-            if _matches_prefix(normalized_package, prefix):
-                return OwnershipResult(
-                    "first_party",
-                    0.95 if prefix.rstrip(".") == (app_package or "").strip(".") else 0.85,
-                    "Matched the application package or its inferred organization root.",
-                    prefix,
-                )
+        if normalized_app_package and (
+            normalized_package == normalized_app_package
+            or normalized_package.startswith(normalized_app_package + ".")
+        ):
+            return OwnershipResult(
+                "first_party",
+                0.98,
+                "Matched the exact application package namespace.",
+                normalized_app_package + ".",
+            )
         for prefix in PLATFORM_PREFIXES:
             if _matches_prefix(normalized_package, prefix):
                 return OwnershipResult(
@@ -210,6 +213,14 @@ def classify_code_ownership(
                     "third_party",
                     0.92,
                     "Matched the built-in SDK and dependency package registry.",
+                    prefix,
+                )
+        for prefix in inferred_first:
+            if _matches_prefix(normalized_package, prefix):
+                return OwnershipResult(
+                    "unknown",
+                    0.45,
+                    "Matched only the inferred organization root; retained as uncertain ownership.",
                     prefix,
                 )
 

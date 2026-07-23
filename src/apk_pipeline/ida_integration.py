@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+import csv
 import hashlib
 import json
+import os
 import re
+import shutil
+import tempfile
+import zipfile
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Iterable
@@ -13,17 +18,20 @@ from .capability_taxonomy import capability_names, classify_text
 from .evidence import token_fingerprint, unit_id
 from .native_semantics import abi_analysis_role, classify_native_semantics
 from .utils import (
+    atomic_text_writer,
     ensure_dir,
+    reset_dir,
     safe_read_text,
+    safe_name,
     safe_write_json,
     safe_write_text,
     sha256_file,
 )
 
 
-IDA_TASK_SCHEMA = "2026-07-23.ida-task-manifest.v1"
-IDA_RESULT_SCHEMA = "2026-07-23.ida-manual-result.v1"
-IDA_IMPORT_SCHEMA = "2026-07-23.ida-import.v1"
+IDA_TASK_SCHEMA = "2026-07-23.ida-task-manifest.v2"
+IDA_RESULT_SCHEMA = "2026-07-23.ida-manual-result.v2"
+IDA_IMPORT_SCHEMA = "2026-07-23.ida-import.v2"
 CALLABLE_KINDS = {
     "jni_symbol",
     "exported_symbol",
@@ -371,6 +379,7 @@ def build_ida_task_manifest(
                 ),
                 "task_type": "function",
                 "library": library_path,
+                "workspace_relative_path": library.get("workspace_relative_path"),
                 "library_name": library.get("name"),
                 "library_sha256": library.get("sha256"),
                 "abi": abi,
@@ -402,50 +411,67 @@ def build_ida_task_manifest(
             candidates.append(candidate)
             library_candidate_count += 1
 
-        if not functions:
-            candidates.append(
-                {
-                    "task_id": unit_id(
-                        "ida_library_discovery",
-                        library.get("sha256"),
-                        abi,
-                    ),
-                    "task_type": "library_discovery",
-                    "library": library_path,
-                    "library_name": library.get("name"),
-                    "library_sha256": library.get("sha256"),
-                    "abi": abi,
-                    "abi_analysis_role": analysis_role,
-                    "symbol": None,
-                    "address": None,
-                    "priority_score": (
-                        16 if analysis_role == "primary_production" else 0
+        discovery_components = {
+            "library_discovery_required": 1,
+            "arm64_priority_bonus": (
+                16
+                if analysis_role == "primary_production"
+                else 6
+                if analysis_role == "secondary_production"
+                else 0
+            ),
+            "model_dependency_bonus": 10 if model_dependency else 0,
+            "java_bridge_bonus": min(
+                20,
+                4 * len(hints_by_library.get(library_path) or []),
+            ),
+        }
+        candidates.append(
+            {
+                "task_id": unit_id(
+                    "ida_library_discovery",
+                    library.get("sha256"),
+                    abi,
+                ),
+                "task_type": "library_discovery",
+                "library": library_path,
+                "workspace_relative_path": library.get(
+                    "workspace_relative_path"
+                ),
+                "library_name": library.get("name"),
+                "library_sha256": library.get("sha256"),
+                "abi": abi,
+                "abi_analysis_role": analysis_role,
+                "symbol": None,
+                "address": None,
+                "priority_score": sum(discovery_components.values()),
+                "score_components": discovery_components,
+                "capabilities": indexed_library.get("capabilities") or [],
+                "selection_reasons": [
+                    (
+                        "no_callable_exported_symbols"
+                        if not functions
+                        else "discover_internal_implementations_beyond_exported_wrappers"
                     )
-                    + (10 if model_dependency else 0)
-                    + min(20, 4 * len(hints_by_library.get(library_path) or [])),
-                    "score_components": {
-                        "library_discovery_required": 1,
-                        "model_dependency_bonus": 10 if model_dependency else 0,
-                    },
-                    "capabilities": indexed_library.get("capabilities") or [],
-                    "selection_reasons": ["no_callable_exported_symbols"],
-                    "selected_by_automated_ranking": False,
-                    "associated_java_methods": hints_by_library.get(library_path)
-                    or [],
-                    "model_dependency_signal": model_dependency,
-                    "semantic_role_prior": {
-                        "role": "uncertain",
-                        "confidence": "low",
-                        "reasons": ["library_level_discovery_required"],
-                    },
-                    "review_status": "pending",
-                }
-            )
-            library_candidate_count = 1
+                ],
+                "selected_by_automated_ranking": False,
+                "associated_java_methods": hints_by_library.get(library_path)
+                or [],
+                "model_dependency_signal": model_dependency,
+                "semantic_role_prior": {
+                    "role": "uncertain",
+                    "confidence": "low",
+                    "reasons": ["library_level_discovery_required"],
+                },
+                "review_status": "pending",
+            }
+        )
+        library_candidate_count += 1
 
         library_summaries.append(
             {
                 "library": library_path,
+                "workspace_relative_path": library.get("workspace_relative_path"),
                 "library_name": library.get("name"),
                 "library_sha256": library.get("sha256"),
                 "abi": abi,
@@ -472,19 +498,51 @@ def build_ida_task_manifest(
         )
     )
     review_limit = max(1, review_limit)
+    buckets: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+    for candidate in candidates:
+        bucket_key = (
+            str(candidate.get("library_sha256") or ""),
+            str(candidate.get("abi") or ""),
+        )
+        buckets[bucket_key].append(candidate)
+    ordered_bucket_keys = sorted(
+        buckets,
+        key=lambda key: (
+            -int(buckets[key][0].get("priority_score") or 0),
+            key,
+        ),
+    )
+    diversified: list[dict[str, Any]] = []
+    while ordered_bucket_keys and len(diversified) < review_limit:
+        remaining_keys: list[tuple[str, str]] = []
+        for review_bucket_key in ordered_bucket_keys:
+            bucket = buckets[review_bucket_key]
+            if bucket and len(diversified) < review_limit:
+                diversified.append(bucket.pop(0))
+            if bucket:
+                remaining_keys.append(review_bucket_key)
+        ordered_bucket_keys = remaining_keys
+
     review_queue = [
         {
             "rank": index,
             "task_id": candidate["task_id"],
+            "task_type": candidate.get("task_type"),
+            "library": candidate.get("library"),
+            "workspace_relative_path": candidate.get("workspace_relative_path"),
             "library_name": candidate.get("library_name"),
             "library_sha256": candidate.get("library_sha256"),
             "abi": candidate.get("abi"),
             "symbol": candidate.get("symbol"),
             "address": candidate.get("address"),
             "priority_score": candidate.get("priority_score"),
+            "capabilities": candidate.get("capabilities") or [],
+            "selection_reasons": candidate.get("selection_reasons") or [],
+            "associated_java_methods": candidate.get("associated_java_methods")
+            or [],
             "semantic_role_prior": candidate.get("semantic_role_prior"),
         }
-        for index, candidate in enumerate(candidates[:review_limit], start=1)
+        for index, candidate in enumerate(diversified, start=1)
     ]
     return {
         "schema_version": IDA_TASK_SCHEMA,
@@ -497,6 +555,9 @@ def build_ida_task_manifest(
             "decompiled_definition": (
                 "decompiled means pseudocode was produced; it does not imply that "
                 "a core algorithm was recovered"
+            ),
+            "review_queue_selection": (
+                "round_robin_across_library_sha256_and_abi_after_priority_sort"
             ),
         },
         "library_count": len(library_summaries),
@@ -519,13 +580,14 @@ def prepare_manual_ida_workspace(manual_root: Path) -> dict[str, Path]:
         template_path,
         {
             "schema_version": IDA_RESULT_SCHEMA,
+            "task_id": "<copy from ida_target_manifest.json>",
             "library_sha256": "<copy from ida_target_manifest.json>",
             "library_name": "<library file name>",
             "abi": "arm64-v8a",
             "address": "0x0",
             "symbol": "<IDA function name>",
             "ida_version": "<IDA version>",
-            "pseudocode_file": "results/<matching .c or .txt file>",
+            "pseudocode_file": "<matching .c or .txt file>",
         },
     )
     safe_write_text(
@@ -537,7 +599,7 @@ def prepare_manual_ida_workspace(manual_root: Path) -> dict[str, Path]:
                 "1. Select a task from ../ida_target_manifest.json.",
                 "2. Save pseudocode as UTF-8 text under this results directory.",
                 "3. Save one JSON metadata file per function using result_template.json.",
-                "4. Keep the exact library SHA-256, ABI, address, symbol, and IDA version.",
+                "4. Keep the exact task ID, library SHA-256, ABI, address, symbol, and IDA version.",
                 "5. Run: python scripts/import_ida_results.py --workspace <workspace> --refresh-phase5",
                 "",
                 "A produced pseudocode file is recorded as decompiled. Semantic role is",
@@ -554,6 +616,165 @@ def prepare_manual_ida_workspace(manual_root: Path) -> dict[str, Path]:
         "import_summary": manual_root / "import_summary.json",
         "evidence_units": manual_root / "evidence_units.json",
     }
+
+
+def export_ida_handoff(
+    workspace: Path,
+    task_manifest: dict[str, Any],
+    *,
+    max_libraries: int = 12,
+) -> dict[str, Any]:
+    """Package a portable, bounded set of ranked libraries for manual IDA review."""
+
+    if max_libraries < 1:
+        raise ValueError("max_libraries must be positive")
+    phase3_dir = workspace / "phase3_native"
+    handoff_dir = reset_dir(phase3_dir / "ida_handoff")
+    binaries_dir = ensure_dir(handoff_dir / "binaries")
+    candidates_by_task = {
+        str(item.get("task_id") or ""): item
+        for item in task_manifest.get("candidates") or []
+        if isinstance(item, dict)
+    }
+    selected_libraries: list[dict[str, Any]] = []
+    selected_keys: set[tuple[str, str]] = set()
+    selected_tasks: list[dict[str, Any]] = []
+
+    for queued in task_manifest.get("review_queue") or []:
+        if not isinstance(queued, dict):
+            continue
+        candidate = candidates_by_task.get(str(queued.get("task_id") or ""))
+        if not candidate:
+            continue
+        key = (
+            str(candidate.get("library_sha256") or "").lower(),
+            str(candidate.get("abi") or ""),
+        )
+        if key not in selected_keys:
+            if len(selected_keys) >= max_libraries:
+                continue
+            source_path = _resolve_library_binary(workspace, candidate)
+            actual_sha = sha256_file(source_path).lower()
+            if actual_sha != key[0]:
+                raise ValueError(
+                    f"IDA handoff hash mismatch for {source_path}: {actual_sha} != {key[0]}"
+                )
+            selected_keys.add(key)
+            destination_name = "__".join(
+                (
+                    f"{len(selected_keys):02d}",
+                    safe_name(key[1] or "unknown_abi"),
+                    safe_name(
+                        Path(
+                            str(
+                                candidate.get("library_name")
+                                or source_path.name
+                            )
+                        ).stem
+                    ),
+                    actual_sha[:12],
+                )
+            ) + ".so"
+            destination = binaries_dir / destination_name
+            shutil.copy2(source_path, destination)
+            binary_record = {
+                "library_rank": len(selected_keys),
+                "library_name": candidate.get("library_name"),
+                "abi": key[1],
+                "library_sha256": actual_sha,
+                "source_workspace_relative_path": candidate.get(
+                    "workspace_relative_path"
+                ),
+                "handoff_path": str(destination.relative_to(handoff_dir)),
+                "size_bytes": destination.stat().st_size,
+            }
+            selected_libraries.append(binary_record)
+        if key in selected_keys:
+            selected_tasks.append(dict(queued))
+
+    handoff_manifest = {
+        "schema_version": "2026-07-23.ida-handoff.v1",
+        "source_task_schema": task_manifest.get("schema_version"),
+        "selection_policy": (
+            "first ranked unique library-and-ABI pairs from the diversified review queue"
+        ),
+        "max_libraries": max_libraries,
+        "selected_library_count": len(selected_libraries),
+        "excluded_library_count": max(
+            0,
+            int(task_manifest.get("library_count") or 0) - len(selected_libraries),
+        ),
+        "selected_task_count": len(selected_tasks),
+        "libraries": selected_libraries,
+        "review_queue": selected_tasks,
+    }
+    safe_write_json(handoff_dir / "ida_handoff_manifest.json", handoff_manifest)
+    safe_write_json(handoff_dir / "ida_target_manifest.json", task_manifest)
+    with atomic_text_writer(handoff_dir / "review_queue.csv") as fh:
+        fieldnames = [
+            "rank",
+            "task_id",
+            "task_type",
+            "library_name",
+            "abi",
+            "library_sha256",
+            "symbol",
+            "address",
+            "priority_score",
+            "capabilities",
+            "selection_reasons",
+        ]
+        writer = csv.DictWriter(fh, fieldnames=fieldnames)
+        writer.writeheader()
+        for task in selected_tasks:
+            writer.writerow(
+                {
+                    **{field: task.get(field) for field in fieldnames},
+                    "capabilities": ",".join(task.get("capabilities") or []),
+                    "selection_reasons": ",".join(
+                        task.get("selection_reasons") or []
+                    ),
+                }
+            )
+    safe_write_text(
+        handoff_dir / "README.txt",
+        "\n".join(
+            [
+                "IDA Classroom handoff",
+                "",
+                "1. Open binaries in library_rank order.",
+                "2. Use review_queue.csv to inspect the ranked functions for each binary.",
+                "3. Press F5 in IDA to decompile a selected function.",
+                "4. Export pseudocode as UTF-8 text and fill the manual_ida result template.",
+                "5. Keep task_id, ABI, address, symbol, and library SHA-256 unchanged.",
+                "",
+                "This package is a bounded review set. The complete native inventory remains",
+                "in phase3_native/native_analysis.json and ida_target_manifest.json.",
+                "",
+            ]
+        ),
+    )
+
+    zip_path = phase3_dir / "ida_handoff.zip"
+    fd, temp_name = tempfile.mkstemp(
+        prefix=".ida_handoff.",
+        suffix=".zip",
+        dir=str(phase3_dir),
+    )
+    os.close(fd)
+    temp_path = Path(temp_name)
+    try:
+        with zipfile.ZipFile(temp_path, "w", compression=zipfile.ZIP_STORED) as archive:
+            for path in sorted(item for item in handoff_dir.rglob("*") if item.is_file()):
+                archive.write(path, path.relative_to(handoff_dir).as_posix())
+        os.replace(temp_path, zip_path)
+    except Exception:
+        temp_path.unlink(missing_ok=True)
+        raise
+    handoff_manifest["zip_path"] = str(zip_path)
+    handoff_manifest["zip_size_bytes"] = zip_path.stat().st_size
+    safe_write_json(handoff_dir / "ida_handoff_manifest.json", handoff_manifest)
+    return handoff_manifest
 
 
 def _load_result_rows(path: Path) -> list[dict[str, Any]]:
@@ -627,6 +848,31 @@ def _candidate_indexes(
         if address:
             by_address[(sha, abi, address)].append(candidate)
     return exact, by_symbol, by_address
+
+
+def _resolve_library_binary(
+    workspace: Path,
+    library: dict[str, Any],
+) -> Path:
+    candidates: list[Path] = []
+    relative = library.get("workspace_relative_path")
+    if relative:
+        workspace_root = workspace.resolve()
+        relative_candidate = (workspace_root / str(relative)).resolve()
+        if (
+            relative_candidate == workspace_root
+            or workspace_root in relative_candidate.parents
+        ):
+            candidates.append(relative_candidate)
+    extracted = library.get("extracted_path")
+    if extracted:
+        candidates.append(Path(str(extracted)).expanduser().resolve())
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    raise FileNotFoundError(
+        "The extracted library is missing; rerun Phase 3 or restore the complete workspace."
+    )
 
 
 def import_manual_ida_results(
@@ -745,9 +991,18 @@ def import_manual_ida_results(
                             "library_name does not match the extracted library."
                         )
                 library = matching_libraries[0]
+                library_path = _resolve_library_binary(workspace, library)
+                actual_library_sha = sha256_file(library_path).lower()
+                if actual_library_sha != sha:
+                    raise ValueError(
+                        "The current extracted library hash does not match library_sha256."
+                    )
                 ida_version = str(row.get("ida_version") or "").strip()
                 if not ida_version:
                     raise ValueError("ida_version is required.")
+                submitted_task_id = str(row.get("task_id") or "").strip()
+                if not submitted_task_id:
+                    raise ValueError("task_id is required.")
                 symbol = str(row.get("symbol") or "").strip()
                 address = normalize_address(row.get("address"))
                 if not symbol and not address:
@@ -779,10 +1034,30 @@ def import_manual_ida_results(
                     ]
                     if not library_tasks or not address:
                         raise ValueError("Function is not present in ida_target_manifest.json.")
-                    identity_verification = "verified_library_and_discovered_internal_address"
-                    associated_java = library_tasks[0].get("associated_java_methods") or []
+                    discovery_task = next(
+                        (
+                            item
+                            for item in library_tasks
+                            if str(item.get("task_id") or "") == submitted_task_id
+                        ),
+                        None,
+                    )
+                    if not discovery_task:
+                        raise ValueError(
+                            "task_id does not match the library discovery task."
+                        )
+                    identity_verification = (
+                        "binary_hash_verified_manual_internal_address"
+                    )
+                    associated_java = discovery_task.get(
+                        "associated_java_methods"
+                    ) or []
                 else:
-                    identity_verification = "verified_manifest_function"
+                    if submitted_task_id != str(candidate.get("task_id") or ""):
+                        raise ValueError("task_id does not match the selected function.")
+                    identity_verification = (
+                        "binary_hash_verified_manifest_task_metadata_matched"
+                    )
                     symbol = symbol or str(candidate.get("symbol") or "")
                     address = address or normalize_address(candidate.get("address"))
                     associated_java = candidate.get("associated_java_methods") or []
@@ -836,8 +1111,13 @@ def import_manual_ida_results(
                     "kind": "manual_ida_function",
                     "evidence_source": "ida_classroom_manual",
                     "decompiled": True,
-                    "algorithm_recovered": semantic.get("role") == "algorithm",
-                    "library": library.get("extracted_path"),
+                    "algorithm_body_candidate": semantic.get("role") == "algorithm",
+                    "algorithm_recovered": False,
+                    "task_id": submitted_task_id,
+                    "library": str(library_path),
+                    "workspace_relative_path": library.get(
+                        "workspace_relative_path"
+                    ),
                     "library_name": library.get("name"),
                     "library_sha256": sha,
                     "sha256": sha,
@@ -863,9 +1143,10 @@ def import_manual_ida_results(
                     "source_metadata_path": str(metadata_path),
                     "ownership": library.get("ownership") or {},
                     "confidence": (
-                        0.96
-                        if identity_verification == "verified_manifest_function"
-                        else 0.88
+                        0.82
+                        if identity_verification
+                        == "binary_hash_verified_manifest_task_metadata_matched"
+                        else 0.75
                     ),
                 }
                 accepted.append(evidence)
@@ -906,8 +1187,8 @@ def import_manual_ida_results(
         "rejected": rejected,
         "evidence_units_path": str(paths["evidence_units"]),
         "notes": [
-            "decompiled=true means IDA produced pseudocode for a verified binary identity.",
-            "algorithm_recovered is true only when the separate semantic classifier finds substantive algorithm evidence.",
+            "decompiled=true means pseudocode was submitted for a task whose current binary SHA-256 was reverified.",
+            "algorithm_body_candidate is a heuristic semantic label; algorithm_recovered remains false until research review confirms substance.",
             "Automated radare2/rizin evidence remains stored separately.",
         ],
     }

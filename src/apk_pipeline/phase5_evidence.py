@@ -19,7 +19,7 @@ from .run_context import (
 from .utils import ensure_dir, safe_write_json, safe_write_text
 
 
-PHASE_SCHEMA = "2026-07-23.phase5.v5"
+PHASE_SCHEMA = "2026-07-23.phase5.v6"
 SIMILARITY_UNIT_LIMIT = 250
 
 
@@ -253,6 +253,43 @@ def _collect_capabilities(
     return dict(sorted(counter.items()))
 
 
+def _capability_counts_by_phase(
+    code_index: dict[str, Any],
+    native_analysis: dict[str, Any],
+    resource_inventory: dict[str, Any],
+    split_inventory: dict[str, Any],
+) -> dict[str, dict[str, int]]:
+    split_counts: Counter[str] = Counter()
+    for split in split_inventory.get("splits") or []:
+        split_counts.update(split.get("capabilities") or [])
+    java_counts = (
+        code_index.get("comparison_capability_counts")
+        if "comparison_capability_counts" in code_index
+        else code_index.get("capability_counts")
+    )
+    native_counts = (
+        native_analysis.get("comparison_capability_counts")
+        if "comparison_capability_counts" in native_analysis
+        else native_analysis.get("capability_counts")
+    )
+    return {
+        "phase0_split_inventory": dict(sorted(split_counts.items())),
+        "phase2_java_kotlin": dict(
+            sorted(_counter_from_dict(java_counts).items())
+        ),
+        "phase3_native": dict(
+            sorted(_counter_from_dict(native_counts).items())
+        ),
+        "phase4_resources_models": dict(
+            sorted(
+                _counter_from_dict(
+                    resource_inventory.get("aggregate_capability_counts")
+                ).items()
+            )
+        ),
+    }
+
+
 def _extract_code_snippets(
     code_index: dict[str, Any],
     max_per_capability: int = 12,
@@ -340,6 +377,12 @@ def _extract_native_deep_summary(workspace: Path) -> dict[str, Any]:
         ),
         "manual_ida_import": _load_json(
             workspace / "phase3_native" / "manual_ida" / "import_summary.json"
+        ),
+        "ida_handoff": _load_json(
+            workspace
+            / "phase3_native"
+            / "ida_handoff"
+            / "ida_handoff_manifest.json"
         ),
     }
 
@@ -517,6 +560,9 @@ def _build_java_native_bridge_map(
                         "decompiled": target.get("decompiled"),
                         "algorithm_recovered": target.get(
                             "algorithm_recovered"
+                        ),
+                        "algorithm_body_candidate": target.get(
+                            "algorithm_body_candidate"
                         ),
                     }
                 )
@@ -745,6 +791,7 @@ def _build_similarity_packet(
             "identity_verification": unit.get("identity_verification"),
             "decompiled": unit.get("decompiled"),
             "algorithm_recovered": unit.get("algorithm_recovered"),
+            "algorithm_body_candidate": unit.get("algorithm_body_candidate"),
             "semantic_role": unit.get("semantic_role"),
             "semantic_confidence": unit.get("semantic_confidence"),
             "semantic_reasons": unit.get("semantic_reasons"),
@@ -754,6 +801,12 @@ def _build_similarity_packet(
             "call_targets": unit.get("call_targets"),
             "string_refs": unit.get("string_refs"),
             "token_fingerprint": unit.get("token_fingerprint"),
+            "token_shingle_signature": unit.get("token_shingle_signature"),
+            "graph_fingerprint": unit.get("graph_fingerprint"),
+            "subgraph_count": unit.get("subgraph_count"),
+            "operator_count": unit.get("operator_count"),
+            "tensor_count": unit.get("tensor_count"),
+            "operator_counts": unit.get("operator_counts"),
             "source_file": unit.get("source_file"),
         }
         for unit in selected_units
@@ -773,7 +826,7 @@ def _build_similarity_packet(
         for unit in selected_units
     )
     return {
-        "schema_version": "2026-07-23.similarity-ready.v3",
+        "schema_version": "2026-07-23.similarity-preparation.v1",
         "app": {
             "package": manifest.get("package"),
             "app_name": manifest.get("app_name"),
@@ -836,17 +889,19 @@ def _build_similarity_packet(
             "manual_ida_import": (
                 native_deep_summary or {}
             ).get("manual_ida_import") or {},
+            "ida_handoff": (native_deep_summary or {}).get("ida_handoff") or {},
         },
         "native_probes": native_probe_summaries or [],
         "graph_path": str(graph_path),
         "java_native_bridge_map_path": str(bridge_map_path) if bridge_map_path else None,
         "notes": [
             "This packet is intended for downstream review and similarity preparation.",
-            "Hashes identify exact artifacts; token_fingerprint is a normalized static signal, not a similarity score.",
+            "Hashes identify exact artifacts; token_fingerprint is exact normalized identity and token_shingle_signature is comparison-ready, but neither is a final similarity score.",
             "Native pseudocode and function features appear when auto/deep native analysis selects targets and an automated adapter is available.",
-            "Manual IDA evidence is identity-verified and remains distinct from automated radare2/rizin evidence.",
-            "decompiled=true records pseudocode production; algorithm_recovered is a separate conservative semantic label.",
+            "Manual IDA evidence re-verifies the current binary SHA-256 and matches submitted task metadata; it remains distinct from automated radare2/rizin evidence.",
+            "decompiled=true records pseudocode production; algorithm_body_candidate is heuristic and algorithm_recovered remains false until research review.",
             "Java capability counts exclude code classified as third-party or platform by default; dependency signals are reported separately.",
+            "Capability counts are kept by phase because Java files, native string occurrences, model resources, and split tags are different measurement units.",
         ],
     }
 
@@ -1116,7 +1171,8 @@ def run_phase5_evidence(
     prompt_path = output_dir / "review_prompt.md"
     evidence_jsonl_path = output_dir / "evidence_units.jsonl"
     graph_path = output_dir / "evidence_graph.json"
-    similarity_packet_path = output_dir / "similarity_ready_packet.json"
+    similarity_packet_path = output_dir / "similarity_preparation_packet.json"
+    similarity_compatibility_path = output_dir / "similarity_ready_packet.json"
     bridge_map_path = output_dir / "java_native_bridge_map.json"
     cache_path = output_dir / "cache_manifest.json"
 
@@ -1127,6 +1183,7 @@ def run_phase5_evidence(
         evidence_jsonl_path,
         graph_path,
         similarity_packet_path,
+        similarity_compatibility_path,
         bridge_map_path,
     ]
     upstream_paths = [
@@ -1191,6 +1248,12 @@ def run_phase5_evidence(
         resource_inventory,
         split_inventory,
     )
+    capability_counts_by_phase = _capability_counts_by_phase(
+        code_index,
+        native_analysis,
+        resource_inventory,
+        split_inventory,
+    )
     evidence_units = _collect_evidence_units(workspace)
     evidence_kind_counts = Counter(str(unit.get("kind") or "unknown") for unit in evidence_units)
     evidence_graph = _build_evidence_graph(evidence_units, manifest)
@@ -1249,6 +1312,11 @@ def run_phase5_evidence(
         ),
     }
     similarity_packet["native_code_attribution"] = native_code_attribution
+    similarity_packet["capability_counts_by_phase"] = capability_counts_by_phase
+    similarity_packet["capability_count_interpretation"] = (
+        "discovery counts with phase-specific denominators; do not compare or sum "
+        "them as a homogeneous similarity metric"
+    )
     similarity_packet["completeness"] = dependency_state
 
     packet = {
@@ -1256,6 +1324,7 @@ def run_phase5_evidence(
         "manifest": manifest,
         "split_inventory": split_inventory,
         "capability_counts": capability_counts,
+        "capability_counts_by_phase": capability_counts_by_phase,
         "java_code_attribution": java_code_attribution,
         "native_code_attribution": native_code_attribution,
         "models": _extract_models(resource_inventory),
@@ -1309,6 +1378,7 @@ def run_phase5_evidence(
             "jsonl_path": str(evidence_jsonl_path),
             "graph_path": str(graph_path),
             "similarity_packet_path": str(similarity_packet_path),
+            "legacy_similarity_packet_alias": str(similarity_compatibility_path),
         },
         "source_files": {
             "split_inventory": str(workspace / "phase0_split_inventory" / "split_inventory.json"),
@@ -1327,6 +1397,15 @@ def run_phase5_evidence(
             "native_evidence_units": str(workspace / "phase3_native" / "native_evidence_units.json"),
             "ida_target_manifest": str(
                 workspace / "phase3_native" / "ida_target_manifest.json"
+            ),
+            "ida_handoff_zip": str(
+                workspace / "phase3_native" / "ida_handoff.zip"
+            ),
+            "ida_handoff_manifest": str(
+                workspace
+                / "phase3_native"
+                / "ida_handoff"
+                / "ida_handoff_manifest.json"
             ),
             "manual_ida_import": str(
                 workspace
@@ -1351,6 +1430,7 @@ def run_phase5_evidence(
     safe_write_json(graph_path, evidence_graph)
     safe_write_json(bridge_map_path, bridge_map)
     safe_write_json(similarity_packet_path, similarity_packet)
+    safe_write_json(similarity_compatibility_path, similarity_packet)
     safe_write_json(packet_json_path, packet)
     safe_write_text(packet_md_path, _render_markdown(packet))
     safe_write_text(prompt_path, _render_prompt(packet_md_path))

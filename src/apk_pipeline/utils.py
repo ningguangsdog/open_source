@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True, slots=True)
 class ZipSafetyLimits:
-    max_entries: int = 20000
+    max_entries: int = 100000
     max_total_uncompressed: int = 3_000_000_000
     max_single_file: int = 1_000_000_000
 
@@ -115,7 +115,8 @@ def sha256_bytes(data: bytes) -> str:
 def safe_name(name: str) -> str:
     import re
 
-    return re.sub(r"[^A-Za-z0-9_.-]+", "_", name)
+    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", name).strip("._")
+    return cleaned or "unnamed"
 
 
 def is_safe_zip_member(name: str) -> bool:
@@ -125,6 +126,18 @@ def is_safe_zip_member(name: str) -> bool:
     if normalized.is_absolute() or ":" in normalized.parts[0]:
         return False
     return ".." not in normalized.parts
+
+
+def safe_zip_target(root: Path, member_name: str) -> Path:
+    """Return a resolved extraction target that remains below root."""
+
+    if not is_safe_zip_member(member_name):
+        raise ValueError(f"Unsafe zip member path: {member_name}")
+    resolved_root = root.resolve()
+    target = (resolved_root / member_name.replace("\\", "/")).resolve()
+    if target != resolved_root and resolved_root not in target.parents:
+        raise ValueError(f"Unsafe extraction target: {member_name}")
+    return target
 
 
 def validate_zip(path: Path, limits: ZipSafetyLimits | None = None) -> list[zipfile.ZipInfo]:
@@ -152,9 +165,7 @@ def safe_extract_zip(path: Path, out_dir: Path, limits: ZipSafetyLimits | None =
     out_dir = out_dir.resolve()
     with zipfile.ZipFile(path, "r") as zf:
         for info in infos:
-            target = (out_dir / info.filename).resolve()
-            if target != out_dir and out_dir not in target.parents:
-                raise ValueError(f"Unsafe extraction target: {info.filename}")
+            safe_zip_target(out_dir, info.filename)
             zf.extract(info, out_dir)
 
 

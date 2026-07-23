@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import importlib.util
 import subprocess
 import tempfile
 import unittest
@@ -27,10 +28,12 @@ from apk_pipeline.phase3_native import (
     _extract_native_libraries,
     run_phase3_multi,
 )
+from apk_pipeline.phase4_resources import _scan_apk
 from apk_pipeline.phase5_evidence import (
     _build_similarity_packet,
     run_phase5_evidence,
 )
+from apk_pipeline.tflite_parser import parse_model_metadata
 from apk_pipeline.models import PhaseResult
 from apk_pipeline.utils import safe_write_json
 
@@ -110,6 +113,33 @@ def _write_apk(path: Path, entries: dict[str, bytes]) -> None:
 
 
 class Phase012QualityTests(unittest.TestCase):
+    @unittest.skipUnless(
+        importlib.util.find_spec("flatbuffers")
+        and importlib.util.find_spec("tflite"),
+        "structured TFLite parser dependencies are not installed",
+    )
+    def test_tflite_schema_parser_reads_graph_metadata(self) -> None:
+        import flatbuffers
+        import tflite
+
+        builder = flatbuffers.Builder(256)
+        description = builder.CreateString("test model")
+        tflite.ModelStart(builder)
+        tflite.ModelAddVersion(builder, 3)
+        tflite.ModelAddDescription(builder, description)
+        model = tflite.ModelEnd(builder)
+        builder.Finish(model, file_identifier=b"TFL3")
+        metadata = parse_model_metadata(
+            "test.tflite",
+            bytes(builder.Output()),
+        )
+        graph = metadata["structured_graph"]
+        self.assertEqual(graph["status"], "parsed")
+        self.assertEqual(graph["model_version"], 3)
+        self.assertEqual(graph["description"], "test model")
+        self.assertEqual(graph["subgraph_count"], 0)
+        self.assertRegex(graph["graph_fingerprint"], r"^[0-9a-f]{64}$")
+
     def test_capability_classifier_avoids_generic_substrings(self) -> None:
         result = classify_text(
             "capital allocation hashmap page form asset api object"
@@ -239,10 +269,16 @@ class Phase012QualityTests(unittest.TestCase):
             "sources/a/b/C.java",
             app_package="com.adobe.reader",
         )
+        same_org_dependency = classify_code_ownership(
+            "com.google.firebase.analytics",
+            "sources/com/google/firebase/Analytics.java",
+            app_package="com.google.product",
+        )
         self.assertEqual(first.category, "first_party")
         self.assertEqual(third.category, "third_party")
         self.assertEqual(platform.category, "platform")
         self.assertEqual(unknown.category, "unknown")
+        self.assertEqual(same_org_dependency.category, "third_party")
 
     def test_native_ownership_uses_jni_names_library_names_and_hashes(self) -> None:
         first = classify_native_ownership(
@@ -329,6 +365,39 @@ class Phase012QualityTests(unittest.TestCase):
                 {path.read_bytes() for path in output_paths},
                 {b"first", b"second"},
             )
+
+    def test_native_extraction_rejects_unsafe_archive_members(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            apk = root / "unsafe.apk"
+            _write_apk(apk, {"lib/../../../escaped.so": b"escape"})
+            records = _extract_native_libraries(
+                [apk],
+                root / "workspace" / "libs",
+            )
+            self.assertEqual(len(records), 1)
+            self.assertFalse(records[0]["success"])
+            self.assertFalse((root / "escaped.so").exists())
+
+    def test_resource_selection_keeps_late_high_value_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            apk = root / "resources.apk"
+            entries = {
+                f"assets/rules/rule_{index:04d}.txt": b"ordinary rule"
+                for index in range(801)
+            }
+            entries["assets/ocr/model_labels.txt"] = b"ocr recognizer labels"
+            _write_apk(apk, entries)
+            records, summary = _scan_apk(apk)
+            selected_paths = {record["path"] for record in records}
+            self.assertIn("assets/ocr/model_labels.txt", selected_paths)
+            self.assertEqual(
+                summary["resource_candidate_discovered_count"],
+                802,
+            )
+            self.assertEqual(summary["resource_candidate_count"], 800)
+            self.assertEqual(summary["resource_candidate_excluded_count"], 2)
 
     def test_jadx_nonzero_and_timeout_preserve_partial_sources(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -817,6 +886,48 @@ class Phase012QualityTests(unittest.TestCase):
                 review_packet["capability_counts"]["local_ml"],
                 1,
             )
+
+    def test_pipeline_stops_after_primary_phase0_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            apk = root / "sample.apk"
+            _write_apk(apk, {"AndroidManifest.xml": b"manifest"})
+            failed_phase0 = PhaseResult(
+                name="phase0_split_inventory",
+                success=False,
+                status="failed",
+                error="rejected",
+            )
+            config = PipelineConfig(
+                apk_path=apk,
+                workspace=root / "workspace",
+                force=True,
+            )
+            with (
+                patch(
+                    "apk_pipeline.pipeline.run_phase0",
+                    return_value=failed_phase0,
+                ),
+                patch("apk_pipeline.pipeline.run_phase1_multi") as phase1,
+                patch("apk_pipeline.pipeline.run_phase2_multi") as phase2,
+                patch("apk_pipeline.pipeline.run_phase3_multi") as phase3,
+                patch("apk_pipeline.pipeline.run_phase4_resources") as phase4,
+                patch("apk_pipeline.pipeline.run_phase5_evidence") as phase5,
+            ):
+                summary = APKPipeline(config).run()
+            self.assertEqual(
+                [phase.status for phase in summary.phases],
+                [
+                    "failed",
+                    "skipped",
+                    "skipped",
+                    "skipped",
+                    "skipped",
+                    "skipped",
+                ],
+            )
+            for mocked in (phase1, phase2, phase3, phase4, phase5):
+                mocked.assert_not_called()
 
 
 if __name__ == "__main__":

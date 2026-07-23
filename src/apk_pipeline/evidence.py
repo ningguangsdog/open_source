@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections import deque
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -26,6 +27,48 @@ def normalize_text(text: str, *, max_chars: int = 20000) -> str:
 def token_fingerprint(text: str, *, max_chars: int = 20000) -> str:
     normalized = normalize_text(text, max_chars=max_chars)
     return hashlib.sha256(normalized.encode("utf-8", errors="ignore")).hexdigest()
+
+
+def token_shingle_signature(
+    texts: str | Iterable[str],
+    *,
+    shingle_size: int = 5,
+    max_hashes: int = 256,
+) -> dict[str, Any]:
+    """Build a compact, deterministic bottom-k token-shingle signature."""
+
+    if shingle_size < 2 or max_hashes < 1:
+        raise ValueError("shingle_size must be >= 2 and max_hashes must be positive")
+    chunks = [texts] if isinstance(texts, str) else texts
+    window: deque[str] = deque(maxlen=shingle_size)
+    retained: set[str] = set()
+    token_count = 0
+    shingle_count = 0
+    for text in chunks:
+        normalized = normalize_text(str(text), max_chars=len(str(text)))
+        for token in normalized.split():
+            token_count += 1
+            window.append(token)
+            if len(window) < shingle_size:
+                continue
+            shingle_count += 1
+            digest = hashlib.blake2b(
+                "\x1f".join(window).encode("utf-8", errors="ignore"),
+                digest_size=8,
+            ).hexdigest()
+            retained.add(digest)
+            if len(retained) > max_hashes * 8:
+                retained = set(sorted(retained)[:max_hashes])
+    hashes = sorted(retained)[:max_hashes]
+    return {
+        "algorithm": "bottom_k_blake2b_64",
+        "normalization": "lowercase_urls_hex_and_numbers_normalized",
+        "shingle_size": shingle_size,
+        "token_count": token_count,
+        "shingle_count": shingle_count,
+        "retained_hash_count": len(hashes),
+        "hashes": hashes,
+    }
 
 
 def unit_id(*parts: object) -> str:

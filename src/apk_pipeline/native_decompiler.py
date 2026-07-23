@@ -883,18 +883,14 @@ def run_targeted_decompile(
     inventory_cache: dict[str, list[dict[str, Any]]] = {}
     budgeted = [target for target in plan.get("targets") or [] if isinstance(target, dict)]
     total_targets = len(budgeted)
+    attempted_targets = 0
+    app_timed_out = False
     for index, target in enumerate(budgeted, start=1):
         if time.monotonic() - start_time > timeout_per_app:
             _emit_progress(progress_callback, {"event": "app_timeout", "attempted": len(results), "total": total_targets})
-            results.append(
-                {
-                    "success": False,
-                    "tool": executable,
-                    "target": target,
-                    "error": "app_timeout_budget_exhausted",
-                }
-            )
+            app_timed_out = True
             break
+        attempted_targets += 1
         library_path = Path(str(target["library"]))
         if not library_path.exists():
             _emit_progress(
@@ -943,7 +939,21 @@ def run_targeted_decompile(
                     "function_count": len(inventory),
                 },
             )
-        output_path = output_dir / f"{safe_name(library_path.name)}__{safe_name(str(target['name']))}.c"
+        output_identity = "__".join(
+            (
+                safe_name(str(target.get("abi") or "unknown_abi")),
+                safe_name(library_path.name),
+                safe_name(str(target.get("library_sha256") or "unknown_hash")[:12]),
+                safe_name(
+                    str(
+                        normalize_address(target.get("address"))
+                        or target.get("name")
+                        or "unknown_target"
+                    )
+                ),
+            )
+        )
+        output_path = output_dir / f"{output_identity}.c"
         target_start = time.monotonic()
         _emit_progress(
             progress_callback,
@@ -1012,10 +1022,12 @@ def run_targeted_decompile(
             )
 
     return {
-        "status": "completed",
+        "status": "app_timeout" if app_timed_out else "completed",
         "tool": executable,
         "plan": plan,
-        "attempted_targets": len(budgeted),
+        "attempted_targets": attempted_targets,
+        "selected_target_count": total_targets,
+        "unattempted_target_count": max(0, total_targets - attempted_targets),
         "libraries_attempted": dict(attempted_counts),
         "libraries_selected": plan.get("selected_libraries") or {},
         "budget": {

@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from apk_pipeline.input_resolver import resolve_apk_input
+from apk_pipeline.evidence import token_shingle_signature
 from apk_pipeline.models import PhaseResult, PipelineSummary
 from apk_pipeline.phase0_split_inventory import run_phase0
 from apk_pipeline.phase2_jadx import run_phase2_multi
@@ -32,6 +33,16 @@ from apk_pipeline.utils import (
 
 
 class RunIntegrityTests(unittest.TestCase):
+    def test_token_shingle_signature_is_stable_across_literal_changes(self) -> None:
+        first = token_shingle_signature(
+            "int score = pixels[12] * weights[99]; return score;"
+        )
+        second = token_shingle_signature(
+            "int score = pixels[42] * weights[7]; return score;"
+        )
+        self.assertEqual(first["hashes"], second["hashes"])
+        self.assertGreater(first["retained_hash_count"], 0)
+
     def test_partial_phase_is_not_legacy_success(self) -> None:
         result = PhaseResult(
             name="example",

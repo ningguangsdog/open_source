@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import zipfile
+import hashlib
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -17,7 +18,7 @@ from .run_context import (
     write_phase_cache,
 )
 from .tflite_parser import MODEL_EXTENSIONS, parse_model_metadata
-from .utils import ensure_dir, read_zip_entry_prefix, safe_write_json, zip_entry_sha256
+from .utils import ensure_dir, safe_write_json, validate_zip
 
 
 RESOURCE_EXTENSIONS = (
@@ -36,27 +37,60 @@ RESOURCE_EXTENSIONS = (
     ".conf",
 )
 MAX_RESOURCE_CANDIDATES_PER_APK = 800
-MODEL_READ_LIMIT = 8_000_000
+MODEL_READ_LIMIT = 128_000_000
 RESOURCE_READ_LIMIT = 500_000
-PHASE_SCHEMA = "2026-07-23.phase4.v2"
+PHASE_SCHEMA = "2026-07-23.phase4.v3"
 
 
-def _entry_record(apk_path: Path, info: zipfile.ZipInfo, *, kind: str) -> dict[str, Any]:
+def _read_entry(
+    archive: zipfile.ZipFile,
+    info: zipfile.ZipInfo,
+    *,
+    prefix_limit: int,
+) -> tuple[str, bytes]:
+    digest = hashlib.sha256()
+    prefix = bytearray()
+    with archive.open(info, "r") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            digest.update(chunk)
+            if len(prefix) < prefix_limit:
+                remaining = prefix_limit - len(prefix)
+                prefix.extend(chunk[:remaining])
+    return digest.hexdigest(), bytes(prefix)
+
+
+def _entry_record(
+    archive: zipfile.ZipFile,
+    apk_path: Path,
+    info: zipfile.ZipInfo,
+    *,
+    kind: str,
+) -> dict[str, Any]:
     path_hits = classify_path(info.filename)
+    read_limit = MODEL_READ_LIMIT if kind == "model" else RESOURCE_READ_LIMIT
+    entry_sha256, data = _read_entry(
+        archive,
+        info,
+        prefix_limit=read_limit,
+    )
     record: dict[str, Any] = {
         "apk": str(apk_path),
         "path": info.filename,
         "kind": kind,
         "size_bytes": info.file_size,
-        "sha256": zip_entry_sha256(apk_path, info.filename),
+        "sha256": entry_sha256,
         "path_capabilities": path_hits,
+        "content_bytes_read": len(data),
+        "content_truncated": info.file_size > len(data),
     }
 
     if kind == "model":
-        data = read_zip_entry_prefix(apk_path, info.filename, limit=MODEL_READ_LIMIT)
-        record["model_metadata"] = parse_model_metadata(info.filename, data)
+        record["model_metadata"] = parse_model_metadata(
+            info.filename,
+            data,
+            complete=info.file_size <= len(data),
+        )
     else:
-        data = read_zip_entry_prefix(apk_path, info.filename, limit=RESOURCE_READ_LIMIT)
         if data:
             text_sample = data.decode("utf-8", errors="ignore")
             text_hits = classify_text(text_sample[:100_000])
@@ -69,7 +103,24 @@ def _entry_record(apk_path: Path, info: zipfile.ZipInfo, *, kind: str) -> dict[s
 
 
 def _is_model(path: str) -> bool:
-    return Path(path).suffix.lower() in MODEL_EXTENSIONS
+    lower = path.lower()
+    suffix = Path(path).suffix.lower()
+    if suffix in MODEL_EXTENSIONS:
+        return True
+    return suffix in {".bin", ".dat", ".weights"} and any(
+        marker in lower
+        for marker in (
+            "model",
+            "weight",
+            "tensor",
+            "network",
+            "classifier",
+            "segment",
+            "detect",
+            "recogn",
+            "ocr",
+        )
+    )
 
 
 def _is_resource_candidate(path: str) -> bool:
@@ -98,21 +149,50 @@ def _scan_apk(apk_path: Path) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     counters: Counter[str] = Counter()
     capability_counts: Counter[str] = Counter()
 
-    with zipfile.ZipFile(apk_path, "r") as zf:
-        for info in zf.infolist():
-            if info.is_dir():
+    infos = validate_zip(apk_path)
+    candidates: list[tuple[int, str, zipfile.ZipInfo, str]] = []
+    for info in infos:
+        if info.is_dir():
+            continue
+        lower_name = info.filename.lower()
+        if _is_model(lower_name):
+            kind = "model"
+        elif _is_resource_candidate(lower_name):
+            kind = "resource_candidate"
+        else:
+            continue
+        path_hits = classify_path(info.filename)
+        capability_score = 0
+        for details in path_hits.values():
+            if not isinstance(details, dict):
                 continue
-            lower_name = info.filename.lower()
-            if _is_model(lower_name):
-                kind = "model"
-            elif _is_resource_candidate(lower_name):
-                kind = "resource_candidate"
-            else:
+            raw_score = details.get("score")
+            try:
+                capability_score += int(str(raw_score or 0))
+            except ValueError:
                 continue
+        marker_bonus = 20 if kind == "model" else 0
+        candidates.append(
+            (
+                -(marker_bonus + capability_score),
+                info.filename,
+                info,
+                kind,
+            )
+        )
+    candidates.sort(key=lambda item: (item[0], item[1]))
+    model_candidates = [item for item in candidates if item[3] == "model"]
+    resource_candidates = [
+        item for item in candidates if item[3] == "resource_candidate"
+    ]
+    selected = [
+        *model_candidates,
+        *resource_candidates[:MAX_RESOURCE_CANDIDATES_PER_APK],
+    ]
 
-            if kind == "resource_candidate" and counters[kind] >= MAX_RESOURCE_CANDIDATES_PER_APK:
-                continue
-            record = _entry_record(apk_path, info, kind=kind)
+    with zipfile.ZipFile(apk_path, "r") as zf:
+        for _, _, info, kind in selected:
+            record = _entry_record(zf, apk_path, info, kind=kind)
             records.append(record)
             counters[kind] += 1
 
@@ -128,6 +208,15 @@ def _scan_apk(apk_path: Path) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         "apk": str(apk_path),
         "model_count": counters["model"],
         "resource_candidate_count": counters["resource_candidate"],
+        "model_candidate_discovered_count": len(model_candidates),
+        "resource_candidate_discovered_count": len(resource_candidates),
+        "resource_candidate_excluded_count": max(
+            0,
+            len(resource_candidates) - MAX_RESOURCE_CANDIDATES_PER_APK,
+        ),
+        "resource_selection_rule": (
+            "capability_and_model_path_score_then_path_name"
+        ),
         "capability_counts": dict(sorted(capability_counts.items())),
     }
     return records, summary
@@ -147,6 +236,7 @@ def build_model_evidence_units(records: list[dict[str, Any]]) -> list[dict[str, 
         if record.get("kind") != "model":
             continue
         metadata = record.get("model_metadata") or {}
+        structured_graph = metadata.get("structured_graph") or {}
         capabilities = _record_capabilities(record)
         strings_sample = metadata.get("strings_sample") or []
         operator_hints = metadata.get("operator_hints") or []
@@ -175,6 +265,13 @@ def build_model_evidence_units(records: list[dict[str, Any]]) -> list[dict[str, 
                 "header_hex": metadata.get("header_hex"),
                 "entropy_first_mb": metadata.get("entropy_first_mb"),
                 "operator_hints": compact_list(operator_hints, 80),
+                "structured_parser_status": structured_graph.get("status"),
+                "graph_fingerprint": structured_graph.get("graph_fingerprint"),
+                "subgraph_count": structured_graph.get("subgraph_count"),
+                "operator_count": structured_graph.get("operator_count"),
+                "tensor_count": structured_graph.get("tensor_count"),
+                "operator_counts": structured_graph.get("operator_counts") or {},
+                "subgraphs": structured_graph.get("subgraphs") or [],
                 "metadata_strings": compact_list(strings_sample, 80),
                 "capabilities": capabilities,
                 "token_fingerprint": token_fingerprint(fingerprint_text),
@@ -273,6 +370,18 @@ def run_phase4_resources(
         "summary_by_apk": summaries,
         "aggregate_capability_counts": dict(sorted(aggregate_capabilities.items())),
         "aggregate_capabilities": capability_names(aggregate_capabilities.keys()),
+        "selection_telemetry": {
+            "resource_candidate_discovered_count": sum(
+                item["resource_candidate_discovered_count"] for item in summaries
+            ),
+            "resource_candidate_selected_count": sum(
+                item["resource_candidate_count"] for item in summaries
+            ),
+            "resource_candidate_excluded_count": sum(
+                item["resource_candidate_excluded_count"] for item in summaries
+            ),
+            "selection_rule": "capability_and_model_path_score_then_path_name",
+        },
         "records": all_records,
         "warnings": warnings,
     }

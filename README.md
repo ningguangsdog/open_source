@@ -24,27 +24,31 @@ The pipeline is designed for app-level capability review across many Android app
    - Builds a complete, chunked code index with capability signals, native method declarations, `System.loadLibrary` calls, URLs, imports, and short source snippets.
    - Classifies Java/Kotlin code as first-party, third-party, platform, or unknown. Decompiled XML remains in the complete discovery index but is excluded from Java/Kotlin implementation counts.
    - Complete source metadata remains in the index; snippet limits apply only to the compact review layer.
-   - Emits Java evidence units and a package-level index for downstream review.
+   - Emits Java evidence units, a package-level index, exact normalized fingerprints, and compact token-shingle signatures for later comparison work.
 
 4. `phase3_native`
    - Extracts native `.so` libraries from all native-bearing APK splits.
    - Collects strings, exported/JNI symbols, ELF addresses and sizes, URLs, and capability signals.
    - Ranks high-value native targets with ABI priority, Java/JNI relationships, model dependencies, call-graph centrality, and conservative wrapper penalties.
-   - Keeps the complete callable candidate inventory while placing only the highest-priority functions in the manual review queue.
+   - Keeps the complete callable candidate inventory while building a library-diversified manual review queue.
+   - Adds a hash-bound discovery task for every selected library so internal implementations reached from exported JNI wrappers can be returned without pretending they were exported symbols.
    - Writes a native toolchain preflight, decompile plan, function-level feature stream, string/xref view, and lightweight call graph.
-   - Produces an identity-bound IDA Classroom task manifest and validates manually exported pseudocode against the exact library SHA-256, ABI, symbol, and address.
+   - Produces an identity-bound IDA Classroom task manifest and a portable `ida_handoff.zip` containing a bounded set of ranked binaries.
+   - Re-hashes the current extracted binary before accepting manually exported pseudocode and matches the submitted task ID, ABI, symbol, and address.
    - Stores automated `rizin`/`radare2` evidence separately from manual IDA evidence. Producing pseudocode does not by itself establish that a core algorithm was recovered.
    - Attributes native libraries using application JNI prefixes, conservative known-runtime names, and optional SHA-256 registries. Ambiguous product-specific names remain `unknown` and stay in comparison evidence.
-   - In the default `--native-depth auto` mode, optional pseudocode and function features are attempted only when high-value targets and a supported native decompiler are available.
+   - In the recommended `--profile ida-handoff` workflow, target ranking runs without invoking an automated native decompiler.
 
 5. `phase4_resources`
    - Inventories local models, rule files, dictionaries, OCR assets, and other high-value resources.
-   - Extracts conservative model metadata from visible file content, including TFLite magic markers, operator/name hints, and string samples.
+   - Ranks resource candidates before applying compact-output limits and records discovered, selected, and excluded counts.
+   - Parses visible TFLite graph structure when possible, including subgraphs, operators, tensors, inputs, outputs, and a deterministic graph fingerprint.
    - Emits separate model and resource evidence units.
 
 6. `phase5_evidence`
    - Produces a compact review packet from the previous stages.
-   - Emits a JSONL evidence-unit stream, an app-level evidence graph, a Java/native bridge map, and a similarity-ready packet.
+   - Emits a JSONL evidence-unit stream, an app-level evidence graph, a Java/native bridge map, and a similarity-preparation packet.
+   - Keeps capability counts separated by phase because Java files, native strings, model resources, and split tags use different denominators.
    - Excludes third-party and platform Java/native evidence from comparison-facing capability counts by default while reporting dependency evidence separately.
    - Similarity scoring is intentionally left out of this stage.
 
@@ -56,13 +60,14 @@ Install Python dependencies:
 pip install -r requirements.txt
 ```
 
-Run the pipeline:
+Run the complete extraction and IDA handoff workflow:
 
 ```bash
 python scripts/run_pipeline.py \
   --apk path/to/app.apk \
   --workspace ./runs \
   --isolated-workspace \
+  --profile ida-handoff \
   --force
 ```
 
@@ -79,27 +84,20 @@ python scripts/run_pipeline.py \
   --apk path/to/app.apkm \
   --workspace ./runs \
   --isolated-workspace \
+  --profile ida-handoff \
   --force
 ```
 
-Check native deep-analysis tool availability without running an APK:
-
-```bash
-python scripts/run_pipeline.py --native-preflight-only
-```
-
-For Colab-style environments, install or check native tools before the main run:
-
-```bash
-bash scripts/setup_native_tools_colab.sh
-python scripts/run_pipeline.py --native-preflight-only
-```
+The `ida-handoff` profile does not require `rizin` or `radare2`. It completes
+Phase 0-5, ranks native targets, and writes
+`phase3_native/ida_handoff.zip` for manual IDA Classroom review.
 
 ## Useful Options
 
 - `--no-decompile-all-splits`: only run JADX on the primary APK.
 - `--jadx-timeout-per-apk`: set the timeout for each dex-bearing APK or split; partial source is retained.
 - `--isolated-workspace`: create a content-addressed workspace for each APK or bundle.
+- `--profile ida-handoff`: run the formal extraction and manual IDA handoff workflow without automated native decompilation.
 - `--native-depth none`: skip native target ranking and optional native decompiler calls.
 - `--native-depth basic`: extract native metadata and ranked targets without decompiler attempts.
 - `--native-depth targeted`: extract native metadata, rank targets, and emit native evidence units.
@@ -110,6 +108,7 @@ python scripts/run_pipeline.py --native-preflight-only
 - `--native-max-libraries`: cap the number of native libraries selected for deeper review.
 - `--native-max-decompile-targets`: cap the number of native targets sent to the optional decompiler.
 - `--ida-review-limit`: cap the priority IDA review queue; the complete candidate inventory remains in the manifest.
+- `--ida-handoff-max-libraries`: cap the number of unique library/ABI binaries copied into `ida_handoff.zip`.
 - `--native-target-capabilities`: prioritize one or more capability names during native target selection.
 - `--no-resource-scan`: skip raw model/resource inventory.
 - `--no-evidence-packets`: skip the final review packet.
@@ -149,6 +148,9 @@ apk_workspace/
   phase3_native/native_string_xrefs.json
   phase3_native/native_callgraph.json
   phase3_native/ida_target_manifest.json
+  phase3_native/ida_handoff.zip
+  phase3_native/ida_handoff/ida_handoff_manifest.json
+  phase3_native/ida_handoff/review_queue.csv
   phase3_native/manual_ida/README.txt
   phase3_native/manual_ida/result_template.json
   phase3_native/manual_ida/results/
@@ -168,6 +170,7 @@ apk_workspace/
   phase5_evidence/evidence_units.jsonl
   phase5_evidence/evidence_graph.json
   phase5_evidence/java_native_bridge_map.json
+  phase5_evidence/similarity_preparation_packet.json
   phase5_evidence/similarity_ready_packet.json
   phase5_evidence/cache_manifest.json
 ```
@@ -196,15 +199,17 @@ all discovered Java, Kotlin, and decompiled XML files, including read failures
 and explicit snippet-selection telemetry. `phase5_evidence/review_packet.json`
 is intentionally compact. For comparison preparation, first-party and unknown
 code are included by default; third-party and platform signals are retained in
-separate attribution and dependency sections. The compact similarity-ready
+separate attribution and dependency sections. The compact similarity-preparation
 packet uses stratified sampling across phases, evidence kinds, and capabilities;
 its selection telemetry points back to the complete JSONL evidence stream.
+`similarity_ready_packet.json` remains as a compatibility alias for existing
+notebooks.
 
 The most useful files for review are usually:
 
 - `phase5_evidence/review_packet.md`
 - `phase5_evidence/evidence_units.jsonl`
-- `phase5_evidence/similarity_ready_packet.json`
+- `phase5_evidence/similarity_preparation_packet.json`
 - `phase2_jadx/code_index.json`
 - `phase2_jadx/java_evidence_units.json`
 - `phase3_native/native_targets.json`
@@ -215,6 +220,7 @@ The most useful files for review are usually:
 - `phase3_native/native_string_xrefs.json`
 - `phase3_native/native_callgraph.json`
 - `phase3_native/ida_target_manifest.json`
+- `phase3_native/ida_handoff.zip`
 - `phase3_native/manual_ida/import_summary.json`
 - `phase3_native/manual_ida/evidence_units.json`
 - `phase3_native/probes/<profile>/native_probe_summary.json`
@@ -222,7 +228,7 @@ The most useful files for review are usually:
 - `phase4_resources/resource_inventory.json`
 - `phase5_evidence/java_native_bridge_map.json`
 
-## Native Deep Analysis
+## Optional Native Deep Analysis
 
 JADX decompiles Dalvik bytecode and does not decompile native `.so` libraries. Native code requires a binary analysis tool. The automated native-deep adapter currently supports `rizin` and `radare2`.
 
@@ -232,12 +238,11 @@ Function-level outputs include normalized instruction features, pseudocode finge
 
 ## Manual IDA Classroom Review
 
-`phase3_native/ida_target_manifest.json` is the handoff from the automated
-pipeline to IDA. ARM64 production libraries are prioritized; x86 and x86_64
-variants are retained for cross-validation. Each task records the library
-SHA-256, ABI, symbol, address, selection reasons, semantic prior, and related
-Java native methods. The `review_queue` is bounded for practical review, while
-`candidates` retains every callable candidate discovered by the pipeline.
+Start with `phase3_native/ida_handoff.zip`. It contains the selected `.so`
+files, `review_queue.csv`, a handoff manifest, and the complete task manifest.
+ARM64 production libraries are prioritized; x86 and x86_64 variants are
+retained for cross-validation. The complete candidate inventory remains in
+`phase3_native/ida_target_manifest.json`.
 
 For each reviewed function:
 
@@ -245,8 +250,8 @@ For each reviewed function:
    `phase3_native/manual_ida/results/`.
 2. Create a JSON metadata file from
    `phase3_native/manual_ida/result_template.json`.
-3. Copy the exact library SHA-256, ABI, function address, symbol, and IDA
-   version from the task and IDA database.
+3. Copy the exact task ID, library SHA-256, ABI, function address, symbol, and
+   IDA version from the task and IDA database.
 4. Import and refresh the final evidence packet:
 
 ```bash
@@ -255,14 +260,18 @@ python scripts/import_ida_results.py \
   --refresh-phase5
 ```
 
-The importer rejects results that do not match the current workspace or whose
-symbol and address identify different functions. Accepted functions are labeled
-independently as `wrapper`, `orchestration`, `algorithm`, `model_runtime`,
-`utility`, or `uncertain`. `decompiled=true` means that verified pseudocode was
-produced; `algorithm_recovered=true` is reserved for a substantive algorithm
-body rather than a wrapper or runtime call.
+The importer re-hashes the current extracted library and rejects results whose
+task ID, ABI, symbol, or address does not match the handoff. A
+`library_discovery` task may be used for an internal function found while
+following an exported wrapper; its binary hash, ABI, task ID, and internal
+address are still required. Accepted functions are labeled independently as
+`wrapper`, `orchestration`, `algorithm`,
+`model_runtime`, `utility`, or `uncertain`. `decompiled=true` records
+pseudocode production. `algorithm_body_candidate=true` is a heuristic flag;
+`algorithm_recovered` remains false until research review confirms that the
+body is substantive.
 
-## Focused Native Probes
+## Experimental Focused Native Probes
 
 After a full pipeline run has produced `phase3_native/native_function_index.json`, a focused native-only probe can re-use the workspace and run deeper target selection without rerunning manifest, JADX, or resource extraction.
 
@@ -292,15 +301,21 @@ Key probe outputs:
 - `native_probe_review_units.jsonl`: per-target outcome classification for review.
 - `native_probe_summary.json`: summary counts and output paths.
 
-When the probe completes, phase 5 evidence packets are refreshed by default so the probe review units are included in `phase5_evidence/evidence_units.jsonl` and `phase5_evidence/similarity_ready_packet.json`.
+When the probe completes, phase 5 evidence packets are refreshed by default so
+the probe review units are included in `phase5_evidence/evidence_units.jsonl`
+and the similarity-preparation packet.
 
 ## External Tools
 
-The Python dependency list is intentionally small. Some stages use external command-line tools when available:
+The Python dependency list includes Androguard and the generated TFLite schema
+package. Some stages use external command-line tools when available:
 
 - `jadx`: Java/Kotlin decompilation. If not installed, the runner can download the configured JADX release.
 - `strings`: native string extraction.
 - `readelf`, `llvm-readelf`, or `nm`: native symbol extraction.
 - `rizin` or `radare2`: optional targeted native pseudocode and function-feature output.
 
-If optional tools are missing, the pipeline records the missing capability in the phase output instead of stopping the whole run.
+The `ida-handoff` profile uses `strings` and an ELF symbol utility when
+available; these are normally present in standard Colab runtimes. If symbol
+tools are unavailable, the library-level discovery tasks remain usable.
+Optional decompiler tools are not installed or invoked by that profile.

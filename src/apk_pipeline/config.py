@@ -8,6 +8,7 @@ from pathlib import Path
 class PipelineConfig:
     apk_path: Path
     workspace: Path
+    analysis_profile: str = "standard"
     force: bool = False
     isolated_workspace: bool = False
     jadx_version: str = "1.5.0"
@@ -26,6 +27,7 @@ class PipelineConfig:
     native_timeout_per_function: int = 90
     native_timeout_per_app: int = 3600
     ida_review_limit: int = 120
+    ida_handoff_max_libraries: int = 12
     native_target_capabilities: tuple[str, ...] = ()
     max_snippets_per_capability: int = 40
     first_party_prefixes: tuple[str, ...] = ()

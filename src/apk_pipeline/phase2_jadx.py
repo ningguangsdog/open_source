@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import os
 import re
+import shutil
 import subprocess
+import tempfile
 import time
 import urllib.request
 import zipfile
@@ -18,7 +21,13 @@ from .capability_taxonomy import (
     keyword_matches_text,
 )
 from .code_ownership import classify_code_ownership, normalize_prefixes
-from .evidence import capability_confidence, compact_list, token_fingerprint, unit_id
+from .evidence import (
+    capability_confidence,
+    compact_list,
+    token_fingerprint,
+    token_shingle_signature,
+    unit_id,
+)
 from .models import PhaseResult
 from .run_context import (
     build_phase_cache_spec,
@@ -35,6 +44,7 @@ from .utils import (
     safe_write_json,
     sha256_file,
     tool_exists,
+    validate_zip,
     zip_contains,
 )
 
@@ -85,17 +95,45 @@ def _apk_has_dex(apk_path: Path) -> bool:
 
 
 def _find_jadx_binary(tools_dir: Path, version: str) -> Path | None:
-    candidates = [
-        tools_dir / f"jadx-{version}" / "bin" / "jadx",
-        tools_dir / "jadx" / "bin" / "jadx",
-    ]
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
-    for candidate in tools_dir.glob("**/bin/jadx"):
-        if candidate.exists():
-            return candidate
-    return None
+    candidate = tools_dir / f"jadx-{version}" / "bin" / "jadx"
+    return candidate if candidate.is_file() else None
+
+
+def _download_jadx_archive(url: str, zip_path: Path) -> None:
+    fd, temp_name = tempfile.mkstemp(
+        prefix=f".{zip_path.name}.",
+        suffix=".download",
+        dir=str(zip_path.parent),
+    )
+    os.close(fd)
+    temp_path = Path(temp_name)
+    try:
+        urllib.request.urlretrieve(url, temp_path)
+        validate_zip(temp_path)
+        os.replace(temp_path, zip_path)
+    except Exception:
+        temp_path.unlink(missing_ok=True)
+        raise
+
+
+def _extract_jadx_archive(zip_path: Path, extract_dir: Path) -> None:
+    temp_dir = Path(
+        tempfile.mkdtemp(
+            prefix=f".{extract_dir.name}.",
+            dir=str(extract_dir.parent),
+        )
+    )
+    try:
+        safe_extract_zip(zip_path, temp_dir)
+        binary = temp_dir / "bin" / "jadx"
+        if not binary.is_file():
+            raise RuntimeError(f"JADX archive does not contain bin/jadx: {zip_path}")
+        if extract_dir.exists():
+            shutil.rmtree(extract_dir)
+        os.replace(temp_dir, extract_dir)
+    except Exception:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise
 
 
 def _ensure_jadx(workspace: Path, version: str, no_download: bool) -> list[str]:
@@ -111,14 +149,20 @@ def _ensure_jadx(workspace: Path, version: str, no_download: bool) -> list[str]:
         raise RuntimeError("jadx is not installed and automatic download is disabled")
 
     zip_path = tools_dir / f"jadx-{version}.zip"
+    url = JADX_RELEASE_URL.format(version=version)
+    if zip_path.exists():
+        try:
+            validate_zip(zip_path)
+        except Exception:
+            zip_path.unlink(missing_ok=True)
     if not zip_path.exists():
-        url = JADX_RELEASE_URL.format(version=version)
-        urllib.request.urlretrieve(url, zip_path)
+        _download_jadx_archive(url, zip_path)
 
     extract_dir = tools_dir / f"jadx-{version}"
+    if extract_dir.exists() and not _find_jadx_binary(tools_dir, version):
+        shutil.rmtree(extract_dir)
     if not extract_dir.exists():
-        ensure_dir(extract_dir)
-        safe_extract_zip(zip_path, extract_dir)
+        _extract_jadx_archive(zip_path, extract_dir)
 
     binary = _find_jadx_binary(tools_dir, version)
     if not binary:
@@ -430,6 +474,7 @@ def _empty_source_record(path: Path, root: Path, error: Exception) -> dict[str, 
         "read_error": f"{type(error).__name__}: {error}",
         "size_bytes": path.stat().st_size if path.exists() else None,
         "sha256": None,
+        "token_shingle_signature": None,
         "package": None,
         "class_name": path.stem,
         "class_names": [],
@@ -528,6 +573,7 @@ def _index_source_file(
         **chunk_metadata,
         "indexing_mode": "complete_overlapping_chunks_with_method_level_parsing",
         "sha256": sha256_file(path),
+        "token_shingle_signature": token_shingle_signature(chunks),
         "package": package,
         "path_inferred_package": inferred_path_package,
         "class_name": class_names[0] if class_names else path.stem,
@@ -767,6 +813,7 @@ def build_java_evidence_units(code_index: dict[str, Any]) -> list[dict[str, Any]
                 "urls": compact_list(record.get("urls") or [], 40),
                 "snippets": snippets,
                 "token_fingerprint": token_fingerprint(text_for_hash),
+                "token_shingle_signature": record.get("token_shingle_signature"),
                 "confidence": capability_confidence(capabilities, len(snippets)),
                 "representation": (
                     "compact evidence unit; complete lists and source metadata are "

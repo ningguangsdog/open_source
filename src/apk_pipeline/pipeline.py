@@ -8,6 +8,7 @@ import logging
 from pathlib import Path
 import platform
 import sys
+from typing import Callable
 
 from .config import PipelineConfig
 from .input_resolver import ResolvedAPKInput, resolve_apk_input
@@ -33,7 +34,7 @@ from .utils import ensure_dir, safe_write_json
 
 logger = logging.getLogger(__name__)
 PIPELINE_VERSION_LABEL = (
-    "July 5 + Native Deep v1 + Run Integrity v1 + Evidence Quality v1 + IDA Review v1"
+    "July 5 + Native Deep v1 + Pretest Finalization v1"
 )
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -100,113 +101,148 @@ class APKPipeline:
         run_context_path = write_run_context(workspace, run_context)
 
         phases: list[PhaseResult] = []
-        phase_calls = [
-            (
-                "phase0_split_inventory",
-                lambda: run_phase0(
-                    resolved.all_apks,
-                    resolved.primary_apk,
-                    workspace,
-                    force=self.config.force,
-                    run_context=run_context,
-                ),
-            ),
-            (
-                "phase1_manifest",
-                lambda: run_phase1_multi(
-                    resolved.primary_apk,
-                    resolved.all_apks,
-                    workspace,
-                    force=self.config.force,
-                    run_context=run_context,
-                ),
-            ),
-            (
-                "phase2_jadx",
-                lambda: run_phase2_multi(
-                    resolved.primary_apk,
-                    resolved.all_apks,
-                    workspace,
-                    force=self.config.force,
-                    jadx_version=self.config.jadx_version,
-                    jadx_threads=self.config.jadx_threads,
-                    jadx_timeout_per_apk=self.config.jadx_timeout_per_apk,
-                    no_jadx_download=not self.config.jadx_download,
-                    decompile_all_splits=self.config.decompile_all_splits,
-                    max_snippets_per_capability=self.config.max_snippets_per_capability,
-                    first_party_prefixes=self.config.first_party_prefixes,
-                    third_party_prefixes=self.config.third_party_prefixes,
-                    run_context=run_context,
-                ),
-            ),
-            (
-                "phase3_native",
-                lambda: run_phase3_multi(
-                    resolved.phase3_apks,
-                    workspace,
-                    force=self.config.force,
-                    native_depth=self.config.native_depth,
-                    native_max_functions=self.config.native_max_functions,
-                    native_decompiler=self.config.native_decompiler,
-                    native_max_libraries=self.config.native_max_libraries,
-                    native_max_decompile_targets=self.config.native_max_decompile_targets,
-                    native_timeout_per_function=self.config.native_timeout_per_function,
-                    native_timeout_per_app=self.config.native_timeout_per_app,
-                    ida_review_limit=self.config.ida_review_limit,
-                    native_target_capabilities=self.config.native_target_capabilities,
-                    first_party_native_hashes=self.config.first_party_native_hashes,
-                    third_party_native_hashes=self.config.third_party_native_hashes,
-                    run_context=run_context,
-                ),
-            ),
-        ]
+        try:
+            phase0 = run_phase0(
+                resolved.all_apks,
+                resolved.primary_apk,
+                workspace,
+                force=self.config.force,
+                run_context=run_context,
+            )
+        except Exception as exc:
+            logger.exception("phase0_split_inventory failed with an uncaught exception")
+            phase0 = PhaseResult(
+                name="phase0_split_inventory",
+                success=False,
+                status="failed",
+                output_paths=[],
+                details={},
+                error=repr(exc),
+            )
+        phases.append(phase0)
 
-        if self.config.resource_scan:
-            phase_calls.append(
-                (
+        if phase0.status == "failed":
+            reason = "Phase 0 rejected the primary APK; downstream evidence would be unreliable."
+            phases.extend(
+                _skipped_phase(name, reason)
+                for name in (
+                    "phase1_manifest",
+                    "phase2_jadx",
+                    "phase3_native",
                     "phase4_resources",
-                    lambda: run_phase4_resources(
-                        resolved.all_apks,
+                    "phase5_evidence",
+                )
+            )
+            phase_calls: list[tuple[str, Callable[[], PhaseResult]]] = []
+        else:
+            valid_paths = {
+                Path(path).expanduser().resolve()
+                for path in phase0.details.get("valid_apks", [])
+            }
+            analysis_apks = [
+                path for path in resolved.all_apks if path.resolve() in valid_paths
+            ]
+            phase3_apks = [
+                path for path in resolved.phase3_apks if path.resolve() in valid_paths
+            ]
+            phase_calls = [
+                (
+                    "phase1_manifest",
+                    lambda: run_phase1_multi(
+                        resolved.primary_apk,
+                        analysis_apks,
                         workspace,
                         force=self.config.force,
                         run_context=run_context,
                     ),
-                )
-            )
-        else:
-            phase_calls.append(
+                ),
                 (
-                    "phase4_resources",
-                    lambda: _skipped_phase(
+                    "phase2_jadx",
+                    lambda: run_phase2_multi(
+                        resolved.primary_apk,
+                        analysis_apks,
+                        workspace,
+                        force=self.config.force,
+                        jadx_version=self.config.jadx_version,
+                        jadx_threads=self.config.jadx_threads,
+                        jadx_timeout_per_apk=self.config.jadx_timeout_per_apk,
+                        no_jadx_download=not self.config.jadx_download,
+                        decompile_all_splits=self.config.decompile_all_splits,
+                        max_snippets_per_capability=self.config.max_snippets_per_capability,
+                        first_party_prefixes=self.config.first_party_prefixes,
+                        third_party_prefixes=self.config.third_party_prefixes,
+                        run_context=run_context,
+                    ),
+                ),
+                (
+                    "phase3_native",
+                    lambda: run_phase3_multi(
+                        phase3_apks,
+                        workspace,
+                        force=self.config.force,
+                        native_depth=self.config.native_depth,
+                        native_max_functions=self.config.native_max_functions,
+                        native_decompiler=self.config.native_decompiler,
+                        native_max_libraries=self.config.native_max_libraries,
+                        native_max_decompile_targets=self.config.native_max_decompile_targets,
+                        native_timeout_per_function=self.config.native_timeout_per_function,
+                        native_timeout_per_app=self.config.native_timeout_per_app,
+                        ida_review_limit=self.config.ida_review_limit,
+                        ida_handoff_max_libraries=self.config.ida_handoff_max_libraries,
+                        native_target_capabilities=self.config.native_target_capabilities,
+                        first_party_native_hashes=self.config.first_party_native_hashes,
+                        third_party_native_hashes=self.config.third_party_native_hashes,
+                        run_context=run_context,
+                    ),
+                ),
+            ]
+
+            if self.config.resource_scan:
+                phase_calls.append(
+                    (
                         "phase4_resources",
-                        "Resource scanning was disabled by configuration.",
-                    ),
+                        lambda: run_phase4_resources(
+                            analysis_apks,
+                            workspace,
+                            force=self.config.force,
+                            run_context=run_context,
+                        ),
+                    )
                 )
-            )
+            else:
+                phase_calls.append(
+                    (
+                        "phase4_resources",
+                        lambda: _skipped_phase(
+                            "phase4_resources",
+                            "Resource scanning was disabled by configuration.",
+                        ),
+                    )
+                )
 
-        if self.config.emit_evidence_packets:
-            phase_calls.append(
-                (
-                    "phase5_evidence",
-                    lambda: run_phase5_evidence(
-                        workspace,
-                        force=self.config.force,
-                        run_context=run_context,
-                        upstream_results=phases,
-                        require_resources=self.config.resource_scan,
-                    ),
-                )
-            )
-        else:
-            phase_calls.append(
-                (
-                    "phase5_evidence",
-                    lambda: _skipped_phase(
+            if self.config.emit_evidence_packets:
+                phase_calls.append(
+                    (
                         "phase5_evidence",
-                        "Evidence packet generation was disabled by configuration.",
-                    ),
+                        lambda: run_phase5_evidence(
+                            workspace,
+                            force=self.config.force,
+                            run_context=run_context,
+                            upstream_results=phases,
+                            require_resources=self.config.resource_scan,
+                        ),
+                    )
                 )
-            )
+            else:
+                phase_calls.append(
+                    (
+                        "phase5_evidence",
+                        lambda: _skipped_phase(
+                            "phase5_evidence",
+                            "Evidence packet generation was disabled by configuration.",
+                        ),
+                    )
+                )
 
         for phase_name, call in phase_calls:
             try:

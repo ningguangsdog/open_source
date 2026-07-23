@@ -18,7 +18,7 @@ from .run_context import (
 from .utils import ensure_dir, safe_write_json, sha256_file, validate_zip
 
 
-PHASE_SCHEMA = "2026-07-23.phase0.v3"
+PHASE_SCHEMA = "2026-07-23.phase0.v4"
 DENSITY_MARKERS = (
     "ldpi",
     "mdpi",
@@ -30,7 +30,16 @@ DENSITY_MARKERS = (
     "nodpi",
 )
 ABI_MARKERS = ("arm64", "armeabi", "x86", "mips", "riscv")
-MODEL_EXTENSIONS = (".tflite", ".lite", ".onnx", ".pb", ".pt", ".pth", ".mlmodel")
+MODEL_EXTENSIONS = (
+    ".tflite",
+    ".lite",
+    ".onnx",
+    ".pb",
+    ".pt",
+    ".pth",
+    ".mlmodel",
+    ".task",
+)
 RESOURCE_EXTENSIONS = (
     ".json",
     ".xml",
@@ -262,6 +271,12 @@ def run_phase0(
             **payload["summary"],
             "successful_apk_count": len(records) - len(failed_records),
             "failed_apk_count": len(failed_records),
+            "valid_apks": [
+                str(item["file"]) for item in records if item.get("success")
+            ],
+            "invalid_apks": [
+                str(item["file"]) for item in records if not item.get("success")
+            ],
         },
         error=error,
         warnings=[

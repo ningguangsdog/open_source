@@ -33,6 +33,15 @@ def non_negative_int(value: str) -> int:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the APK research extraction pipeline.")
+    parser.add_argument(
+        "--profile",
+        choices=["standard", "ida-handoff"],
+        default="standard",
+        help=(
+            "Named analysis preset. ida-handoff performs complete Phase 0-5 "
+            "extraction and target ranking without an automated native decompiler."
+        ),
+    )
     parser.add_argument("--apk", type=Path, help="Path to .apk, .apkm, .apks, or .xapk input.")
     parser.add_argument("--workspace", type=Path, help="Directory for pipeline outputs.")
     parser.add_argument("--force", action="store_true", help="Recompute phases even when outputs already exist.")
@@ -64,19 +73,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--native-depth",
         choices=["none", "basic", "targeted", "auto", "deep"],
-        default="auto",
+        default=None,
         help="Native analysis depth. auto ranks evidence and attempts pseudocode only for high-value targets.",
     )
     parser.add_argument(
         "--native-max-functions",
         type=positive_int,
-        default=300,
+        default=None,
         help="Maximum ranked native targets to keep in phase3_native/native_targets.json.",
     )
     parser.add_argument(
         "--native-decompiler",
         choices=["auto", "none", "rizin", "radare2", "ghidra", "retdec"],
-        default="auto",
+        default=None,
         help="Preferred native decompiler adapter for auto/deep native analysis.",
     )
     parser.add_argument(
@@ -87,13 +96,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--native-max-libraries",
         type=positive_int,
-        default=8,
+        default=None,
         help="Maximum native libraries selected for deeper native review.",
     )
     parser.add_argument(
         "--native-max-decompile-targets",
         type=positive_int,
-        default=40,
+        default=None,
         help="Maximum native targets sent to the optional decompiler adapter.",
     )
     parser.add_argument(
@@ -111,11 +120,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--ida-review-limit",
         type=positive_int,
-        default=120,
+        default=None,
         help=(
             "Number of highest-priority native functions placed in the manual "
             "IDA review queue. The full candidate inventory is still retained."
         ),
+    )
+    parser.add_argument(
+        "--ida-handoff-max-libraries",
+        type=positive_int,
+        default=None,
+        help="Maximum unique library/ABI binaries included in phase3_native/ida_handoff.zip.",
     )
     parser.add_argument(
         "--native-target-capabilities",
@@ -181,14 +196,45 @@ def main() -> int:
     if args.native_preflight_only:
         import json
 
-        print(json.dumps(detect_native_toolchain(args.native_decompiler), indent=2, ensure_ascii=False))
+        print(
+            json.dumps(
+                detect_native_toolchain(args.native_decompiler or "auto"),
+                indent=2,
+                ensure_ascii=False,
+            )
+        )
         return 0
     if args.apk is None or args.workspace is None:
         raise SystemExit("--apk and --workspace are required unless --native-preflight-only is used.")
 
+    profile_defaults = {
+        "standard": {
+            "native_depth": "auto",
+            "native_max_functions": 300,
+            "native_decompiler": "auto",
+            "native_max_libraries": 8,
+            "native_max_decompile_targets": 40,
+            "ida_review_limit": 120,
+            "ida_handoff_max_libraries": 12,
+        },
+        "ida-handoff": {
+            "native_depth": "targeted",
+            "native_max_functions": 600,
+            "native_decompiler": "none",
+            "native_max_libraries": 16,
+            "native_max_decompile_targets": 1,
+            "ida_review_limit": 240,
+            "ida_handoff_max_libraries": 12,
+        },
+    }[args.profile]
+    for name, value in profile_defaults.items():
+        if getattr(args, name) is None:
+            setattr(args, name, value)
+
     config = PipelineConfig(
         apk_path=args.apk,
         workspace=args.workspace,
+        analysis_profile=args.profile,
         force=args.force,
         isolated_workspace=args.isolated_workspace,
         jadx_version=args.jadx_version,
@@ -207,6 +253,7 @@ def main() -> int:
         native_timeout_per_function=args.native_timeout_per_function,
         native_timeout_per_app=args.native_timeout_per_app,
         ida_review_limit=args.ida_review_limit,
+        ida_handoff_max_libraries=args.ida_handoff_max_libraries,
         native_target_capabilities=tuple(
             item.strip()
             for item in args.native_target_capabilities.split(",")
