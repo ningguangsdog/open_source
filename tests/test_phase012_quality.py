@@ -3,11 +3,14 @@ from __future__ import annotations
 import json
 import importlib.util
 import subprocess
+import sys
 import tempfile
+import types
 import unittest
 import zipfile
 from pathlib import Path
 from unittest.mock import patch
+from xml.etree import ElementTree
 
 from apk_pipeline.capability_taxonomy import classify_text
 from apk_pipeline.code_ownership import (
@@ -104,6 +107,13 @@ class _PartialAPK(_CompleteAPK):
 class _CriticalFailureAPK(_CompleteAPK):
     def get_package(self) -> None:
         return None
+
+
+class _ElementManifestAPK(_CompleteAPK):
+    def get_android_manifest_xml(self) -> ElementTree.Element:
+        return ElementTree.fromstring(
+            '<manifest package="com.adobe.reader"><application/></manifest>'
+        )
 
 
 def _write_apk(path: Path, entries: dict[str, bytes]) -> None:
@@ -247,6 +257,44 @@ class Phase012QualityTests(unittest.TestCase):
             summary = _extract_manifest_summary(Path("sample.apk"))
         self.assertEqual(summary["status"], "failed")
         self.assertIn("package", summary["error"])
+
+    def test_phase1_serializes_element_manifest_without_toxml(self) -> None:
+        with patch(
+            "apk_pipeline.phase1_manifest._build_apk_parser",
+            return_value=_ElementManifestAPK(),
+        ):
+            summary = _extract_manifest_summary(Path("sample.apk"))
+        self.assertEqual(summary["status"], "success")
+        self.assertIn('package="com.adobe.reader"', summary["manifest_xml"])
+        self.assertIn(
+            "ElementTree.tostring",
+            summary["field_status"]["manifest_xml"]["method"],
+        )
+
+    def test_phase1_serializes_lxml_manifest_without_toxml(self) -> None:
+        manifest = object()
+        etree = types.SimpleNamespace(
+            iselement=lambda value: value is manifest,
+            tostring=lambda value, *, encoding: (
+                '<manifest package="com.xodo.pdf.reader"><application/></manifest>'
+            ),
+        )
+        lxml = types.ModuleType("lxml")
+        lxml.etree = etree  # type: ignore[attr-defined]
+        apk = _CompleteAPK()
+        apk.get_android_manifest_xml = lambda: manifest  # type: ignore[method-assign]
+        with patch.dict(sys.modules, {"lxml": lxml}):
+            with patch(
+                "apk_pipeline.phase1_manifest._build_apk_parser",
+                return_value=apk,
+            ):
+                summary = _extract_manifest_summary(Path("sample.apk"))
+        self.assertEqual(summary["status"], "success")
+        self.assertIn('package="com.xodo.pdf.reader"', summary["manifest_xml"])
+        self.assertEqual(
+            summary["field_status"]["manifest_xml"]["method"],
+            "get_android_manifest_xml/lxml.etree.tostring",
+        )
 
     def test_ownership_precedence_and_dependency_registry(self) -> None:
         first = classify_code_ownership(

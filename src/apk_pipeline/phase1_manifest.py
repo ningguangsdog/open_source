@@ -15,7 +15,7 @@ from .run_context import (
 from .utils import ensure_dir, safe_write_json
 
 
-PHASE_SCHEMA = "2026-07-23.phase1.v3"
+PHASE_SCHEMA = "2026-07-24.phase1.v4"
 DANGEROUS_PERMISSION_MARKERS = (
     "CAMERA",
     "RECORD_AUDIO",
@@ -224,11 +224,11 @@ def _manifest_xml(
     if manifest is None:
         return ""
     try:
-        xml = manifest.toxml()
+        xml, serializer = _serialize_manifest_xml(manifest)
     except Exception as exc:
         field_status["manifest_xml"] = {
             "status": "error",
-            "method": "get_android_manifest_xml.toxml",
+            "method": "get_android_manifest_xml.serialize",
             "required": True,
             "error": f"{type(exc).__name__}: {exc}",
         }
@@ -236,7 +236,7 @@ def _manifest_xml(
             {
                 "field": "manifest_xml",
                 "status": "error",
-                "method": "get_android_manifest_xml.toxml",
+                "method": "get_android_manifest_xml.serialize",
                 "message": f"{type(exc).__name__}: {exc}",
             }
         )
@@ -244,24 +244,72 @@ def _manifest_xml(
     if not xml:
         field_status["manifest_xml"] = {
             "status": "missing",
-            "method": "get_android_manifest_xml.toxml",
+            "method": serializer,
             "required": True,
         }
         field_warnings.append(
             {
                 "field": "manifest_xml",
                 "status": "missing",
-                "method": "get_android_manifest_xml.toxml",
+                "method": serializer,
                 "message": "Decoded AndroidManifest.xml is empty.",
             }
         )
         return ""
     field_status["manifest_xml"] = {
         "status": "success",
-        "method": "get_android_manifest_xml.toxml",
+        "method": serializer,
         "required": True,
     }
     return xml
+
+
+def _serialize_manifest_xml(manifest: Any) -> tuple[str, str]:
+    """Serialize manifest nodes returned by supported Androguard versions."""
+
+    if isinstance(manifest, str):
+        return manifest, "get_android_manifest_xml"
+    if isinstance(manifest, bytes):
+        return (
+            manifest.decode("utf-8", errors="replace"),
+            "get_android_manifest_xml.decode",
+        )
+
+    toxml = getattr(manifest, "toxml", None)
+    if callable(toxml):
+        value = toxml()
+        if isinstance(value, bytes):
+            value = value.decode("utf-8", errors="replace")
+        if not isinstance(value, str):
+            raise TypeError(
+                "get_android_manifest_xml().toxml() returned "
+                f"{type(value).__name__}, expected str or bytes"
+            )
+        return value, "get_android_manifest_xml.toxml"
+
+    try:
+        from lxml import etree
+
+        if etree.iselement(manifest):
+            return (
+                etree.tostring(manifest, encoding="unicode"),
+                "get_android_manifest_xml/lxml.etree.tostring",
+            )
+    except ImportError:
+        pass
+
+    try:
+        from xml.etree import ElementTree
+
+        return (
+            ElementTree.tostring(manifest, encoding="unicode"),
+            "get_android_manifest_xml/xml.etree.ElementTree.tostring",
+        )
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise TypeError(
+            "Unsupported Android manifest XML object: "
+            f"{type(manifest).__module__}.{type(manifest).__name__}"
+        ) from exc
 
 
 def _completeness_score(field_status: dict[str, dict[str, Any]]) -> float:
