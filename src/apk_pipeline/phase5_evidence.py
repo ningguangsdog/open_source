@@ -19,7 +19,7 @@ from .run_context import (
 from .utils import ensure_dir, safe_write_json, safe_write_text
 
 
-PHASE_SCHEMA = "2026-07-23.phase5.v6"
+PHASE_SCHEMA = "2026-08-20.phase5.v7"
 SIMILARITY_UNIT_LIMIT = 250
 
 
@@ -365,6 +365,30 @@ def _extract_native_targets(
 
 
 def _extract_native_deep_summary(workspace: Path) -> dict[str, Any]:
+    automated_ida = _load_json(
+        workspace / "phase3_native" / "ida_automated_summary.json"
+    )
+    automated_ida_summary = {
+        key: automated_ida.get(key)
+        for key in (
+            "schema_version",
+            "status",
+            "tool",
+            "backend",
+            "attempted_targets",
+            "selected_target_count",
+            "unattempted_target_count",
+            "libraries_selected",
+            "libraries_attempted",
+            "successful_decompilations",
+            "failed_decompilations",
+            "library_summaries",
+            "budget",
+            "elapsed_seconds",
+            "message",
+        )
+        if key in automated_ida
+    }
     return {
         "toolchain": _load_json(workspace / "phase3_native" / "native_toolchain.json"),
         "decompile_plan": _load_json(workspace / "phase3_native" / "native_decompile_plan.json"),
@@ -384,6 +408,7 @@ def _extract_native_deep_summary(workspace: Path) -> dict[str, Any]:
             / "ida_handoff"
             / "ida_handoff_manifest.json"
         ),
+        "automated_ida": automated_ida_summary,
     }
 
 
@@ -506,6 +531,35 @@ def _build_java_native_bridge_map(
                 }
             )
 
+    symbols_by_stem: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    symbols_by_method: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    targets_by_stem: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    targets_by_method: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in symbol_rows:
+        for stem in _lib_stems(
+            [str(row.get("library_name") or ""), str(row.get("library") or "")]
+        ):
+            symbols_by_stem[stem].append(row)
+        symbol = str(row.get("symbol") or "")
+        base = symbol.split("__", 1)[0]
+        if base.startswith("Java_") and "_" in base:
+            symbols_by_method[base.rsplit("_", 1)[-1].lower()].append(row)
+        if "::" in symbol:
+            method_name = symbol.rsplit("::", 1)[-1].split("(", 1)[0]
+            if method_name:
+                symbols_by_method[method_name.lower()].append(row)
+    for target in native_targets:
+        for stem in _lib_stems([str(target.get("library") or "")]):
+            targets_by_stem[stem].append(target)
+        name = str(target.get("name") or target.get("symbol") or "")
+        base = name.split("__", 1)[0]
+        if base.startswith("Java_") and "_" in base:
+            targets_by_method[base.rsplit("_", 1)[-1].lower()].append(target)
+        if "::" in name:
+            method_name = name.rsplit("::", 1)[-1].split("(", 1)[0]
+            if method_name:
+                targets_by_method[method_name.lower()].append(target)
+
     mappings: list[dict[str, Any]] = []
     for record in code_index.get("files") or []:
         native_methods = record.get("native_methods") or []
@@ -520,24 +574,48 @@ def _build_java_native_bridge_map(
         for method in native_methods or [None]:
             expected = _jni_prefix(record.get("package"), record.get("class_name"), str(method or ""))
             candidate_symbols = []
-            for row in symbol_rows:
-                row_stems = _lib_stems([str(row.get("library_name") or ""), str(row.get("library") or "")])
-                if loaded_stems and not loaded_stems.intersection(row_stems):
+            symbol_pool: list[dict[str, Any]] = []
+            if loaded_stems:
+                for stem in sorted(loaded_stems):
+                    symbol_pool.extend(symbols_by_stem.get(stem) or [])
+            elif method:
+                symbol_pool.extend(symbols_by_method.get(str(method).lower()) or [])
+            seen_symbol_rows: set[tuple[str, str, str]] = set()
+            for row in symbol_pool:
+                row_key = (
+                    str(row.get("library") or ""),
+                    str(row.get("symbol") or ""),
+                    str(row.get("address") or ""),
+                )
+                if row_key in seen_symbol_rows:
                     continue
+                seen_symbol_rows.add(row_key)
                 symbol = str(row.get("symbol") or "")
                 if method and (expected in symbol or symbol.endswith(f"_{method}") or f"_{method}__" in symbol):
                     candidate_symbols.append(row)
-                elif not method and loaded_stems.intersection(row_stems):
+                elif not method and loaded_stems:
                     candidate_symbols.append(row)
                 if len(candidate_symbols) >= 40:
                     break
 
             candidate_targets = []
-            for target in native_targets:
-                target_stems = _lib_stems([str(target.get("library") or "")])
-                if loaded_stems and not loaded_stems.intersection(target_stems):
-                    continue
+            target_pool: list[dict[str, Any]] = []
+            if loaded_stems:
+                for stem in sorted(loaded_stems):
+                    target_pool.extend(targets_by_stem.get(stem) or [])
+            elif method:
+                target_pool.extend(targets_by_method.get(str(method).lower()) or [])
+            seen_target_rows: set[tuple[str, str, str]] = set()
+            for target in target_pool:
                 name = str(target.get("name") or target.get("symbol") or "")
+                target_key = (
+                    str(target.get("library") or ""),
+                    name,
+                    str(target.get("address") or ""),
+                )
+                if target_key in seen_target_rows:
+                    continue
+                seen_target_rows.add(target_key)
                 if method and not (
                     expected in name or name.endswith(f"_{method}") or f"_{method}__" in name
                 ):
@@ -593,11 +671,12 @@ def _build_java_native_bridge_map(
             )
 
     return {
-        "schema_version": "2026-07-23.java-native-bridge-map.v2",
+        "schema_version": "2026-08-20.java-native-bridge-map.v3",
         "mapping_count": len(mappings),
         "mappings": mappings,
         "notes": [
             "JNI matching is conservative and may miss obfuscated, dynamically registered, or overloaded methods.",
+            "Library and method indexes bound candidate lookup before conservative symbol matching.",
             "Use candidate_symbols and candidate_native_targets as review links, not final attribution claims.",
         ],
     }
@@ -1196,6 +1275,9 @@ def run_phase5_evidence(
         workspace / "phase2_jadx" / "cache_manifest.json",
         workspace / "phase3_native" / "native_analysis.json",
         workspace / "phase3_native" / "native_evidence_units.json",
+        workspace / "phase3_native" / "native_decompilation.json",
+        workspace / "phase3_native" / "native_function_features.jsonl",
+        workspace / "phase3_native" / "ida_automated_summary.json",
         workspace / "phase3_native" / "ida_target_manifest.json",
         workspace / "phase3_native" / "manual_ida" / "import_summary.json",
         workspace / "phase3_native" / "manual_ida" / "evidence_units.json",
@@ -1355,6 +1437,7 @@ def run_phase5_evidence(
             },
             "import": native_deep_summary.get("manual_ida_import") or {},
         },
+        "automated_ida": native_deep_summary.get("automated_ida") or {},
         "native_probes": native_probe_summaries,
         "java_native_bridge_map": {
             "mapping_count": bridge_map.get("mapping_count"),
@@ -1390,6 +1473,9 @@ def run_phase5_evidence(
             "native_toolchain": str(workspace / "phase3_native" / "native_toolchain.json"),
             "native_decompile_plan": str(workspace / "phase3_native" / "native_decompile_plan.json"),
             "native_decompilation": str(workspace / "phase3_native" / "native_decompilation.json"),
+            "ida_automated_summary": str(
+                workspace / "phase3_native" / "ida_automated_summary.json"
+            ),
             "native_function_features": str(workspace / "phase3_native" / "native_function_features.jsonl"),
             "native_string_xrefs": str(workspace / "phase3_native" / "native_string_xrefs.json"),
             "native_callgraph": str(workspace / "phase3_native" / "native_callgraph.json"),

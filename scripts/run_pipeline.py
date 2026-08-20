@@ -12,6 +12,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from apk_pipeline import APKPipeline, PipelineConfig
+from apk_pipeline.ida_backend import run_ida_preflight
 from apk_pipeline.logging_utils import configure_logging
 from apk_pipeline.native_decompiler import detect_native_toolchain
 from apk_pipeline.run_context import WorkspaceIdentityMismatchError
@@ -35,11 +36,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the APK research extraction pipeline.")
     parser.add_argument(
         "--profile",
-        choices=["standard", "ida-handoff"],
+        choices=["standard", "ida-handoff", "ida-classroom"],
         default="standard",
         help=(
-            "Named analysis preset. ida-handoff performs complete Phase 0-5 "
-            "extraction and target ranking without an automated native decompiler."
+            "Named analysis preset. ida-handoff produces a manual review package; "
+            "ida-classroom runs the isolated IDALib/Hex-Rays backend."
         ),
     )
     parser.add_argument("--apk", type=Path, help="Path to .apk, .apkm, .apks, or .xapk input.")
@@ -84,7 +85,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--native-decompiler",
-        choices=["auto", "none", "rizin", "radare2", "ghidra", "retdec"],
+        choices=["auto", "none", "ida", "rizin", "radare2", "ghidra", "retdec"],
         default=None,
         help="Preferred native decompiler adapter for auto/deep native analysis.",
     )
@@ -108,14 +109,36 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--native-timeout-per-function",
         type=positive_int,
-        default=90,
+        default=None,
         help="Timeout in seconds for one optional native decompiler command.",
     )
     parser.add_argument(
         "--native-timeout-per-app",
         type=positive_int,
-        default=3600,
+        default=None,
         help="Total timeout budget in seconds for optional native decompilation.",
+    )
+    parser.add_argument(
+        "--ida-install-dir",
+        type=Path,
+        help="IDA 9.x installation directory or macOS .app bundle used by IDALib.",
+    )
+    parser.add_argument(
+        "--ida-python-executable",
+        type=Path,
+        help="Python executable used for isolated IDALib worker processes.",
+    )
+    parser.add_argument(
+        "--ida-max-retries",
+        type=non_negative_int,
+        default=None,
+        help="Retries for a failed or timed-out IDALib library job.",
+    )
+    parser.add_argument(
+        "--ida-callgraph-depth",
+        type=non_negative_int,
+        default=None,
+        help="Caller/callee expansion depth around Phase 3 seed targets.",
     )
     parser.add_argument(
         "--ida-review-limit",
@@ -196,13 +219,35 @@ def main() -> int:
     if args.native_preflight_only:
         import json
 
+        preferred_decompiler = args.native_decompiler
+        if preferred_decompiler is None:
+            preferred_decompiler = {
+                "standard": "auto",
+                "ida-handoff": "none",
+                "ida-classroom": "ida",
+            }[args.profile]
+        toolchain = detect_native_toolchain(
+            preferred_decompiler,
+            ida_install_dir=args.ida_install_dir,
+        )
+        if toolchain.get("selected_decompiler") == "ida":
+            ida_preflight = run_ida_preflight(
+                args.ida_install_dir,
+                python_executable=args.ida_python_executable,
+            )
+            toolchain["tools"]["ida"] = ida_preflight
+            toolchain["selected_adapter_automated"] = bool(
+                ida_preflight.get("available")
+            )
         print(
             json.dumps(
-                detect_native_toolchain(args.native_decompiler or "auto"),
+                toolchain,
                 indent=2,
                 ensure_ascii=False,
             )
         )
+        if preferred_decompiler == "ida":
+            return 0 if toolchain["tools"]["ida"].get("available") else 1
         return 0
     if args.apk is None or args.workspace is None:
         raise SystemExit("--apk and --workspace are required unless --native-preflight-only is used.")
@@ -214,6 +259,10 @@ def main() -> int:
             "native_decompiler": "auto",
             "native_max_libraries": 8,
             "native_max_decompile_targets": 40,
+            "native_timeout_per_function": 90,
+            "native_timeout_per_app": 3600,
+            "ida_max_retries": 1,
+            "ida_callgraph_depth": 2,
             "ida_review_limit": 120,
             "ida_handoff_max_libraries": 12,
         },
@@ -223,8 +272,25 @@ def main() -> int:
             "native_decompiler": "none",
             "native_max_libraries": 16,
             "native_max_decompile_targets": 1,
+            "native_timeout_per_function": 90,
+            "native_timeout_per_app": 3600,
+            "ida_max_retries": 0,
+            "ida_callgraph_depth": 1,
             "ida_review_limit": 240,
             "ida_handoff_max_libraries": 12,
+        },
+        "ida-classroom": {
+            "native_depth": "deep",
+            "native_max_functions": 800,
+            "native_decompiler": "ida",
+            "native_max_libraries": 20,
+            "native_max_decompile_targets": 120,
+            "native_timeout_per_function": 120,
+            "native_timeout_per_app": 7200,
+            "ida_max_retries": 1,
+            "ida_callgraph_depth": 2,
+            "ida_review_limit": 300,
+            "ida_handoff_max_libraries": 20,
         },
     }[args.profile]
     for name, value in profile_defaults.items():
@@ -252,6 +318,10 @@ def main() -> int:
         native_max_decompile_targets=args.native_max_decompile_targets,
         native_timeout_per_function=args.native_timeout_per_function,
         native_timeout_per_app=args.native_timeout_per_app,
+        ida_install_dir=args.ida_install_dir,
+        ida_python_executable=args.ida_python_executable,
+        ida_max_retries=args.ida_max_retries,
+        ida_callgraph_depth=args.ida_callgraph_depth,
         ida_review_limit=args.ida_review_limit,
         ida_handoff_max_libraries=args.ida_handoff_max_libraries,
         native_target_capabilities=tuple(

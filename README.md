@@ -33,9 +33,11 @@ The pipeline is designed for app-level capability review across many Android app
    - Keeps the complete callable candidate inventory while building a library-diversified manual review queue.
    - Adds a hash-bound discovery task for every selected library so internal implementations reached from exported JNI wrappers can be returned without pretending they were exported symbols.
    - Writes a native toolchain preflight, decompile plan, function-level feature stream, string/xref view, and lightweight call graph.
+   - Can run IDA 9.x through IDALib and Hex-Rays in one isolated subprocess per selected library. Each worker uses a separate `IDAUSR` directory, enforces a hard timeout, writes checkpoints, and can resume completed functions.
+   - Expands from ranked Java/JNI and exported-symbol seeds into nearby callers and callees, then ranks internal functions before decompilation. An opened library or generated pseudocode is not labeled as a recovered core algorithm without separate semantic evidence.
    - Produces an identity-bound IDA Classroom task manifest and a portable `ida_handoff.zip` containing a bounded set of ranked binaries.
    - Re-hashes the current extracted binary before accepting manually exported pseudocode and matches the submitted task ID, ABI, symbol, and address.
-   - Stores automated `rizin`/`radare2` evidence separately from manual IDA evidence. Producing pseudocode does not by itself establish that a core algorithm was recovered.
+   - Stores automated IDA, `rizin`, and `radare2` evidence separately from manual IDA evidence. Producing pseudocode does not by itself establish that a core algorithm was recovered.
    - Attributes native libraries using application JNI prefixes, conservative known-runtime names, and optional SHA-256 registries. Ambiguous product-specific names remain `unknown` and stay in comparison evidence.
    - In the recommended `--profile ida-handoff` workflow, target ranking runs without invoking an automated native decompiler.
 
@@ -51,6 +53,8 @@ The pipeline is designed for app-level capability review across many Android app
    - Keeps capability counts separated by phase because Java files, native strings, model resources, and split tags use different denominators.
    - Excludes third-party and platform Java/native evidence from comparison-facing capability counts by default while reporting dependency evidence separately.
    - Similarity scoring is intentionally left out of this stage.
+
+After the phases finish, `pipeline_validation.json` checks whether required IDA jobs completed, whether usable pseudocode was produced, whether library hashes still match the Phase 3 inventory, and whether successful IDA functions reached the Phase 5 evidence stream.
 
 ## Quick Start
 
@@ -92,23 +96,56 @@ The `ida-handoff` profile does not require `rizin` or `radare2`. It completes
 Phase 0-5, ranks native targets, and writes
 `phase3_native/ida_handoff.zip` for manual IDA Classroom review.
 
+## Automated IDA Classroom Run
+
+IDA Classroom 9.4 can be used through its bundled IDALib and Python package. Run the preflight from the machine where IDA is installed and activated:
+
+```bash
+python scripts/run_pipeline.py \
+  --profile ida-classroom \
+  --native-preflight-only \
+  --log-level WARNING
+```
+
+Then run the complete automated workflow locally:
+
+```bash
+python scripts/run_pipeline.py \
+  --profile ida-classroom \
+  --apk path/to/app.apkm \
+  --workspace ./runs \
+  --isolated-workspace \
+  --log-level WARNING
+```
+
+The `ida-classroom` profile selects up to 20 ranked native libraries and distributes a 120-function pseudocode budget across them. It starts from Phase 3 seeds, follows callers and callees to a depth of two, and reports a heartbeat every 20 seconds while a library worker is active. If one Hex-Rays function call exceeds `--native-timeout-per-function`, the watchdog terminates that worker, records the timed-out function, and resumes the remaining functions from checkpoints in a fresh process. Individual function failures are retained in the result. A missing backend, a library identity mismatch, zero usable pseudocode, or failure to propagate IDA evidence into Phase 5 prevents the validation report from declaring the run ready for similarity analysis.
+
+Do not add `--force` when resuming an interrupted IDA run with the same APK and configuration. The worker reuses hash-bound checkpoints and skips completed functions. Use `--force` only when a clean recomputation is intended.
+
+Google Colab cannot invoke an IDA installation running on a Mac. Use `--profile ida-handoff` in Colab, or run the complete `ida-classroom` profile locally. Depending on the license, Classroom decompilers may be cloud based; review the Hex-Rays license and data-handling terms before analyzing binaries that cannot be sent to that service.
+
 ## Useful Options
 
 - `--no-decompile-all-splits`: only run JADX on the primary APK.
 - `--jadx-timeout-per-apk`: set the timeout for each dex-bearing APK or split; partial source is retained.
 - `--isolated-workspace`: create a content-addressed workspace for each APK or bundle.
 - `--profile ida-handoff`: run the formal extraction and manual IDA handoff workflow without automated native decompilation.
+- `--profile ida-classroom`: run the complete pipeline with the isolated IDALib/Hex-Rays adapter.
 - `--native-depth none`: skip native target ranking and optional native decompiler calls.
 - `--native-depth basic`: extract native metadata and ranked targets without decompiler attempts.
 - `--native-depth targeted`: extract native metadata, rank targets, and emit native evidence units.
 - `--native-depth auto`: default mode; rank native targets and automatically attempt pseudocode/function-feature extraction only when the target score and local tool availability justify it.
 - `--native-depth deep`: force a pseudocode/function-feature attempt for selected native targets if a supported tool is available.
-- `--native-decompiler auto|none|rizin|radare2|ghidra|retdec`: select the optional native decompiler adapter.
+- `--native-decompiler auto|none|ida|rizin|radare2|ghidra|retdec`: select the optional native decompiler adapter.
 - `--native-preflight-only`: print native tool availability and exit.
 - `--native-max-libraries`: cap the number of native libraries selected for deeper review.
 - `--native-max-decompile-targets`: cap the number of native targets sent to the optional decompiler.
 - `--ida-review-limit`: cap the priority IDA review queue; the complete candidate inventory remains in the manifest.
 - `--ida-handoff-max-libraries`: cap the number of unique library/ABI binaries copied into `ida_handoff.zip`.
+- `--ida-install-dir`: override automatic IDA 9.x installation discovery.
+- `--ida-python-executable`: select the Python executable used by isolated IDALib workers.
+- `--ida-max-retries`: retry a failed or timed-out library worker while retaining completed function checkpoints.
+- `--ida-callgraph-depth`: set caller/callee expansion depth around Phase 3 seed targets.
 - `--native-target-capabilities`: prioritize one or more capability names during native target selection.
 - `--no-resource-scan`: skip raw model/resource inventory.
 - `--no-evidence-packets`: skip the final review packet.
@@ -127,6 +164,7 @@ apk_workspace/
   run_context.json
   run_manifest.json
   pipeline_summary.json
+  pipeline_validation.json
   run_records/<run-id>.json
   phase0_split_inventory/cache_manifest.json
   phase0_split_inventory/split_inventory.json
@@ -143,6 +181,10 @@ apk_workspace/
   phase3_native/native_toolchain.json
   phase3_native/native_decompile_plan.json
   phase3_native/native_decompilation.json
+  phase3_native/ida_automated_summary.json
+  phase3_native/decompiled_targets/ida_auto/ida_backend_summary.json
+  phase3_native/decompiled_targets/ida_auto/libraries/<library>/functions.jsonl
+  phase3_native/decompiled_targets/ida_auto/libraries/<library>/pseudocode/*.c
   phase3_native/native_function_index.json
   phase3_native/native_function_features.jsonl
   phase3_native/native_string_xrefs.json
@@ -194,6 +236,8 @@ Phase 5 includes an evidence-completeness section. Missing, invalid, or
 non-success upstream evidence prevents the final packet from being marked
 successful.
 
+`pipeline_validation.json` is the final automation gate. Its `status` is `passed`, `partial`, or `failed`, and `ready_for_similarity` is true only after every required check passes. `pipeline_summary.json` includes the same validation result, so a process exit code of zero means both the phase contract and the required validation checks passed.
+
 `phase2_jadx/code_index.json` is the complete source metadata index. It records
 all discovered Java, Kotlin, and decompiled XML files, including read failures
 and explicit snippet-selection telemetry. `phase5_evidence/review_packet.json`
@@ -216,6 +260,7 @@ The most useful files for review are usually:
 - `phase3_native/native_function_index.json`
 - `phase3_native/native_toolchain.json`
 - `phase3_native/native_decompile_plan.json`
+- `phase3_native/ida_automated_summary.json`
 - `phase3_native/native_function_features.jsonl`
 - `phase3_native/native_string_xrefs.json`
 - `phase3_native/native_callgraph.json`
@@ -230,11 +275,13 @@ The most useful files for review are usually:
 
 ## Optional Native Deep Analysis
 
-JADX decompiles Dalvik bytecode and does not decompile native `.so` libraries. Native code requires a binary analysis tool. The automated native-deep adapter currently supports `rizin` and `radare2`.
+JADX decompiles Dalvik bytecode and does not decompile native `.so` libraries. Native code requires a binary analysis tool. The automated native-deep adapter supports IDA 9.x through IDALib/Hex-Rays, plus `rizin` and `radare2`.
 
 In `--native-depth auto`, the pipeline first ranks high-value native targets, writes `phase3_native/native_decompile_plan.json`, and attempts native pseudocode/function-feature extraction only when an automated adapter is available. If no adapter is available, the run still records the missing tool in `phase3_native/native_toolchain.json` and keeps the ranked target plan for follow-up.
 
 Function-level outputs include normalized instruction features, pseudocode fingerprints, basic block counts, string references, call targets, and a lightweight call graph. These are intended as evidence for downstream review and later similarity preparation, not as a complete source reconstruction.
+
+The IDA adapter copies each selected library into a pipeline-owned job directory, verifies its SHA-256 hash before analysis, and closes the database without saving an IDB. Pseudocode is stored as per-function UTF-8 `.c` files with a JSONL result stream and library-level summary. The original extracted library is never modified.
 
 ## Manual IDA Classroom Review
 
@@ -314,6 +361,7 @@ package. Some stages use external command-line tools when available:
 - `strings`: native string extraction.
 - `readelf`, `llvm-readelf`, or `nm`: native symbol extraction.
 - `rizin` or `radare2`: optional targeted native pseudocode and function-feature output.
+- IDA 9.x with IDALib and a compatible Hex-Rays decompiler: optional automated native pseudocode, internal-function discovery, call-graph expansion, and function-feature output.
 
 The `ida-handoff` profile uses `strings` and an ELF symbol utility when
 available; these are normally present in standard Colab runtimes. If symbol

@@ -12,6 +12,10 @@ from typing import Any, Callable
 
 from .capability_taxonomy import capability_names, classify_text
 from .evidence import token_fingerprint
+from .ida_backend import (
+    ida_installation_info,
+    run_ida_decompile,
+)
 from .ida_integration import normalize_address
 from .native_semantics import abi_analysis_role, classify_native_semantics
 from .utils import ensure_dir, run_cmd, safe_name, safe_write_json, safe_write_text, tool_exists
@@ -37,7 +41,7 @@ HIGH_VALUE_NAME_MARKERS = (
     "image",
     "model",
 )
-AUTOMATED_DECOMPILER_TOOLS = {"rizin", "radare2"}
+AUTOMATED_DECOMPILER_TOOLS = {"ida", "rizin", "radare2"}
 MAX_COMMAND_OUTPUT = 3_000_000
 ProgressCallback = Callable[[dict[str, Any]], None]
 
@@ -361,9 +365,15 @@ def select_native_targets(
     return budgeted
 
 
-def available_decompiler(preferred: str = "auto") -> str | None:
+def available_decompiler(
+    preferred: str = "auto",
+    *,
+    ida_install_dir: str | Path | None = None,
+) -> str | None:
     if preferred == "none":
         return None
+    if preferred == "ida" and ida_installation_info(ida_install_dir).get("available"):
+        return "ida"
     if preferred == "rizin" and tool_exists("rizin"):
         return "rizin"
     if preferred == "radare2" and tool_exists("r2"):
@@ -374,6 +384,8 @@ def available_decompiler(preferred: str = "auto") -> str | None:
         return "ghidra"
     if preferred not in {"auto", "none"}:
         return None
+    if ida_installation_info(ida_install_dir).get("available"):
+        return "ida"
     if tool_exists("rizin"):
         return "rizin"
     if tool_exists("r2"):
@@ -398,9 +410,14 @@ def _tool_version(command: list[str], timeout: int = 10) -> str | None:
     return text.splitlines()[0][:300]
 
 
-def detect_native_toolchain(preferred: str = "auto") -> dict[str, Any]:
+def detect_native_toolchain(
+    preferred: str = "auto",
+    *,
+    ida_install_dir: str | Path | None = None,
+) -> dict[str, Any]:
     """Return a machine-readable native analysis tool preflight."""
 
+    ida_info = ida_installation_info(ida_install_dir)
     tools = {
         "strings": {
             "available": tool_exists("strings"),
@@ -418,6 +435,7 @@ def detect_native_toolchain(preferred: str = "auto") -> dict[str, Any]:
             "available": tool_exists("nm"),
             "version": _tool_version(["nm", "--version"]) if tool_exists("nm") else None,
         },
+        "ida": ida_info,
         "rizin": {
             "available": tool_exists("rizin"),
             "version": _tool_version(["rizin", "-v"]) if tool_exists("rizin") else None,
@@ -441,7 +459,10 @@ def detect_native_toolchain(preferred: str = "auto") -> dict[str, Any]:
             "automated_adapter": False,
         },
     }
-    selected = available_decompiler(preferred)
+    selected = available_decompiler(
+        preferred,
+        ida_install_dir=ida_install_dir,
+    )
     return {
         "preferred": preferred,
         "selected_decompiler": selected,
@@ -449,7 +470,8 @@ def detect_native_toolchain(preferred: str = "auto") -> dict[str, Any]:
         "tools": tools,
         "notes": [
             "JADX handles Dalvik bytecode only; native .so files require a binary decompiler/disassembler.",
-            "The automated native-deep adapter currently uses rizin or radare2 when available.",
+            "The automated native-deep adapters support IDALib/Hex-Rays, rizin, and radare2.",
+            "IDA runs in an isolated subprocess per library; the manual IDA handoff remains available as fallback.",
         ],
     }
 
@@ -471,25 +493,34 @@ def build_decompile_plan(
     max_targets: int = 40,
     max_libraries: int = 8,
     target_capabilities: tuple[str, ...] | list[str] | set[str] = (),
+    ida_install_dir: str | Path | None = None,
 ) -> dict[str, Any]:
     """Select deterministic native targets for automated deep analysis."""
 
     max_targets = max(1, max_targets)
     max_libraries = max(1, max_libraries)
-    toolchain = detect_native_toolchain(decompiler)
+    toolchain = detect_native_toolchain(
+        decompiler,
+        ida_install_dir=ida_install_dir,
+    )
     selected_tool = toolchain.get("selected_decompiler")
     desired_capabilities = {str(item) for item in target_capabilities if item}
-    callable_targets = [target for target in targets if _target_is_callable(target)]
+    callable_targets = [
+        target
+        for target in targets
+        if _target_is_callable(target)
+        or (selected_tool == "ida" and target.get("kind") == "library")
+    ]
 
     if decompiler == "none":
         status = "disabled"
         reason = "Native decompilation was disabled by configuration."
     elif not selected_tool:
         status = "tool_missing"
-        reason = "Install rizin or radare2 to emit automated native function evidence."
+        reason = "Install or configure IDA 9.x, rizin, or radare2 to emit automated native function evidence."
     elif selected_tool not in AUTOMATED_DECOMPILER_TOOLS:
         status = "tool_present_not_automated"
-        reason = f"{selected_tool} is available, but this pipeline automates rizin/radare2 only."
+        reason = f"{selected_tool} is available, but no automated adapter is configured for it."
     else:
         status = "ready"
         reason = "Automated native decompiler adapter is available."
@@ -817,6 +848,10 @@ def run_targeted_decompile(
     max_libraries: int = 8,
     target_capabilities: tuple[str, ...] | list[str] | set[str] = (),
     feature_detail: str = "full",
+    ida_install_dir: str | Path | None = None,
+    ida_python_executable: str | Path | None = None,
+    ida_max_retries: int = 1,
+    ida_callgraph_depth: int = 2,
     progress_callback: ProgressCallback | None = None,
 ) -> dict[str, Any]:
     """Run optional native decompilation for ranked targets when a tool is installed."""
@@ -830,6 +865,7 @@ def run_targeted_decompile(
         max_targets=max_targets,
         max_libraries=max_libraries,
         target_capabilities=target_capabilities,
+        ida_install_dir=ida_install_dir,
     )
     safe_write_json(output_dir / "native_decompile_plan.json", plan)
     _emit_progress(
@@ -860,7 +896,7 @@ def run_targeted_decompile(
             "status": "tool_missing",
             "plan": plan,
             "requested_decompiler": decompiler,
-            "message": "Install rizin, radare2, RetDec, or Ghidra headless to emit native pseudocode.",
+            "message": "Install or configure IDA 9.x, rizin, radare2, RetDec, or Ghidra headless to emit native pseudocode.",
             "attempted_targets": 0,
             "results": [],
         }
@@ -875,6 +911,23 @@ def run_targeted_decompile(
             "attempted_targets": 0,
             "results": [],
         }
+
+    if tool == "ida":
+        ida_result = run_ida_decompile(
+            [target for target in plan.get("targets") or [] if isinstance(target, dict)],
+            output_dir / "ida_auto",
+            install_dir=ida_install_dir,
+            python_executable=ida_python_executable,
+            timeout_per_function=timeout_per_function,
+            timeout_per_app=timeout_per_app,
+            max_targets=max_targets,
+            max_retries=ida_max_retries,
+            callgraph_depth=ida_callgraph_depth,
+            progress_callback=progress_callback,
+        )
+        ida_result["plan"] = plan
+        ida_result["requested_decompiler"] = decompiler
+        return ida_result
 
     results: list[dict[str, Any]] = []
     executable = "rizin" if tool == "rizin" else "r2"

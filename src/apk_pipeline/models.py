@@ -47,18 +47,25 @@ class PipelineSummary:
     workspace: str
     phases: List[PhaseResult]
     input_resolution: Dict[str, Any] = field(default_factory=dict)
+    validation: Dict[str, Any] = field(default_factory=dict)
     schema_version: str = "2.0"
 
     def to_dict(self) -> Dict[str, Any]:
+        phase_success = all(
+            p.status in {"success", "skipped"} for p in self.phases
+        )
+        validation_status = str(self.validation.get("status") or "not_run")
+        validation_success = validation_status not in {"failed", "partial"}
         return {
             "schema_version": self.schema_version,
             "apk_filename": self.apk_filename,
             "workspace": self.workspace,
             "phases": [p.to_dict() for p in self.phases],
-            "all_success": all(p.status in {"success", "skipped"} for p in self.phases),
+            "all_success": phase_success and validation_success,
             "has_partial": any(p.status == "partial" for p in self.phases),
             "has_failed": any(p.status == "failed" for p in self.phases),
             "input_resolution": self.input_resolution,
+            "validation": self.validation,
         }
 
     def to_json(self) -> str:
