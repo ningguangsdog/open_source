@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 import zipfile
 from collections import Counter
@@ -62,9 +63,52 @@ MAX_INTERESTING_STRINGS = 500
 NATIVE_TOOL_TIMEOUT_SECONDS = 120
 AUTO_DEEP_MIN_SCORE = 18
 AUTO_DEEP_MIN_CAPABILITY_SCORE = 12
-PHASE_SCHEMA = "2026-07-23.phase3.v5"
+PHASE_SCHEMA = "2026-08-20.phase3.v6"
 NATIVE_DEPTHS = {"none", "basic", "targeted", "auto", "deep"}
-NATIVE_DECOMPILERS = {"auto", "none", "rizin", "radare2", "ghidra", "retdec"}
+NATIVE_DECOMPILERS = {"auto", "none", "ida", "rizin", "radare2", "ghidra", "retdec"}
+logger = logging.getLogger(__name__)
+
+
+def _log_ida_progress(payload: dict[str, Any]) -> None:
+    event = str(payload.get("event") or "")
+    if not event.startswith("ida_library_"):
+        return
+    library = Path(str(payload.get("library") or "unknown")).name
+    index = payload.get("index")
+    total = payload.get("total")
+    if event == "ida_library_start":
+        logger.warning(
+            "IDA [%s/%s] started %s: %s seeds, %s function budget, %ss timeout",
+            index,
+            total,
+            library,
+            payload.get("seed_count"),
+            payload.get("function_budget"),
+            payload.get("timeout"),
+        )
+    elif event == "ida_library_heartbeat":
+        logger.warning(
+            "IDA [%s/%s] still analyzing %s: stage=%s, %ss elapsed, %s/%s functions checkpointed, current=%s (%ss)",
+            index,
+            total,
+            library,
+            payload.get("stage"),
+            payload.get("elapsed_seconds"),
+            payload.get("processed_functions"),
+            payload.get("selected_functions"),
+            payload.get("current_function"),
+            payload.get("function_elapsed_seconds"),
+        )
+    elif event == "ida_library_finish":
+        logger.warning(
+            "IDA [%s/%s] finished %s: status=%s, results=%s, successful=%s",
+            index,
+            total,
+            library,
+            payload.get("status"),
+            payload.get("result_count"),
+            payload.get("successful_decompilations"),
+        )
 
 
 def _load_manifest_package(workspace: Path) -> str | None:
@@ -83,6 +127,22 @@ def _load_json_object(path: Path) -> dict[str, Any]:
     except Exception:
         return {}
     return payload if isinstance(payload, dict) else {}
+
+
+def _ida_artifacts_valid(decompilation_path: Path) -> bool:
+    payload = _load_json_object(decompilation_path)
+    if payload.get("tool") != "ida":
+        return True
+    for result in payload.get("results") or []:
+        if not isinstance(result, dict) or result.get("success") is not True:
+            continue
+        output_path = Path(str(result.get("output_path") or ""))
+        if not output_path.is_file() or output_path.stat().st_size <= 0:
+            return False
+        expected_hash = str(result.get("pseudocode_sha256") or "")
+        if expected_hash and sha256_file(output_path) != expected_hash:
+            return False
+    return True
 
 
 def _manual_ida_input_fingerprint(results_dir: Path) -> str:
@@ -653,6 +713,27 @@ def build_native_evidence_units(
 ) -> list[dict[str, Any]]:
     units: list[dict[str, Any]] = []
     decompiled = _decompile_result_map(decompile_result)
+    evidence_targets: list[dict[str, Any]] = []
+    seen_targets: set[tuple[str, str, str]] = set()
+    for candidate in [
+        *targets,
+        *[
+            result.get("target") or {}
+            for result in (decompile_result or {}).get("results") or []
+            if isinstance(result, dict)
+        ],
+    ]:
+        if not isinstance(candidate, dict):
+            continue
+        key = (
+            str(candidate.get("library") or ""),
+            str(candidate.get("name") or ""),
+            str(normalize_address(candidate.get("address")) or ""),
+        )
+        if not key[0] or not key[1] or key in seen_targets:
+            continue
+        seen_targets.add(key)
+        evidence_targets.append(candidate)
 
     for record in library_records:
         capabilities = capability_names((record.get("capability_counts") or {}).keys())
@@ -691,7 +772,7 @@ def build_native_evidence_units(
             }
         )
 
-    for target in targets:
+    for target in evidence_targets:
         key = (
             str(target.get("library") or ""),
             str(target.get("name") or ""),
@@ -702,6 +783,11 @@ def build_native_evidence_units(
         features = result.get("function_features") if result else None
         if not isinstance(features, dict):
             features = {}
+        semantic_role = (
+            result.get("semantic_role")
+            if result and isinstance(result.get("semantic_role"), dict)
+            else target.get("semantic_role_prior") or {}
+        )
         pseudocode_excerpt = ""
         if output_path:
             pseudocode_excerpt = safe_read_text(Path(output_path), limit=4000)
@@ -736,9 +822,25 @@ def build_native_evidence_units(
                 "decompiler_success": result.get("success") if result else None,
                 "decompiler_tool": result.get("tool") if result else None,
                 "pseudocode_path": output_path,
+                "pseudocode_sha256": (
+                    result.get("pseudocode_sha256") if result else None
+                ),
                 "pseudocode_excerpt": pseudocode_excerpt[:4000],
                 "feature_hash": features.get("feature_hash"),
                 "pseudocode_fingerprint": features.get("pseudocode_fingerprint"),
+                "semantic_role": semantic_role,
+                "evidence_source": (
+                    "automated_ida"
+                    if result and result.get("tool") == "ida"
+                    else "automated_native_decompiler"
+                    if result
+                    else "native_target_selection"
+                ),
+                "identity_verification": {
+                    "library_sha256": target.get("library_sha256"),
+                    "abi": target.get("abi"),
+                    "address": normalize_address(target.get("address")),
+                },
                 "instruction_count": features.get("instruction_count"),
                 "basic_block_count": features.get("basic_block_count"),
                 "cfg_edge_count": features.get("cfg_edge_count"),
@@ -763,21 +865,29 @@ def _auto_decompile_decision(
     targets: list[dict[str, Any]],
     *,
     native_decompiler: str,
+    ida_install_dir: str | Path | None = None,
 ) -> dict[str, Any]:
+    tool = available_decompiler(
+        native_decompiler,
+        ida_install_dir=ida_install_dir,
+    )
     callable_targets = [
         target
         for target in targets
         if target.get("kind") in {"jni_symbol", "exported_symbol"}
+        or (tool == "ida" and target.get("kind") == "library")
     ]
     if not callable_targets:
         return {
             "attempt": False,
             "reason": "no_callable_native_targets",
             "candidate_count": 0,
-            "available_decompiler": available_decompiler(native_decompiler),
+            "available_decompiler": available_decompiler(
+                native_decompiler,
+                ida_install_dir=ida_install_dir,
+            ),
         }
 
-    tool = available_decompiler(native_decompiler)
     if not tool:
         return {
             "attempt": False,
@@ -833,6 +943,10 @@ def run_phase3_multi(
     native_max_decompile_targets: int = 40,
     native_timeout_per_function: int = 90,
     native_timeout_per_app: int = 3600,
+    ida_install_dir: Path | None = None,
+    ida_python_executable: Path | None = None,
+    ida_max_retries: int = 1,
+    ida_callgraph_depth: int = 2,
     ida_review_limit: int = 120,
     ida_handoff_max_libraries: int = 12,
     native_target_capabilities: tuple[str, ...] = (),
@@ -866,6 +980,8 @@ def run_phase3_multi(
             "Native limits and timeout values must be positive: "
             + ", ".join(invalid_values)
         )
+    if ida_max_retries < 0 or ida_callgraph_depth < 0:
+        raise ValueError("IDA retry count and callgraph depth must be zero or greater.")
     native_target_capabilities = tuple(
         sorted(
             {
@@ -919,6 +1035,7 @@ def run_phase3_multi(
     analysis_path = output_dir / "native_analysis.json"
     targets_path = output_dir / "native_targets.json"
     decompile_path = output_dir / "native_decompilation.json"
+    ida_automated_summary_path = output_dir / "ida_automated_summary.json"
     decompile_plan_path = output_dir / "native_decompile_plan.json"
     toolchain_path = output_dir / "native_toolchain.json"
     function_features_path = output_dir / "native_function_features.jsonl"
@@ -940,6 +1057,7 @@ def run_phase3_multi(
         analysis_path,
         targets_path,
         decompile_path,
+        ida_automated_summary_path,
         decompile_plan_path,
         toolchain_path,
         function_features_path,
@@ -967,6 +1085,12 @@ def run_phase3_multi(
             "native_max_decompile_targets": native_max_decompile_targets,
             "native_timeout_per_function": native_timeout_per_function,
             "native_timeout_per_app": native_timeout_per_app,
+            "ida_install_dir": str(ida_install_dir) if ida_install_dir else None,
+            "ida_python_executable": (
+                str(ida_python_executable) if ida_python_executable else None
+            ),
+            "ida_max_retries": ida_max_retries,
+            "ida_callgraph_depth": ida_callgraph_depth,
             "ida_review_limit": ida_review_limit,
             "ida_handoff_max_libraries": ida_handoff_max_libraries,
             "native_target_capabilities": list(native_target_capabilities),
@@ -983,11 +1107,19 @@ def run_phase3_multi(
     )
     if not force:
         cached = load_valid_phase_cache(cache_path, cache_spec, output_paths)
-        if cached:
+        if cached and _ida_artifacts_valid(decompile_path):
             return cached_phase_result("phase3_native", output_paths, cached)
+        if cached:
+            logger.warning(
+                "Phase 3 cache references missing or modified IDA pseudocode; resuming IDA jobs."
+            )
 
     reset_dir(libs_dir)
-    reset_dir(output_dir / "decompiled_targets")
+    decompiled_targets_dir = output_dir / "decompiled_targets"
+    if force:
+        reset_dir(decompiled_targets_dir)
+    else:
+        ensure_dir(decompiled_targets_dir)
     extracted = _extract_native_libraries(apk_paths, libs_dir)
     library_records = [_analyze_library(record) for record in extracted if record.get("success")]
     for record in library_records:
@@ -1000,7 +1132,10 @@ def run_phase3_multi(
             third_party_hashes=third_party_native_hashes,
         ).to_dict()
     extraction_errors = [record for record in extracted if not record.get("success")]
-    toolchain = detect_native_toolchain(native_decompiler)
+    toolchain = detect_native_toolchain(
+        native_decompiler,
+        ida_install_dir=ida_install_dir,
+    )
     safe_write_json(toolchain_path, toolchain)
 
     capability_counts: Counter[str] = Counter()
@@ -1051,10 +1186,15 @@ def run_phase3_multi(
         max_targets=min(native_max_functions, native_max_decompile_targets),
         max_libraries=native_max_libraries,
         target_capabilities=native_target_capabilities,
+        ida_install_dir=ida_install_dir,
     )
     safe_write_json(decompile_plan_path, decompile_plan)
 
-    auto_decision = _auto_decompile_decision(targets, native_decompiler=native_decompiler)
+    auto_decision = _auto_decompile_decision(
+        targets,
+        native_decompiler=native_decompiler,
+        ida_install_dir=ida_install_dir,
+    )
     should_attempt_decompile = native_depth == "deep" or (
         native_depth == "auto" and bool(auto_decision.get("attempt"))
     )
@@ -1076,19 +1216,35 @@ def run_phase3_multi(
     if should_attempt_decompile and targets:
         decompile_result = run_targeted_decompile(
             targets,
-            output_dir / "decompiled_targets",
+            decompiled_targets_dir,
             decompiler=native_decompiler,
             timeout_per_function=native_timeout_per_function,
             timeout_per_app=native_timeout_per_app,
             max_targets=min(native_max_functions, native_max_decompile_targets),
             max_libraries=native_max_libraries,
             target_capabilities=native_target_capabilities,
+            ida_install_dir=ida_install_dir,
+            ida_python_executable=ida_python_executable,
+            ida_max_retries=ida_max_retries,
+            ida_callgraph_depth=ida_callgraph_depth,
+            progress_callback=_log_ida_progress,
         )
         decompile_result["auto_decision"] = auto_decision
         if decompile_result.get("plan"):
             decompile_plan = decompile_result["plan"]
             safe_write_json(decompile_plan_path, decompile_plan)
     safe_write_json(decompile_path, decompile_result)
+    safe_write_json(
+        ida_automated_summary_path,
+        decompile_result
+        if decompile_result.get("tool") == "ida"
+        else {
+            "schema_version": "2026-08-20.ida-automated-summary.v1",
+            "status": "not_used",
+            "selected_decompiler": (decompile_result or {}).get("tool"),
+            "message": "The automated IDA backend was not selected for this run.",
+        },
+    )
 
     function_features = _collect_function_features(decompile_result)
     write_jsonl(function_features_path, function_features)
@@ -1127,6 +1283,12 @@ def run_phase3_multi(
         "native_max_decompile_targets": native_max_decompile_targets,
         "native_timeout_per_function": native_timeout_per_function,
         "native_timeout_per_app": native_timeout_per_app,
+        "ida_install_dir": str(ida_install_dir) if ida_install_dir else None,
+        "ida_python_executable": (
+            str(ida_python_executable) if ida_python_executable else None
+        ),
+        "ida_max_retries": ida_max_retries,
+        "ida_callgraph_depth": ida_callgraph_depth,
         "ida_review_limit": ida_review_limit,
         "ida_handoff_max_libraries": ida_handoff_max_libraries,
         "native_target_capabilities": list(native_target_capabilities),
@@ -1137,6 +1299,7 @@ def run_phase3_multi(
         "decompile_plan_path": str(decompile_plan_path),
         "evidence_units_path": str(evidence_units_path),
         "decompilation_path": str(decompile_path),
+        "ida_automated_summary_path": str(ida_automated_summary_path),
         "toolchain_path": str(toolchain_path),
         "function_features_path": str(function_features_path),
         "string_xrefs_path": str(string_xrefs_path),
@@ -1200,6 +1363,7 @@ def run_phase3_multi(
         "manual_ida_evidence_path": str(manual_ida_paths["evidence_units"]),
         "deep_summary_path": str(deep_summary_path),
         "decompilation_path": str(decompile_path),
+        "ida_automated_summary_path": str(ida_automated_summary_path),
         "native_evidence_unit_count": len(native_evidence_units),
         "native_function_feature_count": len(function_features),
         "ida_candidate_count": ida_manifest.get("candidate_count"),
@@ -1214,10 +1378,7 @@ def run_phase3_multi(
     requested_decompile_incomplete = bool(
         should_attempt_decompile
         and targets
-        and (
-            decompile_result.get("status") != "completed"
-            or decompile_failures
-        )
+        and decompile_result.get("status") != "completed"
     )
     manual_ida_import_incomplete = manual_ida_import.get("status") in {
         "partial",
@@ -1247,7 +1408,11 @@ def run_phase3_multi(
     )
     if requested_decompile_incomplete:
         warnings.append(
-            "Requested native pseudocode generation did not complete for every selected target."
+            "Requested native pseudocode generation did not complete its scheduled library jobs."
+        )
+    if decompile_failures:
+        warnings.append(
+            "Some individual native functions could not be decompiled; failures are retained as auditable evidence."
         )
     if manual_ida_import_incomplete:
         warnings.append(

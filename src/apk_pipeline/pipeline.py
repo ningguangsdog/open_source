@@ -19,6 +19,7 @@ from .phase2_jadx import run_phase2_multi
 from .phase3_native import run_phase3_multi
 from .phase4_resources import run_phase4_resources
 from .phase5_evidence import run_phase5_evidence
+from .result_validation import write_pipeline_validation
 from .run_context import (
     assert_workspace_identity,
     assert_workspace_original_input,
@@ -34,7 +35,7 @@ from .utils import ensure_dir, safe_write_json
 
 logger = logging.getLogger(__name__)
 PIPELINE_VERSION_LABEL = (
-    "July 5 + Native Deep v1 + Pretest Finalization v1"
+    "July 5 + Native Deep v1 + IDA Classroom Automation v1"
 )
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -187,6 +188,10 @@ class APKPipeline:
                         native_max_decompile_targets=self.config.native_max_decompile_targets,
                         native_timeout_per_function=self.config.native_timeout_per_function,
                         native_timeout_per_app=self.config.native_timeout_per_app,
+                        ida_install_dir=self.config.ida_install_dir,
+                        ida_python_executable=self.config.ida_python_executable,
+                        ida_max_retries=self.config.ida_max_retries,
+                        ida_callgraph_depth=self.config.ida_callgraph_depth,
                         ida_review_limit=self.config.ida_review_limit,
                         ida_handoff_max_libraries=self.config.ida_handoff_max_libraries,
                         native_target_capabilities=self.config.native_target_capabilities,
@@ -259,11 +264,18 @@ class APKPipeline:
                 )
             phases.append(result)
 
+        validation = write_pipeline_validation(
+            workspace,
+            phases,
+            expect_automated_ida=self.config.native_decompiler == "ida",
+            require_evidence_packet=self.config.emit_evidence_packets,
+        )
         summary = PipelineSummary(
             apk_filename=Path(self.config.apk_path).name,
             workspace=str(workspace),
             phases=phases,
             input_resolution=_input_resolution_dict(resolved),
+            validation=validation,
         )
         summary_payload = summary.to_dict()
         safe_write_json(workspace / "pipeline_summary.json", summary_payload)
@@ -273,18 +285,23 @@ class APKPipeline:
             "has_partial": summary_payload["has_partial"],
             "has_failed": summary_payload["has_failed"],
             "phase_status": {phase.name: phase.status for phase in phases},
+            "validation_status": validation.get("status"),
+            "ready_for_similarity": validation.get("ready_for_similarity"),
         }
         write_run_context(workspace, run_context)
         config_payload = asdict(self.config)
         config_payload["apk_path"] = str(config_payload["apk_path"])
         config_payload["workspace"] = str(config_payload["workspace"])
+        for path_key in ("ida_install_dir", "ida_python_executable"):
+            if config_payload[path_key] is not None:
+                config_payload[path_key] = str(config_payload[path_key])
         config_payload["native_target_capabilities"] = list(config_payload["native_target_capabilities"])
         config_payload["first_party_prefixes"] = list(config_payload["first_party_prefixes"])
         config_payload["third_party_prefixes"] = list(config_payload["third_party_prefixes"])
         config_payload["first_party_native_hashes"] = list(config_payload["first_party_native_hashes"])
         config_payload["third_party_native_hashes"] = list(config_payload["third_party_native_hashes"])
         run_manifest = {
-            "schema_version": "2026-07-23.run-manifest.v2",
+            "schema_version": "2026-08-20.run-manifest.v3",
             "run_id": run_context["run_id"],
             "analysis_id": run_context["analysis_id"],
             "analysis_fingerprint": run_context["analysis_fingerprint"],
@@ -309,6 +326,9 @@ class APKPipeline:
             "run_context_path": str(run_context_path),
             "native_toolchain_path": str(workspace / "phase3_native" / "native_toolchain.json"),
             "pipeline_summary_path": str(workspace / "pipeline_summary.json"),
+            "pipeline_validation_path": str(
+                workspace / "pipeline_validation.json"
+            ),
         }
         safe_write_json(workspace / "run_manifest.json", run_manifest)
         return summary

@@ -26,6 +26,10 @@ class PipelineConfig:
     native_max_decompile_targets: int = 40
     native_timeout_per_function: int = 90
     native_timeout_per_app: int = 3600
+    ida_install_dir: Path | None = None
+    ida_python_executable: Path | None = None
+    ida_max_retries: int = 1
+    ida_callgraph_depth: int = 2
     ida_review_limit: int = 120
     ida_handoff_max_libraries: int = 12
     native_target_capabilities: tuple[str, ...] = ()
