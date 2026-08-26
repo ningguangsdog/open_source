@@ -9,6 +9,7 @@ from typing import Any
 
 from .capability_taxonomy import CAPABILITY_PATTERNS, capability_names
 from .evidence import unit_id, write_jsonl
+from .function_fingerprint import stable_id
 from .models import PhaseResult
 from .run_context import (
     build_phase_cache_spec,
@@ -19,8 +20,11 @@ from .run_context import (
 from .utils import ensure_dir, safe_write_json, safe_write_text
 
 
-PHASE_SCHEMA = "2026-08-20.phase5.v7"
+PHASE_SCHEMA = "2026-08-25.phase5.v15"
 SIMILARITY_UNIT_LIMIT = 250
+REUSE_EVIDENCE_UNIT_LIMIT = 5000
+REUSE_PACKET_CANDIDATE_LIMIT = 200
+DEEP_COMPARISON_EVIDENCE_UNIT_LIMIT = 5000
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -44,21 +48,35 @@ def _load_list(path: Path) -> list[dict[str, Any]]:
     return [item for item in payload if isinstance(item, dict)]
 
 
-def _load_jsonl(path: Path) -> list[dict[str, Any]]:
-    if not path.exists():
+def _load_jsonl(
+    path: Path,
+    *,
+    limit: int | None = None,
+) -> list[dict[str, Any]]:
+    if not path.exists() or (limit is not None and limit <= 0):
         return []
     rows: list[dict[str, Any]] = []
-    for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            payload = json.loads(line)
-        except Exception:
-            continue
-        if isinstance(payload, dict):
-            rows.append(payload)
+    with path.open("r", encoding="utf-8", errors="ignore") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                payload = json.loads(line)
+            except Exception:
+                continue
+            if isinstance(payload, dict):
+                rows.append(payload)
+                if limit is not None and len(rows) >= max(0, limit):
+                    break
     return rows
+
+
+def _reuse_review_source(workspace: Path) -> Path:
+    review_path = workspace / "phase3_native" / "reuse_candidates_review.jsonl"
+    if review_path.is_file():
+        return review_path
+    return workspace / "phase3_native" / "reuse_candidates.jsonl"
 
 
 def _validate_json_source(path: Path, expected_type: type) -> dict[str, Any]:
@@ -453,6 +471,194 @@ def _collect_evidence_units(workspace: Path) -> list[dict[str, Any]]:
             enriched.setdefault("source_file", str(source))
             enriched.setdefault("unit_id", unit_id(source.name, len(units), row.get("kind"), row.get("file") or row.get("path")))
             units.append(enriched)
+    authoritative_targets = _load_json(
+        workspace / "phase3_native" / "reuse_candidate_targets.json"
+    )
+    selected_candidate_pair_ids = {
+        str(
+            target.get("candidate_pair_id")
+            or (target.get("reuse_candidate") or {}).get("candidate_pair_id")
+            or ""
+        )
+        for target in authoritative_targets.get("targets") or []
+        if isinstance(target, dict)
+    }
+    selected_candidate_pair_ids.discard("")
+    reuse_source = _reuse_review_source(workspace)
+    for row in _load_jsonl(reuse_source, limit=REUSE_EVIDENCE_UNIT_LIMIT):
+        commercial = row.get("commercial") or {}
+        source = row.get("source") or {}
+        candidate_pair_id = str(
+            row.get("candidate_pair_id")
+            or stable_id(
+                "reuse_candidate_pair",
+                commercial.get("function_id"),
+                source.get("function_id"),
+                source.get("repository_full_name") or source.get("corpus_id"),
+            )
+        )
+        ownership = commercial.get("ownership") or {"category": "unknown"}
+        analysis_lane = str(row.get("analysis_lane") or "control")
+        deep_eligible = bool(row.get("candidate_deep_comparison_eligible"))
+        proprietary_comparison_eligible = bool(
+            analysis_lane == "adaptation"
+            and deep_eligible
+            and ownership.get("category") not in {"third_party", "platform"}
+        )
+        units.append(
+            {
+                "unit_id": unit_id(
+                    "reuse_candidate",
+                    commercial.get("function_id"),
+                    source.get("function_id"),
+                    source.get("repository_full_name") or source.get("corpus_id"),
+                    source.get("source_path"),
+                    source.get("start_line"),
+                    source.get("library_sha256") or source.get("binary_sha256"),
+                    source.get("address"),
+                    source.get("build_variant"),
+                ),
+                "phase": "phase3_native",
+                "kind": "open_source_retrieval_candidate",
+                "confidence": float(row.get("retrieval_score") or 0),
+                "score": float(row.get("retrieval_score") or 0),
+                "retrieval_score": row.get("retrieval_score"),
+                "selection_score": row.get("selection_score"),
+                "analysis_lane": analysis_lane,
+                "candidate_pair_id": candidate_pair_id,
+                "analysis_semantics": row.get("analysis_semantics"),
+                "selection_evidence": row.get("selection_evidence") or {},
+                "retrieval_components": row.get("components") or {},
+                "retrieval_weighted_channels": row.get("weighted_channels") or [],
+                "evidence_sufficiency": row.get("evidence_sufficiency") or {},
+                "matched_tokens": row.get("matched_tokens") or [],
+                "commercial_function": commercial,
+                "seed_commercial_function": row.get("seed_commercial") or {},
+                "canonical_implementation": row.get("canonical_implementation")
+                or {},
+                "canonical_resolution": row.get("canonical_resolution") or {},
+                "open_source_function": source,
+                "representation": commercial.get("representation"),
+                "name": commercial.get("name"),
+                "file": commercial.get("file"),
+                "line": commercial.get("start_line"),
+                "library": commercial.get("library"),
+                "library_sha256": commercial.get("library_sha256"),
+                "abi": commercial.get("abi"),
+                "address": commercial.get("address"),
+                "ownership": ownership,
+                "open_source_ownership_class": source.get("ownership_class"),
+                "capabilities": commercial.get("capabilities") or [],
+                "comparison_eligible": proprietary_comparison_eligible,
+                "claim_eligibility": {
+                    "usage_review": analysis_lane == "usage",
+                    "adaptation_review": proprietary_comparison_eligible,
+                    "copying_conclusion": False,
+                },
+                "traceability": {
+                    "retrieval_candidate_pair_id": candidate_pair_id,
+                    "selected_for_ida": candidate_pair_id
+                    in selected_candidate_pair_ids,
+                    "ida_pseudocode_available": False,
+                    "deep_comparison_available": False,
+                    "claim_review_eligible": False,
+                },
+                "evidence_scope": "candidate_retrieval",
+                "conclusion_boundary": (
+                    "Retrieval and cohort-selection evidence only. Usage candidates may "
+                    "support dependency attribution; adaptation candidates require deep "
+                    "comparison and independent corroboration. This unit alone cannot "
+                    "support a copying conclusion."
+                ),
+                "source_file": str(reuse_source),
+            }
+        )
+    deep_source = workspace / "phase3_native" / "reuse_deep_comparisons.jsonl"
+    for row in _load_jsonl(
+        deep_source,
+        limit=DEEP_COMPARISON_EVIDENCE_UNIT_LIMIT,
+    ):
+        commercial = row.get("commercial") or {}
+        source = row.get("source") or {}
+        claim = row.get("claim_eligibility") or {}
+        units.append(
+            {
+                "unit_id": unit_id(
+                    "reuse_deep_comparison",
+                    row.get("comparison_id"),
+                    row.get("commercial_function_id"),
+                    row.get("source_family"),
+                ),
+                "phase": "phase3_native",
+                "kind": "open_source_deep_comparison",
+                "confidence": float(row.get("deep_comparison_score") or 0),
+                "score": float(row.get("deep_comparison_score") or 0),
+                "deep_comparison_score": row.get("deep_comparison_score"),
+                "retrieval_score": row.get("retrieval_score"),
+                "analysis_lane": row.get("analysis_lane"),
+                "candidate_pair_id": row.get("candidate_pair_id"),
+                "candidate_origin": row.get("candidate_origin"),
+                "relationship_assessment": row.get("relationship_assessment"),
+                "independent_signal_count": row.get("independent_signal_count"),
+                "independent_signals": row.get("independent_signals") or [],
+                "review_gate": row.get("review_gate") or {},
+                "deep_components": row.get("deep_components") or {},
+                "retrieval_components": row.get("retrieval_components") or {},
+                "commercial_function": commercial,
+                "open_source_function": source,
+                "source_family": row.get("source_family"),
+                "source_family_members": row.get("source_family_members") or [],
+                "source_family_variants": row.get("source_family_variants") or [],
+                "name": commercial.get("decompiled_name") or commercial.get("name"),
+                "library": commercial.get("library"),
+                "library_sha256": commercial.get("library_sha256"),
+                "abi": commercial.get("abi"),
+                "address": commercial.get("decompiled_address") or commercial.get("address"),
+                "pseudocode_path": commercial.get("pseudocode_path"),
+                "pseudocode_sha256": commercial.get("pseudocode_sha256"),
+                "comparison_eligible": bool(
+                    claim.get("usage_review") or claim.get("adaptation_review")
+                ),
+                "claim_eligibility": {
+                    "usage_review": bool(claim.get("usage_review")),
+                    "adaptation_review": bool(claim.get("adaptation_review")),
+                    "copying_conclusion": False,
+                },
+                "traceability": {
+                    "retrieval_candidate_pair_id": row.get(
+                        "candidate_pair_id"
+                    ),
+                    "selected_for_ida": row.get("candidate_origin")
+                    == "selected_ida_seed",
+                    "ida_pseudocode_available": bool(
+                        commercial.get("pseudocode_path")
+                        and commercial.get("pseudocode_sha256")
+                    ),
+                    "canonical_implementation_available": bool(
+                        (row.get("canonical_implementation") or {}).get(
+                            "address"
+                        )
+                    ),
+                    "canonical_resolved_away_from_seed": bool(
+                        (row.get("canonical_resolution") or {}).get(
+                            "resolved_away_from_seed"
+                        )
+                    ),
+                    "canonical_resolution_reason": (
+                        row.get("canonical_resolution") or {}
+                    ).get("resolution_reason"),
+                    "deep_comparison_available": True,
+                    "deep_comparison_id": row.get("comparison_id"),
+                    "claim_review_eligible": bool(
+                        claim.get("usage_review")
+                        or claim.get("adaptation_review")
+                    ),
+                },
+                "evidence_scope": "post_decompilation_source_family_comparison",
+                "conclusion_boundary": row.get("conclusion_boundary"),
+                "source_file": str(deep_source),
+            }
+        )
     probe_root = workspace / "phase3_native" / "probes"
     if probe_root.exists():
         for source in sorted(probe_root.glob("*/native_probe_review_units.jsonl")):
@@ -785,10 +991,18 @@ def _build_similarity_packet(
         for unit in evidence_units
         if unit.get("phase") == "phase3_native" and is_dependency_unit(unit)
     ]
+    unusable_native_units = [
+        unit
+        for unit in evidence_units
+        if unit.get("phase") == "phase3_native"
+        and unit.get("kind") in {"native_target", "manual_ida_function"}
+        and unit.get("comparison_eligible") is False
+    ]
     comparison_units = [
         unit
         for unit in evidence_units
         if not is_dependency_unit(unit)
+        and unit.get("comparison_eligible") is not False
         and not (
             unit.get("phase") == "phase2_jadx"
             and not is_java_kotlin_unit(unit)
@@ -869,6 +1083,18 @@ def _build_similarity_packet(
             "evidence_source": unit.get("evidence_source"),
             "identity_verification": unit.get("identity_verification"),
             "decompiled": unit.get("decompiled"),
+            "decompiler_success": unit.get("decompiler_success"),
+            "comparison_eligible": unit.get("comparison_eligible"),
+            "comparison_exclusion_reason": unit.get(
+                "comparison_exclusion_reason"
+            ),
+            "selection_source": unit.get("selection_source"),
+            "discovered_by": unit.get("discovered_by"),
+            "graph_depth_from_seed": unit.get("graph_depth_from_seed"),
+            "seed_context": unit.get("seed_context"),
+            "origin_seed_candidate": unit.get("origin_seed_candidate"),
+            "context_capabilities": unit.get("context_capabilities"),
+            "capability_provenance": unit.get("capability_provenance"),
             "algorithm_recovered": unit.get("algorithm_recovered"),
             "algorithm_body_candidate": unit.get("algorithm_body_candidate"),
             "semantic_role": unit.get("semantic_role"),
@@ -887,6 +1113,23 @@ def _build_similarity_packet(
             "tensor_count": unit.get("tensor_count"),
             "operator_counts": unit.get("operator_counts"),
             "source_file": unit.get("source_file"),
+            "retrieval_score": unit.get("retrieval_score"),
+            "retrieval_components": unit.get("retrieval_components"),
+            "matched_tokens": unit.get("matched_tokens"),
+            "deep_comparison_score": unit.get("deep_comparison_score"),
+            "deep_components": unit.get("deep_components"),
+            "relationship_assessment": unit.get("relationship_assessment"),
+            "independent_signal_count": unit.get("independent_signal_count"),
+            "independent_signals": unit.get("independent_signals"),
+            "analysis_lane": unit.get("analysis_lane"),
+            "claim_eligibility": unit.get("claim_eligibility"),
+            "commercial_function": unit.get("commercial_function"),
+            "open_source_function": unit.get("open_source_function"),
+            "source_family": unit.get("source_family"),
+            "source_family_members": unit.get("source_family_members"),
+            "source_family_variants": unit.get("source_family_variants"),
+            "evidence_scope": unit.get("evidence_scope"),
+            "conclusion_boundary": unit.get("conclusion_boundary"),
         }
         for unit in selected_units
     ]
@@ -905,7 +1148,7 @@ def _build_similarity_packet(
         for unit in selected_units
     )
     return {
-        "schema_version": "2026-07-23.similarity-preparation.v1",
+        "schema_version": "2026-08-24.similarity-preparation.v3",
         "app": {
             "package": manifest.get("package"),
             "app_name": manifest.get("app_name"),
@@ -924,6 +1167,7 @@ def _build_similarity_packet(
         "excluded_dependency_unit_count": (
             len(dependency_java_units) + len(dependency_native_units)
         ),
+        "excluded_unusable_native_unit_count": len(unusable_native_units),
         "evidence_units_by_kind": dict(sorted(kind_counts.items())),
         "high_value_selection": {
             "limit": SIMILARITY_UNIT_LIMIT,
@@ -1080,6 +1324,36 @@ def _render_markdown(packet: dict[str, Any]) -> str:
         lines.append("- No structured evidence units were available.")
     lines.append("")
 
+    reuse_search = packet.get("reuse_search") or {}
+    retrieval = reuse_search.get("retrieval_summary") or {}
+    full_index = reuse_search.get("native_full_index_summary") or {}
+    lines.append("## Open-Source Reuse Candidate Search")
+    if reuse_search.get("enabled"):
+        lines.append(
+            f"- Native lightweight index: {full_index.get('indexed_function_count') or 0} "
+            f"functions across {full_index.get('indexed_library_hash_count') or 0} unique libraries"
+        )
+        lines.append(
+            f"- Commercial functions searched: {retrieval.get('commercial_function_count') or 0}; "
+            f"open-source functions searched: {retrieval.get('source_function_count') or 0}"
+        )
+        lines.append(
+            f"- Retrieved candidate pairs: {retrieval.get('candidate_pair_count') or 0}; "
+            f"commercial functions with candidates: "
+            f"{retrieval.get('commercial_function_with_candidate_count') or 0}"
+        )
+        lines.append(
+            f"- Candidate preview retained here: {len(reuse_search.get('candidate_preview') or [])}; "
+            f"complete candidates: {reuse_search.get('candidate_path') or 'missing'}"
+        )
+        lines.append(
+            "- Retrieval scores prioritize review. They are not copying probabilities or "
+            "final implementation-similarity findings."
+        )
+    else:
+        lines.append("- Reuse-search indexing and retrieval were not enabled for this run.")
+    lines.append("")
+
     permissions = manifest.get("permissions") or []
     dangerous_permissions = manifest.get("dangerous_permissions") or []
     lines.append("## Permissions")
@@ -1203,7 +1477,10 @@ def _render_markdown(packet: dict[str, Any]) -> str:
     lines.append("## Review Notes")
     lines.append("- Treat obfuscated names, native binaries, and dynamic downloads as uncertainty sources.")
     lines.append("- This packet is evidence for research triage; it is not a legal or security determination.")
-    lines.append("- Similarity scoring against open-source projects is intentionally out of scope for this pipeline stage.")
+    lines.append(
+        "- Candidate retrieval against open-source projects is triage only; final "
+        "implementation-similarity scoring remains a separate reviewed stage."
+    )
     lines.append("")
     return "\n".join(lines)
 
@@ -1220,7 +1497,8 @@ def _render_prompt(packet_path: Path) -> str:
             "4. Review manual IDA evidence separately from automated native evidence.",
             "5. Distinguish pseudocode produced from substantive algorithm recovered.",
             "6. State what cannot be concluded from the available decompiled evidence.",
-            "7. Do not perform open-source similarity scoring unless separate comparison material is provided.",
+            "7. Treat open-source retrieval candidates as review priorities, not copying probabilities.",
+            "8. Do not claim implementation reuse without deep comparison and third-party attribution.",
             "",
             f"Evidence packet: {packet_path}",
         ]
@@ -1272,6 +1550,10 @@ def run_phase5_evidence(
         workspace / "phase1_manifest" / "cache_manifest.json",
         workspace / "phase2_jadx" / "code_index.json",
         workspace / "phase2_jadx" / "java_evidence_units.json",
+        workspace / "phase2_jadx" / "java_method_index.jsonl",
+        workspace / "phase2_jadx" / "java_method_index_summary.json",
+        workspace / "phase2_jadx" / "dex_method_index.jsonl",
+        workspace / "phase2_jadx" / "dex_method_index_summary.json",
         workspace / "phase2_jadx" / "cache_manifest.json",
         workspace / "phase3_native" / "native_analysis.json",
         workspace / "phase3_native" / "native_evidence_units.json",
@@ -1281,6 +1563,17 @@ def run_phase5_evidence(
         workspace / "phase3_native" / "ida_target_manifest.json",
         workspace / "phase3_native" / "manual_ida" / "import_summary.json",
         workspace / "phase3_native" / "manual_ida" / "evidence_units.json",
+        workspace / "phase3_native" / "native_full_function_index.jsonl",
+        workspace / "phase3_native" / "native_full_callgraph.jsonl",
+        workspace / "phase3_native" / "native_full_index_summary.json",
+        workspace / "phase3_native" / "reuse_candidates.jsonl",
+        workspace / "phase3_native" / "reuse_candidates_review.jsonl",
+        workspace / "phase3_native" / "reuse_candidate_summary.json",
+        workspace
+        / "phase3_native"
+        / "reuse_candidate_selection_summary.json",
+        workspace / "phase3_native" / "reuse_deep_comparisons.jsonl",
+        workspace / "phase3_native" / "reuse_deep_comparison_summary.json",
         workspace / "phase3_native" / "cache_manifest.json",
     ]
     if require_resources:
@@ -1341,6 +1634,66 @@ def run_phase5_evidence(
     evidence_graph = _build_evidence_graph(evidence_units, manifest)
     native_deep_summary = _extract_native_deep_summary(workspace)
     native_probe_summaries = _collect_native_probe_summaries(workspace)
+    native_full_index_summary = _load_json(
+        workspace / "phase3_native" / "native_full_index_summary.json"
+    )
+    dex_method_index_summary = _load_json(
+        workspace / "phase2_jadx" / "dex_method_index_summary.json"
+    )
+    reuse_candidate_summary = _load_json(
+        workspace / "phase3_native" / "reuse_candidate_summary.json"
+    )
+    reuse_selection_summary = _load_json(
+        workspace
+        / "phase3_native"
+        / "reuse_candidate_selection_summary.json"
+    )
+    reuse_deep_summary = _load_json(
+        workspace / "phase3_native" / "reuse_deep_comparison_summary.json"
+    )
+    reuse_deep_preview = _load_jsonl(
+        workspace / "phase3_native" / "reuse_deep_comparisons.jsonl",
+        limit=REUSE_PACKET_CANDIDATE_LIMIT,
+    )
+    reuse_review_source = _reuse_review_source(workspace)
+    reuse_candidate_preview = _load_jsonl(
+        reuse_review_source,
+        limit=REUSE_PACKET_CANDIDATE_LIMIT,
+    )
+    reuse_search = {
+        "enabled": bool(
+            native_full_index_summary.get("status") not in {None, "not_requested"}
+            or reuse_candidate_summary.get("status") not in {None, "not_requested"}
+        ),
+        "native_full_index_summary": native_full_index_summary,
+        "dex_method_index_summary": dex_method_index_summary,
+        "retrieval_summary": reuse_candidate_summary,
+        "selection_summary": reuse_selection_summary,
+        "deep_comparison_summary": reuse_deep_summary,
+        "deep_comparison_preview": reuse_deep_preview,
+        "deep_comparison_path": str(
+            workspace / "phase3_native" / "reuse_deep_comparisons.jsonl"
+        ),
+        "candidate_preview_limit": REUSE_PACKET_CANDIDATE_LIMIT,
+        "candidate_preview": reuse_candidate_preview,
+        "candidate_path": str(
+            workspace / "phase3_native" / "reuse_candidates.jsonl"
+        ),
+        "review_candidate_path": str(reuse_review_source),
+        "native_index_path": str(
+            workspace / "phase3_native" / "native_full_function_index.jsonl"
+        ),
+        "native_callgraph_path": str(
+            workspace / "phase3_native" / "native_full_callgraph.jsonl"
+        ),
+        "dex_method_index_path": str(
+            workspace / "phase2_jadx" / "dex_method_index.jsonl"
+        ),
+        "interpretation": (
+            "Candidate retrieval is a bounded review queue, not a copying probability "
+            "or final implementation-similarity score."
+        ),
+    }
     bridge_map = _build_java_native_bridge_map(code_index, native_analysis, evidence_units)
     similarity_packet = _build_similarity_packet(
         manifest,
@@ -1400,6 +1753,7 @@ def run_phase5_evidence(
         "them as a homogeneous similarity metric"
     )
     similarity_packet["completeness"] = dependency_state
+    similarity_packet["reuse_search"] = reuse_search
 
     packet = {
         "completeness": dependency_state,
@@ -1438,6 +1792,7 @@ def run_phase5_evidence(
             "import": native_deep_summary.get("manual_ida_import") or {},
         },
         "automated_ida": native_deep_summary.get("automated_ida") or {},
+        "reuse_search": reuse_search,
         "native_probes": native_probe_summaries,
         "java_native_bridge_map": {
             "mapping_count": bridge_map.get("mapping_count"),
@@ -1468,6 +1823,18 @@ def run_phase5_evidence(
             "manifest": str(workspace / "phase1_manifest" / "manifest_summary.json"),
             "code_index": str(workspace / "phase2_jadx" / "code_index.json"),
             "java_evidence_units": str(workspace / "phase2_jadx" / "java_evidence_units.json"),
+            "java_method_index": str(
+                workspace / "phase2_jadx" / "java_method_index.jsonl"
+            ),
+            "java_method_index_summary": str(
+                workspace / "phase2_jadx" / "java_method_index_summary.json"
+            ),
+            "dex_method_index": str(
+                workspace / "phase2_jadx" / "dex_method_index.jsonl"
+            ),
+            "dex_method_index_summary": str(
+                workspace / "phase2_jadx" / "dex_method_index_summary.json"
+            ),
             "native_analysis": str(workspace / "phase3_native" / "native_analysis.json"),
             "native_targets": str(workspace / "phase3_native" / "native_targets.json"),
             "native_toolchain": str(workspace / "phase3_native" / "native_toolchain.json"),
@@ -1481,6 +1848,34 @@ def run_phase5_evidence(
             "native_callgraph": str(workspace / "phase3_native" / "native_callgraph.json"),
             "native_deep_summary": str(workspace / "phase3_native" / "native_deep_summary.json"),
             "native_evidence_units": str(workspace / "phase3_native" / "native_evidence_units.json"),
+            "native_full_function_index": str(
+                workspace / "phase3_native" / "native_full_function_index.jsonl"
+            ),
+            "native_full_callgraph": str(
+                workspace / "phase3_native" / "native_full_callgraph.jsonl"
+            ),
+            "native_full_index_summary": str(
+                workspace / "phase3_native" / "native_full_index_summary.json"
+            ),
+            "reuse_candidates": str(
+                workspace / "phase3_native" / "reuse_candidates.jsonl"
+            ),
+            "reuse_candidates_review": str(
+                workspace
+                / "phase3_native"
+                / "reuse_candidates_review.jsonl"
+            ),
+            "reuse_candidate_summary": str(
+                workspace / "phase3_native" / "reuse_candidate_summary.json"
+            ),
+            "reuse_deep_comparisons": str(
+                workspace / "phase3_native" / "reuse_deep_comparisons.jsonl"
+            ),
+            "reuse_deep_comparison_summary": str(
+                workspace
+                / "phase3_native"
+                / "reuse_deep_comparison_summary.json"
+            ),
             "ida_target_manifest": str(
                 workspace / "phase3_native" / "ida_target_manifest.json"
             ),
@@ -1549,6 +1944,28 @@ def run_phase5_evidence(
             "native_target_count": len(packet["native_targets"]),
             "native_probe_count": len(native_probe_summaries),
             "evidence_unit_count": len(evidence_units),
+            "reuse_search_enabled": reuse_search["enabled"],
+            "native_full_index_function_count": int(
+                native_full_index_summary.get("indexed_function_count") or 0
+            ),
+            "reuse_candidate_pair_count": int(
+                reuse_candidate_summary.get("candidate_pair_count") or 0
+            ),
+            "reuse_candidate_function_count": int(
+                reuse_candidate_summary.get(
+                    "commercial_function_with_candidate_count"
+                )
+                or 0
+            ),
+            "reuse_deep_source_family_count": int(
+                reuse_deep_summary.get("source_family_comparison_count") or 0
+            ),
+            "reuse_usage_review_ready_count": int(
+                reuse_deep_summary.get("usage_review_ready_count") or 0
+            ),
+            "reuse_adaptation_review_ready_count": int(
+                reuse_deep_summary.get("adaptation_review_ready_count") or 0
+            ),
             "java_native_bridge_mapping_count": bridge_map.get("mapping_count"),
             "similarity_packet": str(similarity_packet_path),
             "packet_md": str(packet_md_path),

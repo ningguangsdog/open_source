@@ -18,8 +18,8 @@ from pathlib import Path
 from typing import Any
 
 
-JOB_SCHEMA = "2026-08-20.ida-worker-job.v1"
-RESULT_SCHEMA = "2026-08-20.ida-worker-result.v1"
+JOB_SCHEMA = "2026-08-25.ida-worker-job.v5"
+RESULT_SCHEMA = "2026-08-25.ida-worker-result.v5"
 HIGH_VALUE_MARKERS = (
     "ocr",
     "recogn",
@@ -91,6 +91,15 @@ def _append_jsonl(path: Path, payload: dict[str, Any]) -> None:
         stream.write("\n")
         stream.flush()
         os.fsync(stream.fileno())
+
+
+def _atomic_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with temporary.open("w", encoding="utf-8") as stream:
+        for row in rows:
+            stream.write(json.dumps(row, ensure_ascii=False, sort_keys=True))
+            stream.write("\n")
+    temporary.replace(path)
 
 
 def _load_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -190,7 +199,140 @@ def _function_refs(start_ea: int) -> tuple[list[int], list[int], int]:
     return sorted(callers), sorted(callees), instruction_count
 
 
-def _inventory() -> tuple[list[dict[str, Any]], dict[int, dict[str, Any]]]:
+def _identifier_tokens(values: list[object]) -> list[str]:
+    tokens: list[str] = []
+    for value in values:
+        text = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", str(value or ""))
+        for token in re.findall(r"[A-Za-z][A-Za-z0-9]{2,}", text):
+            normalized = token.lower()
+            if normalized in {
+                "android",
+                "function",
+                "native",
+                "operator",
+                "result",
+                "string",
+                "this",
+                "void",
+            }:
+                continue
+            if re.fullmatch(r"(?:sub|loc|off|unk)[0-9a-f]+", normalized):
+                continue
+            tokens.append(normalized)
+    return tokens
+
+
+def _bottom_k_signature(
+    tokens: list[str],
+    *,
+    shingle_size: int = 4,
+    max_hashes: int = 64,
+) -> dict[str, Any]:
+    hashes: set[str] = set()
+    for index in range(max(0, len(tokens) - shingle_size + 1)):
+        digest = hashlib.blake2b(
+            "\x1f".join(tokens[index : index + shingle_size]).encode(
+                "utf-8", errors="ignore"
+            ),
+            digest_size=8,
+        ).hexdigest()
+        hashes.add(digest)
+        if len(hashes) > max_hashes * 8:
+            hashes = set(sorted(hashes)[:max_hashes])
+    retained = sorted(hashes)[:max_hashes]
+    return {
+        "algorithm": "bottom_k_blake2b_64",
+        "shingle_size": shingle_size,
+        "token_count": len(tokens),
+        "retained_hash_count": len(retained),
+        "hashes": retained,
+    }
+
+
+def _instruction_inventory_features(
+    start_ea: int,
+    *,
+    max_instructions: int,
+) -> dict[str, Any]:
+    """Collect bounded disassembly features without invoking Hex-Rays."""
+
+    import ida_funcs  # type: ignore
+    import idautils  # type: ignore
+    import idc  # type: ignore
+
+    function = ida_funcs.get_func(start_ea)
+    if function is None:
+        return {}
+    mnemonics: list[str] = []
+    call_targets: set[str] = set()
+    string_refs: set[str] = set()
+    branch_counts = {
+        "conditional": 0,
+        "unconditional": 0,
+        "call": 0,
+        "return": 0,
+    }
+    total_instruction_count = 0
+    for instruction_ea in idautils.FuncItems(start_ea):
+        total_instruction_count += 1
+        if len(mnemonics) >= max_instructions:
+            continue
+        mnemonic = str(idc.print_insn_mnem(instruction_ea) or "").lower()
+        if mnemonic:
+            mnemonics.append(mnemonic)
+            if mnemonic.startswith(("call", "bl", "jal")):
+                branch_counts["call"] += 1
+            elif mnemonic.startswith(("ret", "bx lr")):
+                branch_counts["return"] += 1
+            elif mnemonic in {"jmp", "b", "br"}:
+                branch_counts["unconditional"] += 1
+            elif mnemonic.startswith(("j", "b.", "cb", "tb")):
+                branch_counts["conditional"] += 1
+        if len(call_targets) < 80:
+            for ref in idautils.CodeRefsFrom(instruction_ea, False):
+                target = ida_funcs.get_func(ref)
+                if target is None or target.start_ea == start_ea:
+                    continue
+                call_targets.add(
+                    str(idc.get_func_name(target.start_ea) or _hex(int(target.start_ea)))
+                )
+        if len(string_refs) < 80:
+            for ref in idautils.DataRefsFrom(instruction_ea):
+                value = idc.get_strlit_contents(ref)
+                if not value:
+                    continue
+                if isinstance(value, bytes):
+                    text = value.decode("utf-8", errors="ignore")
+                else:
+                    text = str(value)
+                text = text.strip()
+                if 3 <= len(text) <= 300:
+                    string_refs.add(text)
+    basic_block_count, cfg_edge_count = _flow_metrics(start_ea)
+    return {
+        "instruction_count": total_instruction_count,
+        "instruction_scan_count": len(mnemonics),
+        "instruction_scan_truncated": total_instruction_count > len(mnemonics),
+        "instruction_signature": _bottom_k_signature(mnemonics),
+        "branch_counts": branch_counts,
+        "cfg_counts": {
+            "basic_blocks": basic_block_count,
+            "edges": cfg_edge_count,
+        },
+        "call_targets": sorted(call_targets),
+        "string_refs": sorted(string_refs),
+    }
+
+
+def _inventory(
+    *,
+    detail: str = "basic",
+    max_instructions_per_function: int = 512,
+    library: str | None = None,
+    library_sha256: str | None = None,
+    abi: str | None = None,
+    ownership: dict[str, Any] | None = None,
+) -> tuple[list[dict[str, Any]], dict[int, dict[str, Any]]]:
     import ida_funcs  # type: ignore
     import ida_ida  # type: ignore
     import ida_segment  # type: ignore
@@ -215,6 +357,62 @@ def _inventory() -> tuple[list[dict[str, Any]], dict[int, dict[str, Any]]]:
             "segment": ida_segment.get_segm_name(segment) if segment else None,
             "processor": ida_ida.inf_get_procname(),
         }
+        if detail == "fingerprint":
+            row.update(
+                _instruction_inventory_features(
+                    int(start_ea),
+                    max_instructions=max(16, max_instructions_per_function),
+                )
+            )
+            function_id = hashlib.sha256(
+                "\x1f".join(
+                    (
+                        "ida_lightweight_inventory",
+                        str(library_sha256 or ""),
+                        str(row["address"] or ""),
+                        str(name),
+                    )
+                ).encode("utf-8", errors="ignore")
+            ).hexdigest()[:32]
+            semantic_tokens = sorted(
+                set(
+                    _identifier_tokens(
+                        [
+                            name,
+                            row.get("demangled_name"),
+                            *(row.get("call_targets") or []),
+                        ]
+                    )
+                )
+            )
+            row.update(
+                {
+                    "schema_version": "2026-08-24.native-lightweight-index.v1",
+                    "function_id": function_id,
+                    "representation": "ida_lightweight_inventory",
+                    "library": library,
+                    "library_sha256": library_sha256,
+                    "abi": abi,
+                    "ownership": ownership or {},
+                    "semantic_tokens": semantic_tokens,
+                    "call_tokens": sorted(
+                        set(_identifier_tokens(row.get("call_targets") or []))
+                    ),
+                    "string_tokens": sorted(
+                        set(_identifier_tokens(row.get("string_refs") or []))
+                    ),
+                    "size_measure": int(row.get("instruction_count") or 0),
+                }
+            )
+            structural_payload = {
+                "branches": dict(sorted((row.get("branch_counts") or {}).items())),
+                "cfg": dict(sorted((row.get("cfg_counts") or {}).items())),
+                "instruction_signature": row.get("instruction_signature") or {},
+                "size_measure": int(row.get("instruction_count") or 0),
+            }
+            row["structural_sha256"] = hashlib.sha256(
+                repr(structural_payload).encode("utf-8", errors="ignore")
+            ).hexdigest()
         rows.append(row)
         by_address[int(start_ea)] = row
     return rows, by_address
@@ -263,6 +461,49 @@ def _resolve_seed_addresses(
     return resolved, seed_by_address
 
 
+def _library_seed_context(seeds: list[dict[str, Any]]) -> dict[str, Any]:
+    """Merge unresolved library-level seeds without claiming a function match."""
+
+    if not seeds:
+        return {}
+    ranked = sorted(
+        seeds,
+        key=lambda item: (
+            -int(item.get("score") or 0),
+            str(item.get("name") or ""),
+        ),
+    )
+    context = dict(ranked[0])
+    context["kind"] = "library_context"
+    context["source_seed_kinds"] = sorted(
+        {str(item.get("kind") or "unknown") for item in ranked}
+    )
+    context["capabilities"] = sorted(
+        {
+            str(capability)
+            for item in ranked
+            for capability in (item.get("capabilities") or [])
+            if capability
+        }
+    )
+    context["reasons"] = sorted(
+        {
+            str(reason)
+            for item in ranked
+            for reason in (item.get("reasons") or [])
+            if reason
+        }
+    )[:24]
+    context["associated_java_methods"] = [
+        method
+        for item in ranked
+        for method in (item.get("associated_java_methods") or [])
+        if isinstance(method, dict)
+    ]
+    context["context_only"] = True
+    return context
+
+
 def _selection_score(
     row: dict[str, Any],
     *,
@@ -303,6 +544,12 @@ def _selection_score(
     if name.startswith(("nullsub_", "j_")):
         score -= 240
         reasons.append("stub_or_thunk_penalty")
+    elif name.startswith(("sub_", "unknown_")):
+        score -= 35
+        reasons.append("unnamed_function_penalty")
+    if size > 50_000:
+        score -= min(80, 20 + (size - 50_000) // 2_000)
+        reasons.append("oversized_decompilation_risk")
     return score, reasons
 
 
@@ -314,6 +561,7 @@ def _select_functions(
     callgraph_depth: int,
 ) -> list[dict[str, Any]]:
     seed_addresses, seed_by_address = _resolve_seed_addresses(seeds, inventory)
+    library_context = _library_seed_context(seeds)
     context_seed_by_address = dict(seed_by_address)
     depth_by_address: dict[int, int] = {address: 0 for address in seed_addresses}
     frontier = set(seed_addresses)
@@ -350,7 +598,17 @@ def _select_functions(
         )
         if score <= 0:
             continue
-        seed = context_seed_by_address.get(function_address) or {}
+        depth = depth_by_address.get(function_address)
+        seed = context_seed_by_address.get(function_address) or library_context
+        selection_source = (
+            "pipeline_seed"
+            if function_address in seed_addresses
+            else "seed_callgraph"
+            if depth is not None
+            else "library_inventory"
+        )
+        if selection_source == "library_inventory" and library_context:
+            reasons.append("library_context_seed")
         ranked.append(
             {
                 **row,
@@ -358,17 +616,89 @@ def _select_functions(
                 "selection_reasons": reasons,
                 "seed_target": seed,
                 "is_pipeline_seed": function_address in seed_addresses,
-                "graph_depth_from_seed": depth_by_address.get(function_address),
+                "graph_depth_from_seed": depth,
+                "selection_source": selection_source,
             }
         )
-    ranked.sort(
-        key=lambda row: (
+    def rank_key(row: dict[str, Any]) -> tuple[int, int, str]:
+        return (
             -int(row.get("selection_score") or 0),
             -int(row.get("size_bytes") or 0),
             str(row.get("address") or ""),
         )
-    )
-    return ranked[: max(1, max_targets)]
+
+    # Selection is intentionally tiered.  A wrapper seed is still an explicit
+    # retrieval target and cannot be displaced by a higher-scoring neighbor.
+    # Callgraph expansion remains second so wrappers can lead us to substantive
+    # internal implementations; inventory-only context is the final filler.
+    selected: list[dict[str, Any]] = []
+    for source in ("pipeline_seed", "seed_callgraph", "library_inventory"):
+        tier = sorted(
+            (row for row in ranked if row.get("selection_source") == source),
+            key=rank_key,
+        )
+        available = max(0, max(1, max_targets) - len(selected))
+        selected.extend(tier[:available])
+        if len(selected) >= max(1, max_targets):
+            break
+    return selected
+
+
+def _selection_coverage(
+    seeds: list[dict[str, Any]],
+    inventory: list[dict[str, Any]],
+    selected: list[dict[str, Any]],
+) -> dict[str, Any]:
+    resolved_addresses, _ = _resolve_seed_addresses(seeds, inventory)
+    selected_seed_addresses = {
+        _normalize_address(row.get("address"))
+        for row in selected
+        if row.get("selection_source") == "pipeline_seed"
+    }
+    selected_seed_addresses.discard(None)
+    source_counts: dict[str, int] = {}
+    for source in ("pipeline_seed", "seed_callgraph", "library_inventory"):
+        source_counts[source] = sum(
+            row.get("selection_source") == source for row in selected
+        )
+    unresolved: list[dict[str, Any]] = []
+    for seed in seeds:
+        address = _normalize_address(seed.get("address"))
+        name = str(seed.get("name") or "")
+        matched = False
+        if address is not None:
+            matched = any(
+                _normalize_address(row.get("address")) == address
+                for row in inventory
+            )
+        if not matched and name:
+            lowered = name.lower()
+            matched = any(
+                lowered
+                in str(row.get("demangled_name") or row.get("name") or "").lower()
+                for row in inventory
+            )
+        if not matched:
+            unresolved.append(
+                {
+                    "candidate_pair_id": seed.get("candidate_pair_id"),
+                    "commercial_function_id": seed.get("commercial_function_id"),
+                    "name": name or None,
+                    "address": seed.get("address"),
+                    "reason": "address_and_name_not_resolved_in_ida_inventory",
+                }
+            )
+    return {
+        "requested_seed_count": len(seeds),
+        "resolved_seed_count": len(resolved_addresses),
+        "unresolved_seed_count": len(unresolved),
+        "selected_seed_count": len(selected_seed_addresses),
+        "unselected_resolved_seed_count": max(
+            0, len(resolved_addresses) - len(selected_seed_addresses)
+        ),
+        "selection_source_counts": source_counts,
+        "unresolved_seeds": unresolved,
+    }
 
 
 def _string_refs(start_ea: int, max_items: int = 100) -> list[str]:
@@ -435,6 +765,7 @@ def _decompile_record(
         "demangled_name": selected.get("demangled_name"),
         "selection_score": selected.get("selection_score"),
         "selection_reasons": selected.get("selection_reasons") or [],
+        "selection_source": selected.get("selection_source"),
         "graph_depth_from_seed": selected.get("graph_depth_from_seed"),
         "seed_target": selected.get("seed_target") or {},
         "is_pipeline_seed": bool(selected.get("is_pipeline_seed")),
@@ -530,6 +861,13 @@ def _run_job(job_path: Path, output_dir: Path, ida_install_dir: Path) -> int:
     progress_path = output_dir / "progress.json"
     summary_path = output_dir / "summary.json"
     inventory_path = output_dir / "inventory.json"
+    inventory_jsonl_path = output_dir / "inventory.jsonl"
+    job_mode = str(job.get("job_mode") or "decompile")
+    inventory_detail = str(job.get("inventory_detail") or "basic")
+    if job_mode not in {"decompile", "inventory_only"}:
+        raise ValueError(f"Unsupported IDA job mode: {job_mode}")
+    if inventory_detail not in {"basic", "fingerprint"}:
+        raise ValueError(f"Unsupported inventory detail: {inventory_detail}")
 
     library = Path(str(job.get("library") or ""))
     analysis_binary = Path(str(job.get("analysis_binary") or library))
@@ -549,7 +887,6 @@ def _run_job(job_path: Path, output_dir: Path, ida_install_dir: Path) -> int:
         raise RuntimeError(f"IDALib open_database failed with code {open_result}")
     try:
         import ida_auto  # type: ignore
-        import ida_hexrays  # type: ignore
         import idaapi  # type: ignore
 
         _atomic_json(
@@ -565,24 +902,85 @@ def _run_job(job_path: Path, output_dir: Path, ida_install_dir: Path) -> int:
             },
         )
         ida_auto.auto_wait()
-        inventory, _ = _inventory()
-        _atomic_json(
-            inventory_path,
-            {
+        inventory, _ = _inventory(
+            detail=inventory_detail,
+            max_instructions_per_function=int(
+                job.get("max_inventory_instructions_per_function") or 512
+            ),
+            library=str(library),
+            library_sha256=actual_hash,
+            abi=str(job.get("abi") or ""),
+            ownership=(
+                job.get("ownership")
+                if isinstance(job.get("ownership"), dict)
+                else {}
+            ),
+        )
+        inventory_payload = {
+            "schema_version": RESULT_SCHEMA,
+            "job_hash": job.get("job_hash"),
+            "job_mode": job_mode,
+            "inventory_detail": inventory_detail,
+            "library": str(library),
+            "analysis_binary": str(analysis_binary),
+            "library_sha256": actual_hash,
+            "function_count": len(inventory),
+            "inventory_jsonl": (
+                str(inventory_jsonl_path) if inventory_detail == "fingerprint" else None
+            ),
+        }
+        if inventory_detail == "fingerprint":
+            _atomic_jsonl(inventory_jsonl_path, inventory)
+            _atomic_json(inventory_path, inventory_payload)
+        else:
+            _atomic_json(inventory_path, {**inventory_payload, "functions": inventory})
+
+        if job_mode == "inventory_only":
+            summary = {
                 "schema_version": RESULT_SCHEMA,
                 "job_hash": job.get("job_hash"),
+                "status": "completed",
+                "job_mode": job_mode,
+                "inventory_detail": inventory_detail,
                 "library": str(library),
-                "analysis_binary": str(analysis_binary),
                 "library_sha256": actual_hash,
-                "function_count": len(inventory),
-                "functions": inventory,
-            },
-        )
+                "abi": job.get("abi"),
+                "ida_version": idaapi.get_kernel_version(),
+                "inventory_function_count": len(inventory),
+                "inventory_jsonl": str(inventory_jsonl_path),
+                "selected_function_count": 0,
+                "processed_function_count": 0,
+                "successful_decompilations": 0,
+                "failed_decompilations": 0,
+                "elapsed_seconds": round(time.monotonic() - started, 3),
+                "completed": True,
+            }
+            _atomic_json(
+                progress_path,
+                {
+                    "schema_version": RESULT_SCHEMA,
+                    "job_hash": job.get("job_hash"),
+                    "stage": "completed",
+                    "processed": len(inventory),
+                    "selected": len(inventory),
+                    "current_function": None,
+                    "updated_at_epoch": time.time(),
+                },
+            )
+            _atomic_json(summary_path, summary)
+            return 0
+
+        import ida_hexrays  # type: ignore
         selected = _select_functions(
             [item for item in job.get("seed_targets") or [] if isinstance(item, dict)],
             inventory,
             max_targets=int(job.get("max_targets") or 1),
             callgraph_depth=int(job.get("callgraph_depth") or 2),
+        )
+        selection_coverage = _selection_coverage(
+            [item for item in job.get("seed_targets") or [] if isinstance(item, dict)],
+            inventory,
+            selected,
         )
         current_rows = _current_job_rows(
             results_path,
@@ -664,6 +1062,7 @@ def _run_job(job_path: Path, output_dir: Path, ida_install_dir: Path) -> int:
             "hexrays_version": ida_hexrays.get_hexrays_version(),
             "inventory_function_count": len(inventory),
             "selected_function_count": len(selected),
+            **selection_coverage,
             "processed_function_count": len(rows),
             "successful_decompilations": sum(1 for row in rows if row.get("success")),
             "failed_decompilations": sum(1 for row in rows if not row.get("success")),

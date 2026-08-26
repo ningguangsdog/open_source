@@ -45,6 +45,18 @@ AUTOMATED_DECOMPILER_TOOLS = {"ida", "rizin", "radare2"}
 MAX_COMMAND_OUTPUT = 3_000_000
 ProgressCallback = Callable[[dict[str, Any]], None]
 
+_OWNERSHIP_SELECTION_PRIORITY = {
+    "first_party": 0,
+    "unknown": 1,
+    "third_party": 2,
+    "platform": 3,
+}
+_ABI_SELECTION_PRIORITY = {
+    "primary_production": 0,
+    "secondary_production": 1,
+    "legacy_fallback": 2,
+}
+
 
 def _emit_progress(callback: ProgressCallback | None, payload: dict[str, Any]) -> None:
     if callback is not None:
@@ -82,6 +94,62 @@ def score_native_text(text: str) -> tuple[int, list[str], list[str]]:
             reasons.append(f"name:{marker}")
 
     return score, capability_names(capabilities), sorted(set(reasons))[:12]
+
+
+def _prioritized_library_paths(
+    targets: list[dict[str, Any]],
+    max_libraries: int,
+) -> set[str]:
+    """Prefer proprietary, primary-ABI, logically unique libraries."""
+
+    best_by_path: dict[str, dict[str, Any]] = {}
+    for target in targets:
+        path = str(target.get("library") or "")
+        if not path:
+            continue
+        current = best_by_path.get(path)
+        if current is None or int(target.get("score") or 0) > int(
+            current.get("score") or 0
+        ):
+            best_by_path[path] = target
+
+    def priority(item: dict[str, Any]) -> tuple[int, int, int, str]:
+        ownership = str((item.get("ownership") or {}).get("category") or "unknown")
+        abi_role = str(item.get("abi_analysis_role") or "legacy_fallback")
+        return (
+            _OWNERSHIP_SELECTION_PRIORITY.get(ownership, 1),
+            _ABI_SELECTION_PRIORITY.get(abi_role, 2),
+            -int(item.get("score") or 0),
+            str(item.get("library") or ""),
+        )
+
+    ordered = sorted(best_by_path.values(), key=priority)
+    selected: list[dict[str, Any]] = []
+    duplicate_abi_variants: list[dict[str, Any]] = []
+    selected_abis_by_name: dict[str, set[str]] = {}
+    selected_hashes: set[str] = set()
+    for item in ordered:
+        logical_name = Path(str(item.get("library") or "")).name.lower()
+        abi = str(item.get("abi") or "unknown")
+        library_hash = str(item.get("library_sha256") or "")
+        prior_abis = selected_abis_by_name.get(logical_name, set())
+        is_exact_duplicate = bool(library_hash and library_hash in selected_hashes)
+        is_cross_abi_duplicate = bool(
+            logical_name and prior_abis and abi not in prior_abis
+        )
+        if is_exact_duplicate or is_cross_abi_duplicate:
+            duplicate_abi_variants.append(item)
+            continue
+        selected.append(item)
+        if logical_name:
+            selected_abis_by_name.setdefault(logical_name, set()).add(abi)
+        if library_hash:
+            selected_hashes.add(library_hash)
+    selected.extend(duplicate_abi_variants)
+    return {
+        str(item.get("library") or "")
+        for item in selected[: max(1, max_libraries)]
+    }
 
 
 def select_native_targets(
@@ -336,21 +404,12 @@ def select_native_targets(
         )
     )
     if max_libraries:
-        best_by_library: dict[str, int] = {}
-        for target in targets:
-            target_library = str(target.get("library") or "")
-            best_by_library[target_library] = max(
-                best_by_library.get(target_library, 0),
-                int(target.get("score") or 0),
-            )
-        allowed_libraries = {
-            library_name
-            for library_name, _ in sorted(
-                best_by_library.items(),
-                key=lambda item: (-item[1], item[0]),
-            )[:max_libraries]
-        }
-        targets = [target for target in targets if str(target.get("library") or "") in allowed_libraries]
+        allowed_libraries = _prioritized_library_paths(targets, max_libraries)
+        targets = [
+            target
+            for target in targets
+            if str(target.get("library") or "") in allowed_libraries
+        ]
 
     grouped: Counter[str] = Counter()
     budgeted: list[dict[str, Any]] = []
@@ -482,8 +541,73 @@ def _target_is_callable(target: dict[str, Any]) -> bool:
         "exported_symbol",
         "profile_seed",
         "internal_callee",
+        "internal_callgraph",
+        "internal_inventory",
+        "reuse_candidate",
         "address",
     }
+
+
+def _adaptive_library_target_selection(
+    targets: list[dict[str, Any]],
+    *,
+    max_targets: int,
+    max_libraries: int,
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """Preserve library diversity, then spend remaining budget by target score."""
+
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for target in targets:
+        library = str(target.get("library") or "")
+        if not library:
+            continue
+        grouped.setdefault(library, []).append(target)
+    for library_targets in grouped.values():
+        library_targets.sort(
+            key=lambda item: (
+                -int(item.get("score") or 0),
+                str(item.get("address") or ""),
+                str(item.get("name") or ""),
+            )
+        )
+    library_order = sorted(
+        grouped,
+        key=lambda library: (
+            -int(grouped[library][0].get("score") or 0),
+            library,
+        ),
+    )[: min(max_libraries, max_targets)]
+    if not library_order:
+        return [], {}
+
+    selected: list[dict[str, Any]] = []
+    positions = {library: 0 for library in library_order}
+    selection_counts: Counter[str] = Counter()
+    for library in library_order:
+        selected.append(grouped[library][0])
+        positions[library] = 1
+        selection_counts[library] += 1
+
+    while len(selected) < max_targets:
+        available = [
+            library
+            for library in library_order
+            if positions[library] < len(grouped[library])
+        ]
+        if not available:
+            break
+        library = min(
+            available,
+            key=lambda value: (
+                -int(grouped[value][positions[value]].get("score") or 0),
+                selection_counts[value],
+                value,
+            ),
+        )
+        selected.append(grouped[library][positions[library]])
+        positions[library] += 1
+        selection_counts[library] += 1
+    return selected, dict(selection_counts)
 
 
 def build_decompile_plan(
@@ -494,6 +618,7 @@ def build_decompile_plan(
     max_libraries: int = 8,
     target_capabilities: tuple[str, ...] | list[str] | set[str] = (),
     ida_install_dir: str | Path | None = None,
+    adaptive_library_budget: bool = False,
 ) -> dict[str, Any]:
     """Select deterministic native targets for automated deep analysis."""
 
@@ -533,21 +658,34 @@ def build_decompile_plan(
     if not preferred_targets and desired_capabilities:
         preferred_targets = callable_targets
 
-    budgeted: list[dict[str, Any]] = []
-    selection_counts: Counter[str] = Counter()
-    per_library_budget = max(1, (max_targets + max_libraries - 1) // max_libraries)
-    for target in preferred_targets:
-        library = str(target.get("library") or "")
-        if not library:
-            continue
-        if len(selection_counts) >= max_libraries and selection_counts[library] == 0:
-            continue
-        if selection_counts[library] >= per_library_budget:
-            continue
-        selection_counts[library] += 1
-        budgeted.append(target)
-        if len(budgeted) >= max_targets:
-            break
+    if adaptive_library_budget:
+        budgeted, selected_counts = _adaptive_library_target_selection(
+            preferred_targets,
+            max_targets=max_targets,
+            max_libraries=max_libraries,
+        )
+        selection_counts = Counter(selected_counts)
+        per_library_budget: int | None = None
+        allocation_policy = "candidate_score_with_library_coverage"
+    else:
+        budgeted = []
+        selection_counts = Counter()
+        per_library_budget = max(
+            1, (max_targets + max_libraries - 1) // max_libraries
+        )
+        for target in preferred_targets:
+            library = str(target.get("library") or "")
+            if not library:
+                continue
+            if len(selection_counts) >= max_libraries and selection_counts[library] == 0:
+                continue
+            if selection_counts[library] >= per_library_budget:
+                continue
+            selection_counts[library] += 1
+            budgeted.append(target)
+            if len(budgeted) >= max_targets:
+                break
+        allocation_policy = "frozen_equal_cap"
 
     return {
         "schema_version": "2026-07-05.native-deep-plan.v1",
@@ -561,6 +699,9 @@ def build_decompile_plan(
             "max_targets": max_targets,
             "max_libraries": max_libraries,
             "per_library_budget": per_library_budget,
+            "adaptive_library_budget": adaptive_library_budget,
+            "allocation_policy": allocation_policy,
+            "selected_targets_per_library": dict(selection_counts),
         },
         "target_capabilities": sorted(desired_capabilities),
         "targets": budgeted,
@@ -852,6 +993,7 @@ def run_targeted_decompile(
     ida_python_executable: str | Path | None = None,
     ida_max_retries: int = 1,
     ida_callgraph_depth: int = 2,
+    adaptive_library_budget: bool = False,
     progress_callback: ProgressCallback | None = None,
 ) -> dict[str, Any]:
     """Run optional native decompilation for ranked targets when a tool is installed."""
@@ -866,6 +1008,7 @@ def run_targeted_decompile(
         max_libraries=max_libraries,
         target_capabilities=target_capabilities,
         ida_install_dir=ida_install_dir,
+        adaptive_library_budget=adaptive_library_budget,
     )
     safe_write_json(output_dir / "native_decompile_plan.json", plan)
     _emit_progress(

@@ -339,6 +339,10 @@ class Phase012QualityTests(unittest.TestCase):
             "libtensorflowlite_jni.so",
             "2" * 64,
         )
+        crash_reporting_dependency = classify_native_ownership(
+            "libcrashlytics-common.so",
+            "6" * 64,
+        )
         hash_dependency = classify_native_ownership(
             "libcustom.so",
             "3" * 64,
@@ -354,6 +358,7 @@ class Phase012QualityTests(unittest.TestCase):
         )
         self.assertEqual(first.category, "first_party")
         self.assertEqual(known_dependency.category, "third_party")
+        self.assertEqual(crash_reporting_dependency.category, "third_party")
         self.assertEqual(hash_dependency.category, "third_party")
         self.assertEqual(unknown.category, "unknown")
         self.assertEqual(product_wrapper.category, "unknown")
@@ -555,6 +560,54 @@ class Phase012QualityTests(unittest.TestCase):
             self.assertEqual(
                 summary["code_index_summary"]["files_scanned"],
                 2,
+            )
+
+    def test_phase2_propagates_partial_method_index_status(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            apk = root / "sample.apk"
+            _write_apk(apk, {"classes.dex": b"dex\n035\x00sample"})
+
+            def fake_jadx_run(
+                cmd: list[str],
+                **kwargs: object,
+            ) -> subprocess.CompletedProcess[str]:
+                output_dir = Path(cmd[cmd.index("-d") + 1])
+                source = output_dir / "sources" / "Recovered.java"
+                source.parent.mkdir(parents=True, exist_ok=True)
+                source.write_text("class Recovered {}", encoding="utf-8")
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+
+            with (
+                patch(
+                    "apk_pipeline.phase2_jadx._ensure_jadx",
+                    return_value=["jadx"],
+                ),
+                patch(
+                    "apk_pipeline.phase2_jadx.run_cmd",
+                    side_effect=fake_jadx_run,
+                ),
+                patch(
+                    "apk_pipeline.phase2_jadx.build_jadx_method_index",
+                    return_value=(
+                        {
+                            "status": "partial",
+                            "indexed_method_count": 0,
+                            "read_error_count": 1,
+                        },
+                        [],
+                    ),
+                ),
+            ):
+                result = run_phase2_multi(
+                    apk,
+                    [apk],
+                    root / "workspace",
+                )
+
+            self.assertEqual(result.status, "partial")
+            self.assertTrue(
+                any("method index status=partial" in warning for warning in result.warnings)
             )
 
     def test_code_index_is_complete_and_similarity_excludes_dependencies(self) -> None:
@@ -822,12 +875,21 @@ class Phase012QualityTests(unittest.TestCase):
             "capabilities": ["local_ml"],
             "confidence": 0.9,
         }
+        failed_native_unit = {
+            "unit_id": "native-failed",
+            "phase": "phase3_native",
+            "kind": "native_target",
+            "ownership": {"category": "unknown"},
+            "capabilities": ["local_ml"],
+            "confidence": 0.95,
+            "comparison_eligible": False,
+        }
         with tempfile.TemporaryDirectory() as temp_dir:
             packet = _build_similarity_packet(
                 {},
                 {},
                 {},
-                [*java_units, native_unit],
+                [*java_units, native_unit, failed_native_unit],
                 Path(temp_dir) / "evidence_graph.json",
             )
 
@@ -835,6 +897,8 @@ class Phase012QualityTests(unittest.TestCase):
             unit["unit_id"] for unit in packet["high_value_units"]
         }
         self.assertIn("native-core", selected_ids)
+        self.assertNotIn("native-failed", selected_ids)
+        self.assertEqual(packet["excluded_unusable_native_unit_count"], 1)
         self.assertEqual(
             packet["high_value_selection"]["selected_count"],
             250,

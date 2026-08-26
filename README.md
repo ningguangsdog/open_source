@@ -25,6 +25,7 @@ The pipeline is designed for app-level capability review across many Android app
    - Classifies Java/Kotlin code as first-party, third-party, platform, or unknown. Decompiled XML remains in the complete discovery index but is excluded from Java/Kotlin implementation counts.
    - Complete source metadata remains in the index; snippet limits apply only to the compact review layer.
    - Emits Java evidence units, a package-level index, exact normalized fingerprints, and compact token-shingle signatures for later comparison work.
+   - Writes `java_method_index.jsonl`, a method-level index over every Java/Kotlin body recovered by JADX. Read errors and JADX coverage limits remain explicit.
 
 4. `phase3_native`
    - Extracts native `.so` libraries from all native-bearing APK splits.
@@ -124,6 +125,223 @@ Do not add `--force` when resuming an interrupted IDA run with the same APK and 
 
 Google Colab cannot invoke an IDA installation running on a Mac. Use `--profile ida-handoff` in Colab, or run the complete `ida-classroom` profile locally. Depending on the license, Classroom decompilers may be cloud based; review the Hex-Rays license and data-handling terms before analyzing binaries that cannot be sent to that service.
 
+## Open-Source Reuse Search
+
+`reuse-search` is an opt-in research profile. It leaves the existing
+`standard`, `ida-handoff`, and `ida-classroom` presets unchanged. The profile
+builds a lightweight index over all JADX-recovered methods, all methods parsed
+directly from the selected DEX files, and every function discovered in each
+content-unique native library. Native indexing uses IDA disassembly metadata
+and bounded instruction features without calling Hex-Rays for every function.
+
+The complete lightweight index is retained, while known third-party and
+platform functions are excluded from proprietary reuse retrieval. First-party
+and unattributed functions are searched against a frozen open-source function
+corpus. Hex-Rays is then reserved for retrieved native candidates and their
+configured caller/callee neighborhood. A run with zero retrieved candidates
+is a valid negative retrieval result. Retrieval scores only prioritize review;
+they are not copying probabilities or final implementation-similarity scores.
+Trivial exact matches in very small functions remain visible in the candidate
+file, but are marked as low-information and cannot consume Hex-Rays or OSS
+build-queue budget by themselves.
+
+Candidate retention separates three research claims. The `usage` lane records
+possible bundled or externally maintained open-source code, the `adaptation`
+lane retains project-owned upstream implementations for deeper comparison, and
+the `control` lane calibrates common methods, dependencies, siblings, tests,
+and demos. Each lane is split again into managed and native representations so
+a large Java candidate population cannot displace all native candidates from
+the bounded review set. Native Hex-Rays targets are selected from the complete
+candidate stream with per-project, per-library, and per-function diversity
+constraints; they do not compete with Java methods for one global Top-K.
+
+Inventory jobs are checkpointed per content-unique library and reused only
+when the job configuration and library SHA-256 still match. Retrieval is also
+checkpointed, writes its complete audit trail incrementally, and can resume
+after interruption. Source projects are shortlisted before function scoring;
+duplicate ABI layers and redundant DEX/JADX representations are excluded from
+the retrieval projection without deleting their full indexes.
+
+Run locally on the machine with activated IDA Classroom:
+
+```bash
+python scripts/run_pipeline.py \
+  --profile reuse-search \
+  --apk path/to/app.apkm \
+  --workspace ./runs \
+  --isolated-workspace \
+  --oss-function-index ../research/oss_provenance/source_index/output/function_index.jsonl \
+  --log-level WARNING
+```
+
+The default corpus path is the same `research/oss_provenance` location next
+to this repository. Use `--oss-function-index` when the frozen corpus is
+stored elsewhere. Primary outputs are:
+
+- `phase2_jadx/java_method_index.jsonl`
+- `phase2_jadx/java_method_index_summary.json`
+- `phase2_jadx/dex_method_index.jsonl`
+- `phase2_jadx/dex_method_index_summary.json`
+- `phase3_native/native_full_function_index.jsonl`
+- `phase3_native/native_full_callgraph.jsonl`
+- `phase3_native/native_full_index_summary.json`
+- `phase3_native/reuse_candidates.jsonl`
+- `phase3_native/reuse_candidates_review.jsonl`
+- `phase3_native/reuse_candidate_selection_summary.json`
+- `phase3_native/reuse_candidate_targets.json`
+- `phase3_native/reuse_candidate_summary.json`
+- `phase3_native/reuse_canonical_implementations.jsonl`
+- `phase3_native/reuse_deep_comparisons.jsonl`
+- `phase3_native/reuse_deep_comparison_summary.json`
+
+`reuse_candidates.jsonl` is the complete streamed audit trail.
+`reuse_candidates_review.jsonl` contains the bounded, representation-aware
+usage, adaptation, and control cohorts used by Phase 5.
+`reuse_candidate_selection_summary.json` reports available and retained counts
+for every cohort and records whether eligible native candidates were starved.
+`reuse_candidate_targets.json` is the authoritative downstream identity ledger
+for the bounded IDA queue. It preserves each selected candidate pair, analysis
+lane, commercial function, source function, and source project through Phase 5.
+Eligible native targets are drawn independently from the complete retrieval
+stream for targeted Hex-Rays follow-up.
+Every resolved retrieval seed is reserved before call-graph or inventory
+context is added. The configured target limit may expand to preserve those
+seeds; the IDA summary records requested, resolved, selected, unresolved, and
+unselected seed counts. Call-graph neighbors retain a link to the seed that
+discovered them, but they are compared under their own function identity.
+
+`reuse_canonical_implementations.jsonl` keeps the original retrieval seed as
+the audit entry while recording the substantive comparison body reached through
+the saved call graph. Short wrappers and JNI entry points therefore remain
+traceable without being mistaken for the algorithm implementation. Unresolved
+wrappers remain explicit coverage boundaries. They stay in the audit trail but
+cannot expand source families or support usage/adaptation implementation claims.
+
+`reuse_deep_comparisons.jsonl` reranks the bounded candidates after actual
+Hex-Rays decompilation. It may expand a seed to project-owned source
+implementations using distinctive names or strings, then collapses repeated
+seed entries and build/ABI variants into one canonical implementation/source
+family row. Generic names, dependency wrappers, tests, and vendored source do
+not qualify for that expansion by themselves. Exact compiled identity may
+qualify a candidate for usage review.
+Corroborated usage review may also pass with one independent binary signal plus
+one supporting semantic signal when comparable evidence is sufficient.
+Adaptation review requires at least two independent implementation signals and
+excludes platform or attributed third-party code. Neither result is a copying
+conclusion.
+
+Existing runs can replay only the bounded cohort and native-target selection,
+without repeating extraction, JADX, native inventory, or candidate retrieval:
+
+```bash
+python scripts/reselect_reuse_candidates.py \
+  --workspace path/to/existing/run \
+  --review-limit 5000 \
+  --native-target-limit 140
+```
+
+By default, replay artifacts are written under
+`phase3_native/reselection/`; canonical pipeline outputs are not overwritten.
+
+After changing only post-IDA comparison or claim-review rules, reuse the saved
+Hex-Rays results instead of rerunning extraction, JADX, retrieval, or IDA:
+
+```bash
+python scripts/replay_post_ida_comparison.py \
+  --workspace path/to/existing/run
+```
+
+The command is non-destructive by default and writes an independent review
+under `reanalysis/post_ida/`. After checking that report, promote the result and
+rebuild only Phase 5 plus final validation with:
+
+```bash
+python scripts/replay_post_ida_comparison.py \
+  --workspace path/to/existing/run \
+  --apply
+```
+
+This replay command is a supported recovery and research-audit path. It is not
+part of a normal fresh pipeline run, which already performs the same post-IDA
+comparison before Phase 5.
+
+Evaluate retrieval against project-specific labels without changing pipeline
+code:
+
+```bash
+python scripts/evaluate_reuse_retrieval.py \
+  --candidates ./runs/app/hash/phase3_native/reuse_candidates.jsonl \
+  --labels ./known_reuse_labels.json \
+  --output ./retrieval_evaluation.json \
+  --strict
+```
+
+The label file contains `known_positives` and optional `negative_controls`.
+Each row supplies `id`, `commercial_pattern`, and `source_pattern` regular
+expressions. This measures candidate recall and control hits, not copying.
+
+Temporary compiled-corpus experiments should use a dedicated cache directory.
+Cache cleanup is dry-run by default and refuses deletion outside a marked
+cache root:
+
+```bash
+python scripts/manage_reuse_cache.py \
+  --cache-dir ./reuse_cache \
+  --max-gb 20 \
+  --initialize
+
+python scripts/manage_reuse_cache.py \
+  --cache-dir ./reuse_cache \
+  --max-gb 20 \
+  --apply
+```
+
+Stage an initial 10--15 project build queue from one APK run. This command
+detects native build surfaces in frozen snapshots but does not execute
+untrusted or heterogeneous repository build scripts. Upstream candidates and
+method-specific candidates such as ED_Lib/LSD are eligible; dependency and
+sibling controls remain retrieval evidence but do not consume this build queue:
+
+```bash
+python scripts/prepare_oss_build_queue.py \
+  --candidates ./runs/app/hash/phase3_native/reuse_candidates.jsonl \
+  --snapshot-manifest ../research/oss_provenance/source_snapshots/snapshot_manifest.jsonl \
+  --snapshot-root ../research/oss_provenance/source_snapshots \
+  --output ./reuse_cache/oss_build_queue.jsonl \
+  --limit 15
+```
+
+After reviewed recipes have produced fixed `.so` and/or `.apk` artifacts,
+record one JSON object per artifact. Required fields are `binary_path`,
+`repository_full_name`, and `commit_sha`. Research runs should also record
+`corpus_id`, `candidate_role`, `build_variant`, `compiler`,
+`compiler_version`, `build_recipe_id`, ABI, and first-party package prefixes
+where applicable. Index the artifacts with:
+
+```bash
+python scripts/index_oss_binaries.py \
+  --manifest ./reuse_cache/oss_build_manifest.jsonl \
+  --output-dir ./reuse_cache/compiled_index \
+  --ida-install-dir "/Applications/IDA Classroom 9.4.app/Contents/MacOS"
+```
+
+The combined output is
+`compiled_index/oss_compiled_function_index.jsonl`. Native functions are
+indexed from standalone binaries and every `lib/<abi>/*.so` packaged in a
+compiled APK. DEX methods and packaged native functions from the same APK are
+both retained. If an identical binary hash occurs in more than one project or
+build record, each provenance record remains represented instead of being
+collapsed to one source. Native functions are represented as
+`oss_compiled_binary_function`; methods from built APKs are
+represented as `oss_compiled_dex_method`. Opcode, CFG, size, and exact
+structural channels are scored only when both sides use compatible
+representations. Source-to-source channels are also kept separate. This
+prevents cross-language or source-to-binary evidence from receiving an
+unsupported structural score.
+
+Add this compiled index to later APK runs with
+`--oss-compiled-function-index ./reuse_cache/compiled_index/oss_compiled_function_index.jsonl`.
+
 ## Useful Options
 
 - `--no-decompile-all-splits`: only run JADX on the primary APK.
@@ -131,6 +349,7 @@ Google Colab cannot invoke an IDA installation running on a Mac. Use `--profile 
 - `--isolated-workspace`: create a content-addressed workspace for each APK or bundle.
 - `--profile ida-handoff`: run the formal extraction and manual IDA handoff workflow without automated native decompilation.
 - `--profile ida-classroom`: run the complete pipeline with the isolated IDALib/Hex-Rays adapter.
+- `--profile reuse-search`: index all recoverable commercial functions, retrieve open-source candidates, and deep-decompile only selected native candidates and call-graph neighbors.
 - `--native-depth none`: skip native target ranking and optional native decompiler calls.
 - `--native-depth basic`: extract native metadata and ranked targets without decompiler attempts.
 - `--native-depth targeted`: extract native metadata, rank targets, and emit native evidence units.
@@ -146,6 +365,14 @@ Google Colab cannot invoke an IDA installation running on a Mac. Use `--profile 
 - `--ida-python-executable`: select the Python executable used by isolated IDALib workers.
 - `--ida-max-retries`: retry a failed or timed-out library worker while retaining completed function checkpoints.
 - `--ida-callgraph-depth`: set caller/callee expansion depth around Phase 3 seed targets.
+- `--full-native-index-timeout-per-library`: cap one all-function lightweight native indexing job.
+- `--full-native-index-timeout-per-app`: cap full native indexing across one app.
+- `--full-native-index-max-instructions`: bound instruction features sampled per native function.
+- `--oss-function-index`: select the frozen open-source source-function corpus.
+- `--oss-compiled-function-index`: add reproducibly built OSS native and/or DEX functions. `--oss-binary-function-index` remains an alias.
+- `--reuse-candidate-top-k`: retain at most this many source candidates per commercial function.
+- `--reuse-candidate-min-score`: set the candidate-retrieval threshold; this is not a copying probability.
+- `--reuse-candidate-decompile-limit`: cap native retrieval candidates allowed to consume Hex-Rays budget.
 - `--native-target-capabilities`: prioritize one or more capability names during native target selection.
 - `--no-resource-scan`: skip raw model/resource inventory.
 - `--no-evidence-packets`: skip the final review packet.
@@ -174,6 +401,10 @@ apk_workspace/
   phase2_jadx/cache_manifest.json
   phase2_jadx/jadx_summary.json
   phase2_jadx/code_index.json
+  phase2_jadx/java_method_index.jsonl
+  phase2_jadx/java_method_index_summary.json
+  phase2_jadx/dex_method_index.jsonl
+  phase2_jadx/dex_method_index_summary.json
   phase2_jadx/java_evidence_units.json
   phase2_jadx/java_package_index.json
   phase3_native/native_analysis.json
@@ -186,6 +417,16 @@ apk_workspace/
   phase3_native/decompiled_targets/ida_auto/libraries/<library>/functions.jsonl
   phase3_native/decompiled_targets/ida_auto/libraries/<library>/pseudocode/*.c
   phase3_native/native_function_index.json
+  phase3_native/native_full_function_index.jsonl
+  phase3_native/native_full_callgraph.jsonl
+  phase3_native/native_full_index_summary.json
+  phase3_native/reuse_candidates.jsonl
+  phase3_native/reuse_candidates_review.jsonl
+  phase3_native/reuse_candidate_selection_summary.json
+  phase3_native/reuse_candidate_summary.json
+  phase3_native/reuse_canonical_implementations.jsonl
+  phase3_native/reuse_deep_comparisons.jsonl
+  phase3_native/reuse_deep_comparison_summary.json
   phase3_native/native_function_features.jsonl
   phase3_native/native_string_xrefs.json
   phase3_native/native_callgraph.json
@@ -236,7 +477,16 @@ Phase 5 includes an evidence-completeness section. Missing, invalid, or
 non-success upstream evidence prevents the final packet from being marked
 successful.
 
-`pipeline_validation.json` is the final automation gate. Its `status` is `passed`, `partial`, or `failed`, and `ready_for_similarity` is true only after every required check passes. `pipeline_summary.json` includes the same validation result, so a process exit code of zero means both the phase contract and the required validation checks passed.
+`pipeline_validation.json` is the final automation gate. Its `status` is
+`passed`, `partial`, or `failed`, and `ready_for_similarity` is true only after
+every required check passes. Reuse-search runs additionally expose
+`ready_for_usage_analysis`, `ready_for_adaptation_analysis`, and
+`ready_for_copying_review`. These fields mean the evidence is complete enough
+for the named review; they do not assert that reuse or copying occurred.
+`copying_conclusion_supported` remains false because attribution and independent
+corroboration are outside the automated gate. `pipeline_summary.json` includes
+the same validation result, so a process exit code of zero means both the phase
+contract and the required validation checks passed.
 
 `phase2_jadx/code_index.json` is the complete source metadata index. It records
 all discovered Java, Kotlin, and decompiled XML files, including read failures
@@ -246,6 +496,10 @@ code are included by default; third-party and platform signals are retained in
 separate attribution and dependency sections. The compact similarity-preparation
 packet uses stratified sampling across phases, evidence kinds, and capabilities;
 its selection telemetry points back to the complete JSONL evidence stream.
+Automated IDA selection prefers unique primary-ABI first-party or unattributed
+libraries before duplicate ABI variants and known dependencies. Successful
+pseudocode is comparison-eligible; failed attempts remain in the audit stream
+without entering the similarity candidate set.
 `similarity_ready_packet.json` remains as a compatibility alias for existing
 notebooks.
 
@@ -261,6 +515,8 @@ The most useful files for review are usually:
 - `phase3_native/native_toolchain.json`
 - `phase3_native/native_decompile_plan.json`
 - `phase3_native/ida_automated_summary.json`
+- `phase3_native/reuse_deep_comparison_summary.json`
+- `phase3_native/reuse_deep_comparisons.jsonl`
 - `phase3_native/native_function_features.jsonl`
 - `phase3_native/native_string_xrefs.json`
 - `phase3_native/native_callgraph.json`

@@ -21,6 +21,7 @@ from .capability_taxonomy import (
     keyword_matches_text,
 )
 from .code_ownership import classify_code_ownership, normalize_prefixes
+from .dex_method_index import build_dex_method_index
 from .evidence import (
     capability_confidence,
     compact_list,
@@ -35,6 +36,7 @@ from .run_context import (
     load_valid_phase_cache,
     write_phase_cache,
 )
+from .source_method_index import build_jadx_method_index
 from .utils import (
     ensure_dir,
     reset_dir,
@@ -47,9 +49,10 @@ from .utils import (
     validate_zip,
     zip_contains,
 )
+from .evidence import write_jsonl
 
 
-PHASE_SCHEMA = "2026-07-23.phase2.v3"
+PHASE_SCHEMA = "2026-08-24.phase2.v5"
 JADX_RELEASE_URL = (
     "https://github.com/skylot/jadx/releases/download/v{version}/jadx-{version}.zip"
 )
@@ -1092,6 +1095,7 @@ def run_phase2_multi(
     jadx_timeout_per_apk: int = 1800,
     no_jadx_download: bool = False,
     decompile_all_splits: bool = True,
+    build_direct_dex_index: bool = False,
     max_snippets_per_capability: int = 40,
     first_party_prefixes: Iterable[str] = (),
     third_party_prefixes: Iterable[str] = (),
@@ -1119,11 +1123,24 @@ def run_phase2_multi(
     index_path = output_dir / "code_index.json"
     evidence_path = output_dir / "java_evidence_units.json"
     package_index_path = output_dir / "java_package_index.json"
+    method_index_path = output_dir / "java_method_index.jsonl"
+    method_index_summary_path = output_dir / "java_method_index_summary.json"
+    dex_method_index_path = output_dir / "dex_method_index.jsonl"
+    dex_method_index_summary_path = output_dir / "dex_method_index_summary.json"
     cache_path = output_dir / "cache_manifest.json"
     manifest_path = workspace / "phase1_manifest" / "manifest_summary.json"
     app_package = _load_manifest_package(workspace)
 
-    output_paths = [summary_path, index_path, evidence_path, package_index_path]
+    output_paths = [
+        summary_path,
+        index_path,
+        evidence_path,
+        package_index_path,
+        method_index_path,
+        method_index_summary_path,
+    ]
+    if build_direct_dex_index:
+        output_paths.extend([dex_method_index_path, dex_method_index_summary_path])
     cache_spec = build_phase_cache_spec(
         phase="phase2_jadx",
         phase_schema=PHASE_SCHEMA,
@@ -1133,6 +1150,7 @@ def run_phase2_multi(
             "jadx_timeout_per_apk": jadx_timeout_per_apk,
             "jadx_download": not no_jadx_download,
             "decompile_all_splits": decompile_all_splits,
+            "build_direct_dex_index": build_direct_dex_index,
             "max_snippets_per_capability": max_snippets_per_capability,
             "app_package": app_package,
             "first_party_prefixes": sorted(first_party_prefixes),
@@ -1151,6 +1169,27 @@ def run_phase2_multi(
     targets = [apk for apk in all_apks if _apk_has_dex(apk)]
     if not decompile_all_splits:
         targets = [primary_apk] if _apk_has_dex(primary_apk) else []
+    dex_method_index_summary: dict[str, Any] | None = None
+    dex_method_rows: list[dict[str, Any]] = []
+    dex_payload_fields: dict[str, Any] = {}
+    if build_direct_dex_index:
+        dex_method_index_summary, dex_method_rows = build_dex_method_index(
+            targets,
+            app_package=app_package,
+            first_party_prefixes=first_party_prefixes,
+            third_party_prefixes=third_party_prefixes,
+            output_path=dex_method_index_path,
+            retain_rows=False,
+        )
+        safe_write_json(dex_method_index_summary_path, dex_method_index_summary)
+        dex_payload_fields = {
+            "dex_method_index_path": str(dex_method_index_path),
+            "dex_method_index_summary_path": str(dex_method_index_summary_path),
+            "dex_method_index_status": dex_method_index_summary.get("status"),
+            "dex_method_index_count": dex_method_index_summary.get(
+                "indexed_method_count", 0
+            ),
+        }
 
     if not targets:
         code_index = build_code_index(
@@ -1162,6 +1201,10 @@ def run_phase2_multi(
         )
         java_evidence_units = build_java_evidence_units(code_index)
         package_index = build_java_package_index(code_index)
+        method_index_summary, method_rows = build_jadx_method_index(
+            decompile_root,
+            code_index,
+        )
         payload = {
             "primary_apk": str(primary_apk),
             "targets": [],
@@ -1170,11 +1213,14 @@ def run_phase2_multi(
             "status": "success",
             "message": "No dex-bearing APKs found.",
             "app_package": app_package,
+            **dex_payload_fields,
         }
         safe_write_json(summary_path, payload)
         safe_write_json(index_path, code_index)
         safe_write_json(evidence_path, java_evidence_units)
         safe_write_json(package_index_path, package_index)
+        write_jsonl(method_index_path, method_rows)
+        safe_write_json(method_index_summary_path, method_index_summary)
         result = PhaseResult(
             name="phase2_jadx",
             success=True,
@@ -1206,11 +1252,20 @@ def run_phase2_multi(
             "code_index_path": str(index_path),
             "java_evidence_units_path": str(evidence_path),
             "java_package_index_path": str(package_index_path),
+            "java_method_index_path": str(method_index_path),
+            "java_method_index_summary_path": str(method_index_summary_path),
+            **dex_payload_fields,
         }
         safe_write_json(summary_path, payload)
         safe_write_json(index_path, code_index)
         safe_write_json(evidence_path, [])
         safe_write_json(package_index_path, build_java_package_index(code_index))
+        method_index_summary, method_rows = build_jadx_method_index(
+            decompile_root,
+            code_index,
+        )
+        write_jsonl(method_index_path, method_rows)
+        safe_write_json(method_index_summary_path, method_index_summary)
         result = PhaseResult(
             name="phase2_jadx",
             success=False,
@@ -1242,9 +1297,15 @@ def run_phase2_multi(
     )
     java_evidence_units = build_java_evidence_units(code_index)
     package_index = build_java_package_index(code_index)
+    method_index_summary, method_rows = build_jadx_method_index(
+        decompile_root,
+        code_index,
+    )
     safe_write_json(index_path, code_index)
     safe_write_json(evidence_path, java_evidence_units)
     safe_write_json(package_index_path, package_index)
+    write_jsonl(method_index_path, method_rows)
+    safe_write_json(method_index_summary_path, method_index_summary)
 
     successful_runs = sum(1 for run in runs if run.get("status") == "success")
     partial_runs = sum(1 for run in runs if run.get("status") == "partial")
@@ -1256,6 +1317,15 @@ def run_phase2_multi(
         status = "partial"
     else:
         status = "failed"
+    if method_index_summary.get("status") != "completed" and status == "success":
+        status = "partial"
+    if (
+        build_direct_dex_index
+        and dex_method_index_summary is not None
+        and dex_method_index_summary.get("status") != "completed"
+        and status == "success"
+    ):
+        status = "partial"
     warnings = [
         (
             f"{run['apk']}: JADX status={run['status']}, "
@@ -1265,6 +1335,22 @@ def run_phase2_multi(
         for run in runs
         if run.get("status") != "success"
     ]
+    if method_index_summary.get("status") != "completed":
+        warnings.append(
+            "JADX method index status="
+            f"{method_index_summary.get('status')}; "
+            "method-level source coverage is incomplete."
+        )
+    if (
+        build_direct_dex_index
+        and dex_method_index_summary is not None
+        and dex_method_index_summary.get("status") != "completed"
+    ):
+        warnings.append(
+            "Direct DEX method index status="
+            f"{dex_method_index_summary.get('status')}; "
+            "reuse-search bytecode coverage is incomplete."
+        )
     aggregate_coverage = _aggregate_run_coverage(runs)
     code_index_summary = {
         "files_scanned": code_index["files_scanned"],
@@ -1272,6 +1358,17 @@ def run_phase2_multi(
         "failed_file_count": code_index["failed_file_count"],
         "index_coverage": code_index["index_coverage"],
         "java_evidence_unit_count": len(java_evidence_units),
+        "java_method_index_count": len(method_rows),
+        "dex_method_index_count": (
+            dex_method_index_summary.get("indexed_method_count", 0)
+            if dex_method_index_summary is not None
+            else 0
+        ),
+        "dex_method_index_status": (
+            dex_method_index_summary.get("status")
+            if dex_method_index_summary is not None
+            else "not_requested"
+        ),
         "package_count": package_index["package_count"],
         "ownership_file_counts": code_index["ownership_file_counts"],
         "ownership_code_file_counts": code_index["ownership_code_file_counts"],
@@ -1313,6 +1410,9 @@ def run_phase2_multi(
         "code_index_path": str(index_path),
         "java_evidence_units_path": str(evidence_path),
         "java_package_index_path": str(package_index_path),
+        "java_method_index_path": str(method_index_path),
+        "java_method_index_summary_path": str(method_index_summary_path),
+        **dex_payload_fields,
         "code_index_summary": code_index_summary,
         "warnings": warnings,
     }
@@ -1351,6 +1451,7 @@ def run_phase2(
     jadx_threads: int = 4,
     jadx_timeout_per_apk: int = 1800,
     no_jadx_download: bool = False,
+    build_direct_dex_index: bool = False,
 ) -> PhaseResult:
     return run_phase2_multi(
         apk_path,
@@ -1362,4 +1463,5 @@ def run_phase2(
         jadx_timeout_per_apk=jadx_timeout_per_apk,
         no_jadx_download=no_jadx_download,
         decompile_all_splits=False,
+        build_direct_dex_index=build_direct_dex_index,
     )

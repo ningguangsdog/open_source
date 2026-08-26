@@ -15,6 +15,7 @@ import tempfile
 import time
 from typing import Any, Callable
 
+from .capability_taxonomy import capability_names, classify_text
 from .evidence import token_fingerprint
 from .native_semantics import classify_native_semantics
 from .utils import ensure_dir, safe_name, safe_read_text, safe_write_json, sha256_file
@@ -22,8 +23,9 @@ from .utils import ensure_dir, safe_name, safe_read_text, safe_write_json, sha25
 
 logger = logging.getLogger(__name__)
 
-IDA_JOB_SCHEMA = "2026-08-20.ida-worker-job.v1"
-IDA_BACKEND_SCHEMA = "2026-08-20.ida-backend.v1"
+IDA_JOB_SCHEMA = "2026-08-25.ida-worker-job.v5"
+IDA_RESULT_SCHEMA = "2026-08-25.ida-worker-result.v5"
+IDA_BACKEND_SCHEMA = "2026-08-25.ida-backend.v5"
 ProgressCallback = Callable[[dict[str, Any]], None]
 
 
@@ -246,12 +248,12 @@ def _record_function_timeout(
     selected: dict[str, Any],
     *,
     timeout: int,
-) -> None:
+) -> bool:
     """Checkpoint a watchdog timeout so the next worker can continue."""
 
     address = str(selected.get("address") or "")
     if not address:
-        return
+        return False
     current = {
         str(row.get("address")): row
         for row in _latest_job_rows(
@@ -259,12 +261,13 @@ def _record_function_timeout(
             str(job.get("job_hash") or ""),
         )
     }
-    if current.get(address, {}).get("terminal_failure") is True:
-        return
+    existing = current.get(address, {})
+    if existing.get("success") is True or existing.get("terminal_failure") is True:
+        return False
     _append_jsonl(
         job_dir / "functions.jsonl",
         {
-            "schema_version": "2026-08-20.ida-worker-result.v1",
+            "schema_version": IDA_RESULT_SCHEMA,
             "job_hash": job.get("job_hash"),
             "library": job.get("library"),
             "library_sha256": job.get("library_sha256"),
@@ -277,6 +280,7 @@ def _record_function_timeout(
             "demangled_name": selected.get("demangled_name"),
             "selection_score": selected.get("selection_score"),
             "selection_reasons": selected.get("selection_reasons") or [],
+            "selection_source": selected.get("selection_source"),
             "graph_depth_from_seed": selected.get("graph_depth_from_seed"),
             "seed_target": selected.get("seed_target") or {},
             "is_pipeline_seed": bool(selected.get("is_pipeline_seed")),
@@ -300,6 +304,27 @@ def _record_function_timeout(
             "error": f"function_timeout:{timeout}",
         },
     )
+    return True
+
+
+def _current_worker_progress(
+    path: Path,
+    *,
+    job_hash: str,
+    worker_started_at_epoch: float,
+) -> dict[str, Any]:
+    """Read progress only when it was written by the current worker launch."""
+
+    progress = _read_json(path)
+    if progress.get("job_hash") != job_hash:
+        return {}
+    try:
+        updated_at = float(progress.get("updated_at_epoch") or 0)
+    except (TypeError, ValueError):
+        return {}
+    if updated_at < worker_started_at_epoch:
+        return {}
+    return progress
 
 
 def _run_worker_with_heartbeat(
@@ -314,9 +339,13 @@ def _run_worker_with_heartbeat(
     index: int,
     total: int,
     attempt: int,
+    job_hash: str,
 ) -> tuple[int | None, str, str, str | None, dict[str, Any] | None]:
     """Run one worker while reporting checkpoint progress to the parent."""
 
+    progress_path = job_dir / "progress.json"
+    progress_path.unlink(missing_ok=True)
+    worker_started_at_epoch = time.time()
     process = subprocess.Popen(
         command,
         text=True,
@@ -343,7 +372,11 @@ def _run_worker_with_heartbeat(
             stdout, stderr = process.communicate(timeout=min(2, remaining))
             return process.returncode, stdout or "", stderr or "", None, None
         except subprocess.TimeoutExpired:
-            progress = _read_json(job_dir / "progress.json")
+            progress = _current_worker_progress(
+                progress_path,
+                job_hash=job_hash,
+                worker_started_at_epoch=worker_started_at_epoch,
+            )
             current_value = progress.get("current_function")
             current = current_value if isinstance(current_value, dict) else None
             current_started = float(progress.get("current_started_at_epoch") or 0)
@@ -405,9 +438,19 @@ def _allocate_library_budgets(
     )
     if not libraries:
         return {}
-    max_targets = max(len(libraries), max_targets)
-    budgets = {library: 1 for library in libraries}
-    remaining = max_targets - len(libraries)
+    seed_counts = {
+        library: len(targets_by_library[library]) for library in libraries
+    }
+    # Every upstream-selected seed is an explicit research decision.  Reserve
+    # those slots first; graph and inventory expansion may only consume the
+    # remaining context budget.
+    effective_max_targets = max(
+        len(libraries),
+        max_targets,
+        sum(seed_counts.values()),
+    )
+    budgets = dict(seed_counts)
+    remaining = effective_max_targets - sum(seed_counts.values())
     cursor = 0
     while remaining > 0:
         budgets[libraries[cursor % len(libraries)]] += 1
@@ -436,6 +479,7 @@ def _prepare_job_directory(
         for name in (
             "functions.jsonl",
             "inventory.json",
+            "inventory.jsonl",
             "progress.json",
             "summary.json",
         ):
@@ -452,25 +496,87 @@ def _prepare_job_directory(
     return job_dir, analysis_binary
 
 
+def _valid_inventory_checkpoint(
+    job_dir: Path,
+    *,
+    job_hash: str,
+    library_sha256: str,
+) -> dict[str, Any] | None:
+    """Return a completed inventory summary only when its identity still matches."""
+
+    summary = _read_json(job_dir / "summary.json")
+    inventory_manifest = _read_json(job_dir / "inventory.json")
+    inventory_path = job_dir / "inventory.jsonl"
+    if (
+        summary.get("status") != "completed"
+        or summary.get("completed") is not True
+        or str(summary.get("job_hash") or "") != job_hash
+        or str(summary.get("library_sha256") or "") != library_sha256
+        or str(inventory_manifest.get("job_hash") or "") != job_hash
+        or str(inventory_manifest.get("library_sha256") or "")
+        != library_sha256
+        or not inventory_path.is_file()
+    ):
+        return None
+    expected_count = int(summary.get("inventory_function_count") or 0)
+    if expected_count != int(inventory_manifest.get("function_count") or 0):
+        return None
+    if expected_count > 0 and inventory_path.stat().st_size <= 0:
+        return None
+    return summary
+
+
 def _result_from_worker_row(row: dict[str, Any]) -> dict[str, Any]:
     seed_value = row.get("seed_target")
     seed: dict[str, Any] = seed_value if isinstance(seed_value, dict) else {}
     name = str(row.get("demangled_name") or row.get("name") or "")
     pseudocode_path = Path(str(row.get("pseudocode_path") or ""))
     pseudocode = safe_read_text(pseudocode_path, limit=500_000) if pseudocode_path.is_file() else ""
+    selection_source = str(row.get("selection_source") or "")
+    if not selection_source:
+        selection_source = (
+            "pipeline_seed"
+            if row.get("is_pipeline_seed")
+            else "seed_callgraph"
+            if row.get("graph_depth_from_seed") is not None
+            else "library_inventory"
+        )
+    context_capabilities = capability_names(seed.get("capabilities") or [])
+    function_text = "\n".join(
+        [
+            name,
+            pseudocode,
+            " ".join(str(item) for item in (row.get("string_refs") or [])),
+            " ".join(str(item) for item in (row.get("call_targets") or [])),
+        ]
+    )
+    classified = classify_text(function_text)
+    function_capabilities = capability_names(classified.keys())
+    if selection_source in {"pipeline_seed", "seed_callgraph"}:
+        function_capabilities = capability_names(
+            [*function_capabilities, *context_capabilities]
+        )
+    target_kind = (
+        (seed.get("kind") or "pipeline_seed")
+        if selection_source == "pipeline_seed"
+        else "internal_callgraph"
+        if selection_source == "seed_callgraph"
+        else "internal_inventory"
+    )
     target = {
         "library": row.get("library"),
-        "kind": (
-            seed.get("kind")
-            if row.get("is_pipeline_seed")
-            else "internal_callee"
-        )
-        or "internal_callee",
+        "kind": target_kind,
         "name": name,
         "address": row.get("address"),
         "size_bytes": row.get("size_bytes"),
         "score": row.get("selection_score") or seed.get("score") or 0,
-        "capabilities": seed.get("capabilities") or [],
+        "capabilities": function_capabilities,
+        "context_capabilities": context_capabilities,
+        "capability_provenance": (
+            "function_and_seed_context"
+            if selection_source in {"pipeline_seed", "seed_callgraph"}
+            else "function_content_only"
+        ),
         "reasons": [
             *(seed.get("reasons") or []),
             *(row.get("selection_reasons") or []),
@@ -480,11 +586,57 @@ def _result_from_worker_row(row: dict[str, Any]) -> dict[str, Any]:
         "abi": row.get("abi"),
         "abi_analysis_role": seed.get("abi_analysis_role"),
         "associated_java_methods": seed.get("associated_java_methods") or [],
-        "discovered_by": "ida_callgraph_expansion",
+        "discovered_by": (
+            "ida_pipeline_seed"
+            if selection_source == "pipeline_seed"
+            else "ida_callgraph_expansion"
+            if selection_source == "seed_callgraph"
+            else "ida_inventory_ranking"
+        ),
+        "selection_source": selection_source,
         "graph_depth_from_seed": row.get("graph_depth_from_seed"),
+        "seed_context": {
+            key: seed.get(key)
+            for key in (
+                "kind",
+                "name",
+                "address",
+                "capabilities",
+                "reasons",
+                "context_only",
+            )
+            if seed.get(key) is not None
+        },
     }
+    if selection_source == "pipeline_seed":
+        if seed.get("analysis_lane") is not None:
+            target["analysis_lane"] = seed.get("analysis_lane")
+        if isinstance(seed.get("reuse_candidate"), dict):
+            target["reuse_candidate"] = seed.get("reuse_candidate")
+        for key in (
+            "candidate_pair_id",
+            "commercial_function_id",
+            "source_function_id",
+        ):
+            if seed.get(key) is not None:
+                target[key] = seed.get(key)
+    elif selection_source == "seed_callgraph":
+        # The neighbor remains traceable to the seed that discovered it, but it
+        # is a different commercial function and must not inherit the seed's
+        # direct open-source identity.  Post-IDA comparison resolves the
+        # neighbor independently by its own library hash and address.
+        target["origin_seed_candidate"] = {
+            key: seed.get(key)
+            for key in (
+                "analysis_lane",
+                "candidate_pair_id",
+                "commercial_function_id",
+                "source_function_id",
+            )
+            if seed.get(key) is not None
+        }
     features = {
-        "schema_version": "2026-08-20.native-function-features.v2",
+        "schema_version": "2026-08-21.native-function-features.v3",
         "library": row.get("library"),
         "library_sha256": row.get("library_sha256"),
         "abi": row.get("abi"),
@@ -495,6 +647,9 @@ def _result_from_worker_row(row: dict[str, Any]) -> dict[str, Any]:
         "resolved_offset": row.get("address"),
         "score": target["score"],
         "capabilities": target["capabilities"],
+        "context_capabilities": target["context_capabilities"],
+        "capability_provenance": target["capability_provenance"],
+        "selection_source": selection_source,
         "reasons": target["reasons"],
         "instruction_count": row.get("instruction_count") or 0,
         "basic_block_count": row.get("basic_block_count") or 0,
@@ -670,17 +825,18 @@ def run_ida_decompile(
         function_timeouts = 0
         library_deadline = time.monotonic() + library_timeout
         while True:
-            attempts += 1
-            attempt_remaining = int(
-                min(
-                    timeout_per_app - (time.monotonic() - started),
-                    library_deadline - time.monotonic(),
-                )
-            )
+            app_remaining = timeout_per_app - (time.monotonic() - started)
+            library_remaining = library_deadline - time.monotonic()
+            attempt_remaining = int(min(app_remaining, library_remaining))
             if attempt_remaining <= 0:
                 final_returncode = None
-                final_error = "app_timeout_before_retry"
+                final_error = (
+                    "app_timeout_before_retry"
+                    if app_remaining <= 0
+                    else "library_timeout_before_retry"
+                )
                 break
+            attempts += 1
             with tempfile.TemporaryDirectory(
                 prefix=".idausr-",
                 dir=str(job_dir),
@@ -716,6 +872,7 @@ def run_ida_decompile(
                     index=index,
                     total=len(budgets),
                     attempt=attempts,
+                    job_hash=str(job_core["job_hash"]),
                 )
                 final_error = timeout_error or (
                     worker_stderr[-4000:]
@@ -725,14 +882,32 @@ def run_ida_decompile(
                 if final_returncode == 0:
                     break
                 if timed_out_function is not None:
-                    _record_function_timeout(
+                    recorded = _record_function_timeout(
                         job_dir,
                         job_core,
                         timed_out_function,
                         timeout=timeout_per_function,
                     )
-                    function_timeouts += 1
-                    continue
+                    if recorded:
+                        function_timeouts += 1
+                        continue
+                    checkpoint = next(
+                        (
+                            row
+                            for row in _latest_job_rows(
+                                job_dir / "functions.jsonl",
+                                str(job_core["job_hash"]),
+                            )
+                            if str(row.get("address") or "")
+                            == str(timed_out_function.get("address") or "")
+                        ),
+                        {},
+                    )
+                    if checkpoint.get("success") is True:
+                        continue
+                    process_failures += 1
+                    final_error = "duplicate_function_timeout_checkpoint"
+                    break
                 process_failures += 1
                 if (
                     process_failures > max(0, max_retries)
@@ -781,6 +956,20 @@ def run_ida_decompile(
         )
 
     attempted_targets = len(results)
+    requested_seed_count = sum(len(rows) for rows in targets_by_library.values())
+    resolved_seed_count = sum(
+        int(item.get("resolved_seed_count") or 0) for item in library_summaries
+    )
+    selected_seed_count = sum(
+        int(item.get("selected_seed_count") or 0) for item in library_summaries
+    )
+    unresolved_seed_count = sum(
+        int(item.get("unresolved_seed_count") or 0) for item in library_summaries
+    )
+    selection_source_counts = Counter(
+        str((result.get("target") or {}).get("selection_source") or "unknown")
+        for result in results
+    )
     summary = {
         "schema_version": IDA_BACKEND_SCHEMA,
         "status": status,
@@ -790,6 +979,14 @@ def run_ida_decompile(
         "attempted_targets": attempted_targets,
         "selected_target_count": sum(budgets.values()),
         "unattempted_target_count": max(0, sum(budgets.values()) - attempted_targets),
+        "requested_seed_count": requested_seed_count,
+        "resolved_seed_count": resolved_seed_count,
+        "selected_seed_count": selected_seed_count,
+        "unresolved_seed_count": unresolved_seed_count,
+        "unselected_resolved_seed_count": max(
+            0, resolved_seed_count - selected_seed_count
+        ),
+        "selection_source_counts": dict(sorted(selection_source_counts.items())),
         "libraries_selected": budgets,
         "libraries_attempted": len(library_summaries),
         "successful_decompilations": sum(1 for result in results if result.get("success")),
@@ -797,6 +994,9 @@ def run_ida_decompile(
         "library_summaries": library_summaries,
         "budget": {
             "max_targets": max_targets,
+            "effective_max_targets": sum(budgets.values()),
+            "expanded_for_seed_coverage": sum(budgets.values()) > max_targets,
+            "allocation_policy": "seed_floor_then_context_round_robin",
             "timeout_per_function": timeout_per_function,
             "timeout_per_app": timeout_per_app,
             "max_retries": max_retries,
@@ -808,3 +1008,310 @@ def run_ida_decompile(
     }
     safe_write_json(output_dir / "ida_backend_summary.json", summary)
     return summary
+
+
+def _library_record_path(record: dict[str, Any]) -> Path | None:
+    value = record.get("extracted_path") or record.get("path") or record.get("entry")
+    if not value:
+        return None
+    return Path(str(value))
+
+
+def run_ida_inventory(
+    library_records: list[dict[str, Any]],
+    output_dir: Path,
+    *,
+    install_dir: str | Path | None = None,
+    python_executable: str | Path | None = None,
+    timeout_per_library: int = 1200,
+    timeout_per_app: int = 14_400,
+    max_retries: int = 1,
+    max_instructions_per_function: int = 512,
+    progress_callback: ProgressCallback | None = None,
+) -> dict[str, Any]:
+    """Build a content-deduplicated full native index without Hex-Rays calls."""
+
+    if timeout_per_library <= 0 or timeout_per_app <= 0:
+        raise ValueError("IDA inventory timeout values must be positive")
+    if max_retries < 0:
+        raise ValueError("IDA inventory retry count must be zero or greater")
+    if max_instructions_per_function <= 0:
+        raise ValueError("max_instructions_per_function must be positive")
+
+    started = time.monotonic()
+    output_dir = ensure_dir(output_dir)
+    installation = ida_installation_info(install_dir)
+    if not installation.get("available"):
+        result = {
+            "schema_version": IDA_BACKEND_SCHEMA,
+            "status": "tool_missing",
+            "job_mode": "inventory_only",
+            "installation": installation,
+            "library_summaries": [],
+            "message": installation.get("reason"),
+        }
+        safe_write_json(output_dir / "ida_inventory_summary.json", result)
+        return result
+
+    unique_records: list[tuple[dict[str, Any], Path, str]] = []
+    duplicate_records: list[dict[str, Any]] = []
+    seen_hashes: dict[str, str] = {}
+    invalid_records: list[dict[str, Any]] = []
+    for record in library_records:
+        path = _library_record_path(record)
+        if path is None or not path.is_file():
+            invalid_records.append(
+                {
+                    "library": str(path) if path else None,
+                    "status": "failed",
+                    "error": "library_not_found",
+                }
+            )
+            continue
+        actual_hash = str(record.get("sha256") or "") or sha256_file(path)
+        previous = seen_hashes.get(actual_hash)
+        if previous is not None:
+            duplicate_records.append(
+                {
+                    "library": str(path),
+                    "library_sha256": actual_hash,
+                    "status": "content_duplicate_skipped",
+                    "canonical_library": previous,
+                }
+            )
+            continue
+        seen_hashes[actual_hash] = str(path)
+        unique_records.append((record, path, actual_hash))
+
+    worker = Path(__file__).with_name("ida_worker.py")
+    executable = str(python_executable or sys.executable)
+    resolved_install = Path(str(installation["install_dir"]))
+    summaries: list[dict[str, Any]] = []
+    status = "completed"
+    reused_library_count = 0
+    executed_library_count = 0
+
+    def finalize(run_status: str) -> dict[str, Any]:
+        processed = len(summaries)
+        if processed < len(unique_records) and run_status == "completed":
+            run_status = "partial"
+        result = {
+            "schema_version": IDA_BACKEND_SCHEMA,
+            "status": run_status,
+            "job_mode": "inventory_only",
+            "tool": "ida",
+            "backend": "idalib_disassembly_inventory",
+            "installation": installation,
+            "input_library_count": len(library_records),
+            "unique_library_count": len(unique_records),
+            "duplicate_library_count": len(duplicate_records),
+            "invalid_library_count": len(invalid_records),
+            # Kept for schema compatibility: this is the number of jobs resolved
+            # by either a valid checkpoint or a worker invocation.
+            "attempted_library_count": processed,
+            "executed_library_count": executed_library_count,
+            "reused_library_count": reused_library_count,
+            "completed_library_count": sum(
+                1 for row in summaries if row.get("status") == "completed"
+            ),
+            "indexed_function_count": sum(
+                int(row.get("inventory_function_count") or 0)
+                for row in summaries
+            ),
+            "library_summaries": summaries,
+            "duplicates": duplicate_records,
+            "invalid_records": invalid_records,
+            "budget": {
+                "timeout_per_library": timeout_per_library,
+                "timeout_per_app": timeout_per_app,
+                "max_retries": max_retries,
+                "max_instructions_per_function": (
+                    max_instructions_per_function
+                ),
+                "worker_count": 1,
+            },
+            "elapsed_seconds": round(time.monotonic() - started, 3),
+        }
+        safe_write_json(output_dir / "ida_inventory_summary.json", result)
+        return result
+
+    try:
+        for index, (record, library_path, library_hash) in enumerate(
+            unique_records,
+            start=1,
+        ):
+            job = {
+                "schema_version": IDA_JOB_SCHEMA,
+                "job_mode": "inventory_only",
+                "inventory_detail": "fingerprint",
+                "library": str(library_path),
+                "library_sha256": library_hash,
+                "abi": record.get("abi"),
+                "ownership": record.get("ownership") or {},
+                "seed_targets": [],
+                "max_targets": 1,
+                "callgraph_depth": 0,
+                "max_inventory_instructions_per_function": (
+                    max_instructions_per_function
+                ),
+            }
+            job["job_hash"] = _canonical_hash(job)
+            job_dir, _ = _prepare_job_directory(
+                output_dir,
+                library_path,
+                library_hash,
+                job,
+            )
+            inventory_path = job_dir / "inventory.jsonl"
+            checkpoint = _valid_inventory_checkpoint(
+                job_dir,
+                job_hash=str(job["job_hash"]),
+                library_sha256=library_hash,
+            )
+            if checkpoint is not None:
+                reused_library_count += 1
+                summary = {
+                    **checkpoint,
+                    "library": str(library_path),
+                    "library_sha256": library_hash,
+                    "abi": record.get("abi"),
+                    "ownership": record.get("ownership") or {},
+                    "returncode": 0,
+                    "attempts": 0,
+                    "cache_status": "reused",
+                    "inventory_path": str(inventory_path),
+                    "error": None,
+                }
+                summaries.append(summary)
+                _emit(
+                    progress_callback,
+                    {
+                        "event": "ida_inventory_library_reused",
+                        "index": index,
+                        "total": len(unique_records),
+                        "library": str(library_path),
+                        "function_count": int(
+                            summary.get("inventory_function_count") or 0
+                        ),
+                    },
+                )
+                continue
+
+            app_remaining = timeout_per_app - (time.monotonic() - started)
+            if app_remaining <= 0:
+                status = "app_timeout"
+                break
+            executed_library_count += 1
+            job_path = job_dir / "job.json"
+            library_timeout = min(
+                max(1, int(app_remaining)), timeout_per_library
+            )
+            _emit(
+                progress_callback,
+                {
+                    "event": "ida_inventory_library_start",
+                    "index": index,
+                    "total": len(unique_records),
+                    "library": str(library_path),
+                    "timeout": library_timeout,
+                },
+            )
+            returncode: int | None = None
+            final_error: str | None = None
+            attempts = 0
+            for attempt in range(max_retries + 1):
+                attempts = attempt + 1
+                app_remaining = timeout_per_app - (time.monotonic() - started)
+                if app_remaining <= 0:
+                    final_error = "app_timeout_before_inventory_retry"
+                    break
+                with tempfile.TemporaryDirectory(
+                    prefix=".idausr-",
+                    dir=str(job_dir),
+                ) as temporary:
+                    idausr = Path(temporary)
+                    _copy_ida_user_files(idausr)
+                    environment = os.environ.copy()
+                    environment["IDAUSR"] = str(idausr)
+                    command = [
+                        executable,
+                        str(worker),
+                        "--ida-install-dir",
+                        str(resolved_install),
+                        "--job",
+                        str(job_path),
+                        "--output-dir",
+                        str(job_dir),
+                    ]
+                    (
+                        returncode,
+                        _stdout,
+                        stderr,
+                        timeout_error,
+                        _timed_out_function,
+                    ) = _run_worker_with_heartbeat(
+                        command,
+                        environment=environment,
+                        timeout=min(
+                            library_timeout,
+                            max(1, int(app_remaining)),
+                        ),
+                        timeout_per_function=library_timeout + 1,
+                        job_dir=job_dir,
+                        progress_callback=progress_callback,
+                        library=str(library_path),
+                        index=index,
+                        total=len(unique_records),
+                        attempt=attempts,
+                        job_hash=str(job["job_hash"]),
+                    )
+                    final_error = timeout_error or (
+                        stderr[-4000:]
+                        if returncode not in {0, None}
+                        else None
+                    )
+                if returncode == 0:
+                    break
+
+            worker_summary = _read_json(job_dir / "summary.json")
+            completed = (
+                returncode == 0
+                and worker_summary.get("status") == "completed"
+                and inventory_path.is_file()
+            )
+            if not completed:
+                status = "partial"
+            summary = {
+                **worker_summary,
+                "library": str(library_path),
+                "library_sha256": library_hash,
+                "abi": record.get("abi"),
+                "ownership": record.get("ownership") or {},
+                "returncode": returncode,
+                "attempts": attempts,
+                "cache_status": "executed",
+                "inventory_path": (
+                    str(inventory_path) if inventory_path.is_file() else None
+                ),
+                "error": worker_summary.get("error") or final_error,
+            }
+            summaries.append(summary)
+            _emit(
+                progress_callback,
+                {
+                    "event": "ida_inventory_library_finish",
+                    "index": index,
+                    "total": len(unique_records),
+                    "library": str(library_path),
+                    "status": summary.get("status") or "failed",
+                    "function_count": int(
+                        summary.get("inventory_function_count") or 0
+                    ),
+                    "error": summary.get("error"),
+                },
+            )
+    except KeyboardInterrupt:
+        finalize("interrupted")
+        raise
+
+    return finalize(status)

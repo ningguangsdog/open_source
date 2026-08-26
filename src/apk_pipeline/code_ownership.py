@@ -87,10 +87,13 @@ KNOWN_THIRD_PARTY_NATIVE_PREFIXES = (
     "libavfilter",
     "libavformat",
     "libavutil",
+    "libcrashlytics",
     "libgrpc",
+    "libmediapipe_",
     "libopencv_",
     "libswresample",
     "libswscale",
+    "libtensorflowlite_",
 )
 
 DEPENDENCY_PATH_MARKERS = (
