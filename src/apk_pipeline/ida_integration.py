@@ -37,6 +37,9 @@ CALLABLE_KINDS = {
     "exported_symbol",
     "profile_seed",
     "internal_callee",
+    "internal_callgraph",
+    "internal_inventory",
+    "reuse_candidate",
     "address",
 }
 MODEL_MARKERS = (

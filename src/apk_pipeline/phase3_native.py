@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from itertools import chain
 import json
 import logging
 import re
@@ -17,7 +18,9 @@ from .capability_taxonomy import (
     classify_text,
 )
 from .code_ownership import classify_native_ownership, normalize_hashes
+from .deep_candidate_comparison import compare_decompiled_candidates
 from .evidence import capability_confidence, compact_list, token_fingerprint, unit_id, write_jsonl
+from .ida_backend import run_ida_inventory
 from .ida_integration import (
     build_ida_task_manifest,
     build_java_native_hints,
@@ -35,6 +38,12 @@ from .native_decompiler import (
     run_targeted_decompile,
     score_native_text,
     select_native_targets,
+)
+from .reuse_candidate_retrieval import (
+    iter_jsonl,
+    native_decompile_targets,
+    retrieve_candidates,
+    select_candidate_cohorts,
 )
 from .run_context import (
     build_phase_cache_spec,
@@ -63,7 +72,9 @@ MAX_INTERESTING_STRINGS = 500
 NATIVE_TOOL_TIMEOUT_SECONDS = 120
 AUTO_DEEP_MIN_SCORE = 18
 AUTO_DEEP_MIN_CAPABILITY_SCORE = 12
-PHASE_SCHEMA = "2026-08-20.phase3.v6"
+PHASE_SCHEMA = "2026-08-25.phase3.v12"
+NATIVE_FULL_INDEX_SCHEMA = "2026-08-24.native-full-index.v2"
+REUSE_REVIEW_LIMIT = 5000
 NATIVE_DEPTHS = {"none", "basic", "targeted", "auto", "deep"}
 NATIVE_DECOMPILERS = {"auto", "none", "ida", "rizin", "radare2", "ghidra", "retdec"}
 logger = logging.getLogger(__name__)
@@ -71,7 +82,17 @@ logger = logging.getLogger(__name__)
 
 def _log_ida_progress(payload: dict[str, Any]) -> None:
     event = str(payload.get("event") or "")
-    if not event.startswith("ida_library_"):
+    if event == "reuse_retrieval_checkpoint":
+        logger.warning(
+            "Reuse retrieval checkpoint: commercial_functions=%s, candidates=%s",
+            payload.get("commercial_function_count"),
+            payload.get("candidate_pair_count"),
+        )
+        return
+    if not (
+        event.startswith("ida_library_")
+        or event.startswith("ida_inventory_library_")
+    ):
         return
     library = Path(str(payload.get("library") or "unknown")).name
     index = payload.get("index")
@@ -109,6 +130,258 @@ def _log_ida_progress(payload: dict[str, Any]) -> None:
             payload.get("result_count"),
             payload.get("successful_decompilations"),
         )
+    elif event == "ida_inventory_library_start":
+        logger.warning(
+            "IDA lightweight index [%s/%s] started %s (%ss timeout)",
+            index,
+            total,
+            library,
+            payload.get("timeout"),
+        )
+    elif event == "ida_inventory_library_finish":
+        logger.warning(
+            "IDA lightweight index [%s/%s] finished %s: status=%s, functions=%s",
+            index,
+            total,
+            library,
+            payload.get("status"),
+            payload.get("function_count"),
+        )
+    elif event == "ida_inventory_library_reused":
+        logger.warning(
+            "IDA lightweight index [%s/%s] reused %s: functions=%s",
+            index,
+            total,
+            library,
+            payload.get("function_count"),
+        )
+
+
+def _consolidate_native_inventory(
+    backend_summary: dict[str, Any],
+    output_path: Path,
+    callgraph_output_path: Path | None = None,
+) -> dict[str, Any]:
+    temporary = output_path.with_suffix(output_path.suffix + ".tmp")
+    callgraph_temporary = (
+        callgraph_output_path.with_suffix(callgraph_output_path.suffix + ".tmp")
+        if callgraph_output_path is not None
+        else None
+    )
+    function_count = 0
+    ownership_counts: Counter[str] = Counter()
+    capability_counts: Counter[str] = Counter()
+    library_counts: Counter[str] = Counter()
+    invalid_row_count = 0
+    callgraph_edge_count = 0
+    callgraph_destination = None
+    try:
+        if callgraph_temporary is not None:
+            callgraph_destination = callgraph_temporary.open("w", encoding="utf-8")
+        with temporary.open("w", encoding="utf-8") as destination:
+            for library_summary in backend_summary.get("library_summaries") or []:
+                inventory_value = library_summary.get("inventory_path")
+                inventory_path = Path(str(inventory_value or ""))
+                if not inventory_path.is_file():
+                    continue
+                for row in iter_jsonl(inventory_path):
+                    if not row.get("function_id") or not row.get("address"):
+                        invalid_row_count += 1
+                        continue
+                    text = "\n".join(
+                        (
+                            str(row.get("name") or ""),
+                            str(row.get("demangled_name") or ""),
+                            " ".join(
+                                str(value) for value in row.get("call_targets") or []
+                            ),
+                            " ".join(
+                                str(value) for value in row.get("string_refs") or []
+                            ),
+                        )
+                    )
+                    capabilities = capability_names(classify_text(text).keys())
+                    row["capabilities"] = capabilities
+                    row["coverage_note"] = (
+                        "All IDA-discovered functions in this content-unique native "
+                        "binary are indexed without requiring Hex-Rays pseudocode. "
+                        "Instruction features are bounded by the configured "
+                        "per-function scan limit."
+                    )
+                    destination.write(
+                        json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n"
+                    )
+                    if callgraph_destination is not None:
+                        for target_name in row.get("call_targets") or []:
+                            callgraph_destination.write(
+                                json.dumps(
+                                    {
+                                        "caller_function_id": row.get("function_id"),
+                                        "library_sha256": row.get("library_sha256"),
+                                        "caller_address": row.get("address"),
+                                        "caller_name": row.get("name"),
+                                        "callee_name": target_name,
+                                    },
+                                    ensure_ascii=False,
+                                    sort_keys=True,
+                                )
+                                + "\n"
+                            )
+                            callgraph_edge_count += 1
+                    function_count += 1
+                    ownership_counts.update(
+                        [
+                            str(
+                                (row.get("ownership") or {}).get("category")
+                                or "unknown"
+                            )
+                        ]
+                    )
+                    capability_counts.update(capabilities)
+                    library_counts.update(
+                        [str(row.get("library_sha256") or "unknown")]
+                    )
+    finally:
+        if callgraph_destination is not None:
+            callgraph_destination.close()
+    temporary.replace(output_path)
+    if callgraph_temporary is not None and callgraph_output_path is not None:
+        callgraph_temporary.replace(callgraph_output_path)
+    return {
+        "schema_version": NATIVE_FULL_INDEX_SCHEMA,
+        "status": (
+            "completed"
+            if backend_summary.get("status") == "completed"
+            else "partial"
+        ),
+        "backend_status": backend_summary.get("status"),
+        "input_library_count": backend_summary.get("input_library_count", 0),
+        "unique_library_count": backend_summary.get("unique_library_count", 0),
+        "completed_library_count": backend_summary.get("completed_library_count", 0),
+        "indexed_function_count": function_count,
+        "callgraph_edge_count": callgraph_edge_count,
+        "callgraph_path": (
+            str(callgraph_output_path) if callgraph_output_path is not None else None
+        ),
+        "invalid_row_count": invalid_row_count,
+        "ownership_function_counts": dict(sorted(ownership_counts.items())),
+        "capability_counts": dict(sorted(capability_counts.items())),
+        "indexed_library_hash_count": len(library_counts),
+        "index_path": str(output_path),
+        "backend_summary_path": None,
+    }
+
+
+def _primary_native_projection(
+    library_records: list[dict[str, Any]],
+) -> tuple[set[str], dict[str, Any]]:
+    """Choose one preferred ABI layer per logical library for source retrieval."""
+
+    abi_priority = {
+        "arm64-v8a": 0,
+        "armeabi-v7a": 1,
+        "x86_64": 2,
+        "x86": 3,
+        "armeabi": 4,
+    }
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for record in library_records:
+        path = str(
+            record.get("extracted_path")
+            or record.get("path")
+            or record.get("entry")
+            or ""
+        )
+        logical_name = str(record.get("name") or Path(path).name or path)
+        groups.setdefault(logical_name, []).append(record)
+
+    selected_hashes: set[str] = set()
+    selected_abi_counts: Counter[str] = Counter()
+    excluded_abi_counts: Counter[str] = Counter()
+    for records in groups.values():
+        best_priority = min(
+            abi_priority.get(str(record.get("abi") or ""), 99)
+            for record in records
+        )
+        for record in records:
+            abi = str(record.get("abi") or "unknown")
+            library_hash = str(record.get("sha256") or "")
+            if abi_priority.get(abi, 99) == best_priority and library_hash:
+                selected_hashes.add(library_hash)
+                selected_abi_counts[abi] += 1
+            else:
+                excluded_abi_counts[abi] += 1
+    return selected_hashes, {
+        "policy": "preferred_abi_per_logical_library",
+        "logical_library_count": len(groups),
+        "selected_library_hash_count": len(selected_hashes),
+        "selected_abi_counts": dict(sorted(selected_abi_counts.items())),
+        "excluded_abi_counts": dict(sorted(excluded_abi_counts.items())),
+        "coverage_boundary": (
+            "All ABI inventories remain on disk. Retrieval uses one preferred ABI "
+            "layer per logical library to avoid scoring architecture duplicates."
+        ),
+    }
+
+
+def _reusable_consolidated_inventory(
+    backend_summary: dict[str, Any],
+    summary_path: Path,
+    index_path: Path,
+    callgraph_path: Path,
+) -> dict[str, Any] | None:
+    previous = _load_json_object(summary_path)
+    if (
+        backend_summary.get("status") != "completed"
+        or int(backend_summary.get("reused_library_count") or 0)
+        != int(backend_summary.get("unique_library_count") or 0)
+        or previous.get("status") != "completed"
+        or int(previous.get("indexed_function_count") or 0)
+        != int(backend_summary.get("indexed_function_count") or 0)
+        or int(previous.get("completed_library_count") or 0)
+        != int(backend_summary.get("completed_library_count") or 0)
+        or not index_path.is_file()
+        or index_path.stat().st_size <= 0
+        or not callgraph_path.is_file()
+    ):
+        return None
+    return {
+        **previous,
+        "cache_status": "reused",
+        "backend_status": backend_summary.get("status"),
+    }
+
+
+def _iter_projected_native_rows(
+    path: Path,
+    selected_hashes: set[str],
+) -> Any:
+    for row in iter_jsonl(path):
+        if not selected_hashes or str(row.get("library_sha256") or "") in selected_hashes:
+            yield row
+
+
+def _merge_native_targets(
+    candidate_targets: list[dict[str, Any]],
+    baseline_targets: list[dict[str, Any]],
+    *,
+    limit: int,
+) -> list[dict[str, Any]]:
+    merged: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for target in [*candidate_targets, *baseline_targets]:
+        key = (
+            str(target.get("library_sha256") or target.get("library") or ""),
+            str(normalize_address(target.get("address")) or ""),
+            str(target.get("name") or ""),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(target)
+        if len(merged) >= max(1, limit):
+            break
+    return merged
 
 
 def _load_manifest_package(workspace: Path) -> str | None:
@@ -793,6 +1066,18 @@ def build_native_evidence_units(
             pseudocode_excerpt = safe_read_text(Path(output_path), limit=4000)
         capabilities = capability_names(target.get("capabilities") or [])
         score = int(target.get("score") or 0)
+        decompiler_success = result.get("success") if result else None
+        comparison_eligible = bool(
+            decompiler_success is True
+            and output_path
+            and features.get("pseudocode_fingerprint")
+        )
+        if comparison_eligible:
+            comparison_exclusion_reason = None
+        elif result:
+            comparison_exclusion_reason = "native_decompilation_failed"
+        else:
+            comparison_exclusion_reason = "no_native_pseudocode"
         fingerprint_text = "\n".join(
             [
                 str(target.get("library") or ""),
@@ -815,12 +1100,29 @@ def build_native_evidence_units(
                 "library": target.get("library"),
                 "target_kind": target.get("kind"),
                 "name": target.get("name"),
+                "address": normalize_address(target.get("address")),
+                "abi": target.get("abi"),
+                "library_sha256": target.get("library_sha256"),
                 "score": score,
                 "capabilities": capabilities,
+                "context_capabilities": target.get("context_capabilities") or [],
+                "capability_provenance": target.get("capability_provenance"),
                 "ownership": target.get("ownership") or {},
                 "reasons": target.get("reasons") or [],
-                "decompiler_success": result.get("success") if result else None,
+                "selection_source": target.get("selection_source"),
+                "discovered_by": target.get("discovered_by"),
+                "graph_depth_from_seed": target.get("graph_depth_from_seed"),
+                "seed_context": target.get("seed_context") or {},
+                "origin_seed_candidate": target.get("origin_seed_candidate") or {},
+                "analysis_lane": target.get("analysis_lane"),
+                "candidate_pair_id": target.get("candidate_pair_id"),
+                "commercial_function_id": target.get("commercial_function_id"),
+                "source_function_id": target.get("source_function_id"),
+                "reuse_candidate": target.get("reuse_candidate") or {},
+                "decompiler_success": decompiler_success,
                 "decompiler_tool": result.get("tool") if result else None,
+                "comparison_eligible": comparison_eligible,
+                "comparison_exclusion_reason": comparison_exclusion_reason,
                 "pseudocode_path": output_path,
                 "pseudocode_sha256": (
                     result.get("pseudocode_sha256") if result else None
@@ -847,7 +1149,14 @@ def build_native_evidence_units(
                 "call_targets": compact_list(features.get("call_targets") or [], 80),
                 "string_refs": compact_list(features.get("string_refs") or [], 80),
                 "token_fingerprint": token_fingerprint(fingerprint_text),
-                "confidence": min(0.95, 0.35 + min(score, 60) / 100 + 0.05 * len(capabilities)),
+                "confidence": (
+                    min(
+                        0.95,
+                        0.35 + min(score, 60) / 100 + 0.05 * len(capabilities),
+                    )
+                    if comparison_eligible
+                    else min(0.35, 0.15 + min(score, 40) / 200)
+                ),
             }
         )
 
@@ -949,6 +1258,15 @@ def run_phase3_multi(
     ida_callgraph_depth: int = 2,
     ida_review_limit: int = 120,
     ida_handoff_max_libraries: int = 12,
+    full_native_index: bool = False,
+    full_native_index_timeout_per_library: int = 1200,
+    full_native_index_timeout_per_app: int = 14_400,
+    full_native_index_max_instructions: int = 512,
+    oss_function_index: Path | None = None,
+    oss_binary_function_index: Path | None = None,
+    reuse_candidate_top_k: int = 10,
+    reuse_candidate_min_score: float = 0.28,
+    reuse_candidate_decompile_limit: int = 120,
     native_target_capabilities: tuple[str, ...] = (),
     first_party_native_hashes: tuple[str, ...] = (),
     third_party_native_hashes: tuple[str, ...] = (),
@@ -971,6 +1289,13 @@ def run_phase3_multi(
         "native_timeout_per_app": native_timeout_per_app,
         "ida_review_limit": ida_review_limit,
         "ida_handoff_max_libraries": ida_handoff_max_libraries,
+        "full_native_index_timeout_per_library": (
+            full_native_index_timeout_per_library
+        ),
+        "full_native_index_timeout_per_app": full_native_index_timeout_per_app,
+        "full_native_index_max_instructions": full_native_index_max_instructions,
+        "reuse_candidate_top_k": reuse_candidate_top_k,
+        "reuse_candidate_decompile_limit": reuse_candidate_decompile_limit,
     }
     invalid_values = [
         name for name, value in positive_values.items() if value <= 0
@@ -982,6 +1307,27 @@ def run_phase3_multi(
         )
     if ida_max_retries < 0 or ida_callgraph_depth < 0:
         raise ValueError("IDA retry count and callgraph depth must be zero or greater.")
+    if not 0 <= reuse_candidate_min_score <= 1:
+        raise ValueError("reuse_candidate_min_score must be between zero and one")
+    if full_native_index:
+        if native_decompiler != "ida":
+            raise ValueError("full_native_index requires native_decompiler=ida")
+        if oss_function_index is None:
+            raise ValueError("full_native_index requires oss_function_index")
+        oss_function_index = oss_function_index.expanduser().resolve()
+        if not oss_function_index.is_file():
+            raise FileNotFoundError(
+                f"OSS function index not found: {oss_function_index}"
+            )
+        if oss_binary_function_index is not None:
+            oss_binary_function_index = (
+                oss_binary_function_index.expanduser().resolve()
+            )
+            if not oss_binary_function_index.is_file():
+                raise FileNotFoundError(
+                    "OSS compiled function index not found: "
+                    f"{oss_binary_function_index}"
+                )
     native_target_capabilities = tuple(
         sorted(
             {
@@ -1043,6 +1389,24 @@ def run_phase3_multi(
     callgraph_path = output_dir / "native_callgraph.json"
     function_index_path = output_dir / "native_function_index.json"
     evidence_units_path = output_dir / "native_evidence_units.json"
+    full_index_path = output_dir / "native_full_function_index.jsonl"
+    full_callgraph_path = output_dir / "native_full_callgraph.jsonl"
+    full_index_summary_path = output_dir / "native_full_index_summary.json"
+    reuse_candidates_path = output_dir / "reuse_candidates.jsonl"
+    reuse_review_path = output_dir / "reuse_candidates_review.jsonl"
+    reuse_summary_path = output_dir / "reuse_candidate_summary.json"
+    reuse_selection_summary_path = (
+        output_dir / "reuse_candidate_selection_summary.json"
+    )
+    reuse_candidate_targets_path = output_dir / "reuse_candidate_targets.json"
+    reuse_checkpoint_path = output_dir / "reuse_candidates.checkpoint.json"
+    deep_comparisons_path = output_dir / "reuse_deep_comparisons.jsonl"
+    deep_comparison_summary_path = (
+        output_dir / "reuse_deep_comparison_summary.json"
+    )
+    canonical_implementations_path = (
+        output_dir / "reuse_canonical_implementations.jsonl"
+    )
     deep_summary_path = output_dir / "native_deep_summary.json"
     ida_manifest_path = output_dir / "ida_target_manifest.json"
     ida_handoff_manifest_path = output_dir / "ida_handoff" / "ida_handoff_manifest.json"
@@ -1051,6 +1415,8 @@ def run_phase3_multi(
     cache_path = output_dir / "cache_manifest.json"
     manifest_path = workspace / "phase1_manifest" / "manifest_summary.json"
     code_index_path = workspace / "phase2_jadx" / "code_index.json"
+    java_method_index_path = workspace / "phase2_jadx" / "java_method_index.jsonl"
+    dex_method_index_path = workspace / "phase2_jadx" / "dex_method_index.jsonl"
     app_package = _load_manifest_package(workspace)
 
     output_paths = [
@@ -1065,6 +1431,16 @@ def run_phase3_multi(
         callgraph_path,
         function_index_path,
         evidence_units_path,
+        full_index_path,
+        full_callgraph_path,
+        full_index_summary_path,
+        reuse_candidates_path,
+        reuse_review_path,
+        reuse_summary_path,
+        reuse_selection_summary_path,
+        reuse_candidate_targets_path,
+        deep_comparisons_path,
+        deep_comparison_summary_path,
         deep_summary_path,
         ida_manifest_path,
         ida_handoff_manifest_path,
@@ -1093,6 +1469,29 @@ def run_phase3_multi(
             "ida_callgraph_depth": ida_callgraph_depth,
             "ida_review_limit": ida_review_limit,
             "ida_handoff_max_libraries": ida_handoff_max_libraries,
+            "full_native_index": full_native_index,
+            "full_native_index_timeout_per_library": (
+                full_native_index_timeout_per_library
+            ),
+            "full_native_index_timeout_per_app": (
+                full_native_index_timeout_per_app
+            ),
+            "full_native_index_max_instructions": (
+                full_native_index_max_instructions
+            ),
+            "oss_function_index": (
+                str(oss_function_index) if oss_function_index else None
+            ),
+            "oss_binary_function_index": (
+                str(oss_binary_function_index)
+                if oss_binary_function_index
+                else None
+            ),
+            "reuse_candidate_top_k": reuse_candidate_top_k,
+            "reuse_candidate_min_score": reuse_candidate_min_score,
+            "reuse_candidate_decompile_limit": (
+                reuse_candidate_decompile_limit
+            ),
             "native_target_capabilities": list(native_target_capabilities),
             "app_package": app_package,
             "first_party_native_hashes": sorted(first_party_native_hashes),
@@ -1102,7 +1501,18 @@ def run_phase3_multi(
             ),
         },
         input_paths=apk_paths,
-        upstream_paths=[manifest_path, code_index_path],
+        upstream_paths=[
+            manifest_path,
+            code_index_path,
+            java_method_index_path,
+            *([dex_method_index_path] if full_native_index else []),
+            *([oss_function_index] if oss_function_index is not None else []),
+            *(
+                [oss_binary_function_index]
+                if oss_binary_function_index is not None
+                else []
+            ),
+        ],
         run_context=run_context,
     )
     if not force:
@@ -1159,7 +1569,229 @@ def run_phase3_multi(
     code_index = _load_json_object(code_index_path)
     java_native_hints = build_java_native_hints(code_index, library_records)
 
-    targets = (
+    reuse_candidates: list[dict[str, Any]] = []
+    candidate_targets: list[dict[str, Any]] = []
+    if full_native_index:
+        inventory_jobs_dir = ensure_dir(output_dir / "full_native_index_jobs")
+        if library_records:
+            inventory_backend = run_ida_inventory(
+                library_records,
+                inventory_jobs_dir,
+                install_dir=ida_install_dir,
+                python_executable=ida_python_executable,
+                timeout_per_library=full_native_index_timeout_per_library,
+                timeout_per_app=full_native_index_timeout_per_app,
+                max_retries=ida_max_retries,
+                max_instructions_per_function=full_native_index_max_instructions,
+                progress_callback=_log_ida_progress,
+            )
+        else:
+            inventory_backend = {
+                "schema_version": "2026-08-24.ida-backend.v4",
+                "status": "completed",
+                "job_mode": "inventory_only",
+                "input_library_count": 0,
+                "unique_library_count": 0,
+                "completed_library_count": 0,
+                "indexed_function_count": 0,
+                "library_summaries": [],
+                "message": "No native library was present; Java/Kotlin retrieval remains applicable.",
+            }
+            safe_write_json(
+                inventory_jobs_dir / "ida_inventory_summary.json",
+                inventory_backend,
+            )
+        full_index_summary = _reusable_consolidated_inventory(
+            inventory_backend,
+            full_index_summary_path,
+            full_index_path,
+            full_callgraph_path,
+        ) or _consolidate_native_inventory(
+            inventory_backend,
+            full_index_path,
+            full_callgraph_path,
+        )
+        full_index_summary["backend_summary_path"] = str(
+            inventory_jobs_dir / "ida_inventory_summary.json"
+        )
+        safe_write_json(full_index_summary_path, full_index_summary)
+
+        selected_native_hashes, native_projection = _primary_native_projection(
+            library_records
+        )
+        java_index_available = (
+            java_method_index_path.is_file()
+            and java_method_index_path.stat().st_size > 0
+        )
+        include_dex_in_retrieval = bool(
+            oss_binary_function_index is not None or not java_index_available
+        )
+        commercial_rows = chain(
+            _iter_projected_native_rows(
+                full_index_path,
+                selected_native_hashes,
+            ),
+            iter_jsonl(java_method_index_path),
+            (
+                iter_jsonl(dex_method_index_path)
+                if include_dex_in_retrieval
+                else ()
+            ),
+        )
+        retrieval_summary, reuse_candidates = retrieve_candidates(
+            commercial_rows,
+            chain(
+                iter_jsonl(oss_function_index),
+                (
+                    iter_jsonl(oss_binary_function_index)
+                    if oss_binary_function_index is not None
+                    else ()
+                ),
+            ),
+            top_k=reuse_candidate_top_k,
+            minimum_score=reuse_candidate_min_score,
+            max_candidates_per_commercial=200,
+            project_top_k=12,
+            output_path=reuse_candidates_path,
+            summary_path=reuse_summary_path,
+            checkpoint_path=reuse_checkpoint_path,
+            resume_key=str(cache_spec.get("cache_key") or ""),
+            retained_candidate_limit=0,
+            progress_callback=_log_ida_progress,
+        )
+        retrieval_summary.update(
+            {
+                "full_native_index_status": full_index_summary.get("status"),
+                "full_native_function_count": full_index_summary.get(
+                    "indexed_function_count", 0
+                ),
+                "java_method_index_path": str(java_method_index_path),
+                "java_method_index_available": java_index_available,
+                "dex_method_index_path": str(dex_method_index_path),
+                "dex_method_index_available": dex_method_index_path.is_file(),
+                "dex_included_in_retrieval": include_dex_in_retrieval,
+                "commercial_native_projection": native_projection,
+                "oss_function_index": str(oss_function_index),
+                "oss_binary_function_index": (
+                    str(oss_binary_function_index)
+                    if oss_binary_function_index is not None
+                    else None
+                ),
+                "native_candidate_decompile_limit": (
+                    reuse_candidate_decompile_limit
+                ),
+                "conclusion_boundary": (
+                    "Rows are retrieval candidates for deeper comparison. They are "
+                    "not final similarity scores and do not establish copying."
+                ),
+            }
+        )
+        selection_summary, review_candidates, native_candidate_pool = (
+            select_candidate_cohorts(
+                iter_jsonl(reuse_candidates_path),
+                review_limit=REUSE_REVIEW_LIMIT,
+                native_decompile_limit=reuse_candidate_decompile_limit,
+            )
+        )
+        candidate_targets = native_decompile_targets(
+            native_candidate_pool,
+            limit=reuse_candidate_decompile_limit,
+        )
+        target_lane_counts = Counter(
+            str(target.get("analysis_lane") or "unknown")
+            for target in candidate_targets
+        )
+        selection_summary.update(
+            {
+                "native_decompile_target_count": len(candidate_targets),
+                "native_decompile_target_lane_counts": dict(
+                    sorted(target_lane_counts.items())
+                ),
+                "selection_starved": bool(
+                    selection_summary.get("native_deep_eligible_count", 0)
+                    and not candidate_targets
+                ),
+                "review_candidate_path": str(reuse_review_path),
+            }
+        )
+        write_jsonl(reuse_review_path, review_candidates)
+        safe_write_json(reuse_selection_summary_path, selection_summary)
+        retrieval_summary["review_candidate_count"] = len(review_candidates)
+        retrieval_summary["review_candidate_limit"] = REUSE_REVIEW_LIMIT
+        retrieval_summary["review_candidate_path"] = str(reuse_review_path)
+        retrieval_summary["native_decompile_candidate_count"] = len(
+            candidate_targets
+        )
+        retrieval_summary["candidate_selection"] = selection_summary
+        retrieval_summary["candidate_selection_summary_path"] = str(
+            reuse_selection_summary_path
+        )
+        safe_write_json(reuse_summary_path, retrieval_summary)
+    else:
+        write_jsonl(full_index_path, [])
+        write_jsonl(full_callgraph_path, [])
+        full_index_summary = {
+            "schema_version": NATIVE_FULL_INDEX_SCHEMA,
+            "status": "not_requested",
+            "indexed_function_count": 0,
+            "index_path": str(full_index_path),
+            "message": (
+                "Full native indexing is disabled for this profile; the frozen "
+                "native selector remains active."
+            ),
+        }
+        safe_write_json(full_index_summary_path, full_index_summary)
+        write_jsonl(reuse_candidates_path, [])
+        write_jsonl(reuse_review_path, [])
+        selection_summary = {
+            "schema_version": "2026-08-24.reuse-candidate-selection.v1",
+            "status": "not_requested",
+            "review_candidate_count": 0,
+            "native_deep_eligible_count": 0,
+            "native_decompile_target_count": 0,
+            "selection_starved": False,
+        }
+        safe_write_json(reuse_selection_summary_path, selection_summary)
+        retrieval_summary = {
+            "schema_version": "2026-08-24.reuse-candidate-retrieval.v6",
+            "status": "not_requested",
+            "candidate_pair_count": 0,
+            "review_candidate_count": 0,
+            "review_candidate_limit": REUSE_REVIEW_LIMIT,
+            "review_candidate_path": str(reuse_review_path),
+            "native_decompile_candidate_count": 0,
+            "candidate_selection": selection_summary,
+            "candidate_selection_summary_path": str(
+                reuse_selection_summary_path
+            ),
+            "message": "Open-source candidate retrieval is disabled for this profile.",
+        }
+        safe_write_json(reuse_summary_path, retrieval_summary)
+
+    safe_write_json(
+        reuse_candidate_targets_path,
+        {
+            "schema_version": "2026-08-25.reuse-candidate-targets.v1",
+            "status": "completed" if full_native_index else "not_requested",
+            "target_count": len(candidate_targets),
+            "analysis_lane_counts": dict(
+                sorted(
+                    Counter(
+                        str(target.get("analysis_lane") or "unknown")
+                        for target in candidate_targets
+                    ).items()
+                )
+            ),
+            "targets": candidate_targets,
+            "identity_contract": (
+                "candidate_pair_id, analysis_lane, commercial/source identities, "
+                "and selection evidence are authoritative for downstream IDA and "
+                "post-decompilation comparison."
+            ),
+        },
+    )
+
+    baseline_targets = (
         []
         if native_depth == "none"
         else select_native_targets(
@@ -1171,27 +1803,55 @@ def run_phase3_multi(
             java_native_hints=java_native_hints,
         )
     )
+    targets = _merge_native_targets(
+        candidate_targets,
+        baseline_targets,
+        limit=native_max_functions,
+    )
+    decompile_targets = candidate_targets if full_native_index else targets
     target_payload = {
         "native_depth": native_depth,
         "native_max_functions": native_max_functions,
         "native_max_libraries": native_max_libraries,
         "native_target_capabilities": list(native_target_capabilities),
+        "selection_mode": (
+            "reuse_candidates_then_frozen_baseline"
+            if full_native_index
+            else "frozen_baseline"
+        ),
+        "reuse_candidate_target_count": len(candidate_targets),
+        "reuse_candidate_target_lane_counts": dict(
+            sorted(
+                Counter(
+                    str(target.get("analysis_lane") or "unknown")
+                    for target in candidate_targets
+                ).items()
+            )
+        ),
+        "baseline_target_count": len(baseline_targets),
         "target_count": len(targets),
+        "automated_decompile_target_count": len(decompile_targets),
+        "automated_decompile_scope": (
+            "retrieved_native_candidates_with_callgraph_expansion"
+            if full_native_index
+            else "frozen_baseline_targets"
+        ),
         "targets": targets,
     }
     safe_write_json(targets_path, target_payload)
     decompile_plan = build_decompile_plan(
-        targets,
+        decompile_targets,
         decompiler=native_decompiler if native_depth != "none" else "none",
         max_targets=min(native_max_functions, native_max_decompile_targets),
         max_libraries=native_max_libraries,
         target_capabilities=native_target_capabilities,
         ida_install_dir=ida_install_dir,
+        adaptive_library_budget=full_native_index,
     )
     safe_write_json(decompile_plan_path, decompile_plan)
 
     auto_decision = _auto_decompile_decision(
-        targets,
+        decompile_targets,
         native_decompiler=native_decompiler,
         ida_install_dir=ida_install_dir,
     )
@@ -1213,9 +1873,9 @@ def run_phase3_multi(
             "attempted_targets": 0,
             "results": [],
         }
-    if should_attempt_decompile and targets:
+    if should_attempt_decompile and decompile_targets:
         decompile_result = run_targeted_decompile(
-            targets,
+            decompile_targets,
             decompiled_targets_dir,
             decompiler=native_decompiler,
             timeout_per_function=native_timeout_per_function,
@@ -1227,6 +1887,7 @@ def run_phase3_multi(
             ida_python_executable=ida_python_executable,
             ida_max_retries=ida_max_retries,
             ida_callgraph_depth=ida_callgraph_depth,
+            adaptive_library_budget=full_native_index,
             progress_callback=_log_ida_progress,
         )
         decompile_result["auto_decision"] = auto_decision
@@ -1245,6 +1906,33 @@ def run_phase3_multi(
             "message": "The automated IDA backend was not selected for this run.",
         },
     )
+
+    if full_native_index:
+        deep_comparison_summary = compare_decompiled_candidates(
+            decompile_result,
+            reuse_review_path,
+            [
+                path
+                for path in (oss_function_index, oss_binary_function_index)
+                if path is not None
+            ],
+            deep_comparisons_path,
+            deep_comparison_summary_path,
+            canonical_mapping_path=canonical_implementations_path,
+        )
+    else:
+        write_jsonl(deep_comparisons_path, [])
+        write_jsonl(canonical_implementations_path, [])
+        deep_comparison_summary = {
+            "schema_version": "2026-08-25.open-source-deep-comparison.v2",
+            "status": "not_requested",
+            "source_family_comparison_count": 0,
+            "usage_review_ready_count": 0,
+            "adaptation_review_ready_count": 0,
+            "copying_conclusion_supported": False,
+            "comparison_path": str(deep_comparisons_path),
+        }
+        safe_write_json(deep_comparison_summary_path, deep_comparison_summary)
 
     function_features = _collect_function_features(decompile_result)
     write_jsonl(function_features_path, function_features)
@@ -1300,6 +1988,36 @@ def run_phase3_multi(
         "evidence_units_path": str(evidence_units_path),
         "decompilation_path": str(decompile_path),
         "ida_automated_summary_path": str(ida_automated_summary_path),
+        "full_native_index_path": str(full_index_path),
+        "full_native_index_summary_path": str(full_index_summary_path),
+        "reuse_candidates_path": str(reuse_candidates_path),
+        "reuse_candidates_review_path": str(reuse_review_path),
+        "reuse_candidate_summary_path": str(reuse_summary_path),
+        "reuse_candidate_selection_summary_path": str(
+            reuse_selection_summary_path
+        ),
+        "reuse_candidate_targets_path": str(reuse_candidate_targets_path),
+        "reuse_deep_comparisons_path": str(deep_comparisons_path),
+        "reuse_deep_comparison_summary_path": str(
+            deep_comparison_summary_path
+        ),
+        "reuse_canonical_implementations_path": str(
+            canonical_implementations_path
+        ),
+        "reuse_deep_comparison_status": deep_comparison_summary.get("status"),
+        "reuse_deep_source_family_count": deep_comparison_summary.get(
+            "source_family_comparison_count", 0
+        ),
+        "full_native_index_status": full_index_summary.get("status"),
+        "full_native_function_count": full_index_summary.get(
+            "indexed_function_count", 0
+        ),
+        "reuse_candidate_status": retrieval_summary.get("status"),
+        "reuse_candidate_pair_count": retrieval_summary.get(
+            "candidate_pair_count", 0
+        ),
+        "reuse_candidate_target_count": len(candidate_targets),
+        "automated_decompile_target_count": len(decompile_targets),
         "toolchain_path": str(toolchain_path),
         "function_features_path": str(function_features_path),
         "string_xrefs_path": str(string_xrefs_path),
@@ -1364,6 +2082,32 @@ def run_phase3_multi(
         "deep_summary_path": str(deep_summary_path),
         "decompilation_path": str(decompile_path),
         "ida_automated_summary_path": str(ida_automated_summary_path),
+        "full_native_index_path": str(full_index_path),
+        "full_native_index_summary_path": str(full_index_summary_path),
+        "full_native_index_status": full_index_summary.get("status"),
+        "full_native_function_count": full_index_summary.get(
+            "indexed_function_count", 0
+        ),
+        "reuse_candidates_path": str(reuse_candidates_path),
+        "reuse_candidates_review_path": str(reuse_review_path),
+        "reuse_candidate_summary_path": str(reuse_summary_path),
+        "reuse_candidate_selection_summary_path": str(
+            reuse_selection_summary_path
+        ),
+        "reuse_candidate_targets_path": str(reuse_candidate_targets_path),
+        "reuse_deep_comparisons_path": str(deep_comparisons_path),
+        "reuse_deep_comparison_summary_path": str(
+            deep_comparison_summary_path
+        ),
+        "reuse_deep_comparison_status": deep_comparison_summary.get("status"),
+        "reuse_deep_source_family_count": deep_comparison_summary.get(
+            "source_family_comparison_count", 0
+        ),
+        "reuse_candidate_status": retrieval_summary.get("status"),
+        "reuse_candidate_pair_count": retrieval_summary.get(
+            "candidate_pair_count", 0
+        ),
+        "reuse_candidate_target_count": len(candidate_targets),
         "native_evidence_unit_count": len(native_evidence_units),
         "native_function_feature_count": len(function_features),
         "ida_candidate_count": ida_manifest.get("candidate_count"),
@@ -1377,7 +2121,7 @@ def run_phase3_multi(
     decompile_failures = [item for item in decompile_results if not item.get("success")]
     requested_decompile_incomplete = bool(
         should_attempt_decompile
-        and targets
+        and decompile_targets
         and decompile_result.get("status") != "completed"
     )
     manual_ida_import_incomplete = manual_ida_import.get("status") in {
@@ -1388,6 +2132,13 @@ def run_phase3_multi(
         "partial",
         "failed",
     }
+    reuse_search_incomplete = bool(
+        full_native_index
+        and (
+            full_index_summary.get("status") != "completed"
+            or retrieval_summary.get("status") != "completed"
+        )
+    )
     if extraction_errors and not library_records:
         status = "failed"
     elif (
@@ -1395,6 +2146,7 @@ def run_phase3_multi(
         or requested_decompile_incomplete
         or manual_ida_import_incomplete
         or ida_handoff_incomplete
+        or reuse_search_incomplete
     ):
         status = "partial"
     else:
@@ -1422,6 +2174,11 @@ def run_phase3_multi(
         warnings.append(
             "One or more ranked native libraries could not be packaged for IDA; "
             "see ida_handoff_manifest.json."
+        )
+    if reuse_search_incomplete:
+        warnings.append(
+            "Full native indexing or open-source candidate retrieval was incomplete; "
+            "baseline native evidence was retained."
         )
     result = PhaseResult(
         name="phase3_native",
@@ -1452,6 +2209,22 @@ def run_phase3_multi(
             "manual_ida_status": manual_ida_import.get("status"),
             "manual_ida_accepted_count": manual_ida_import.get("accepted_count"),
             "manual_ida_rejected_count": manual_ida_import.get("rejected_count"),
+            "full_native_index_status": full_index_summary.get("status"),
+            "full_native_function_count": full_index_summary.get(
+                "indexed_function_count", 0
+            ),
+            "reuse_candidate_status": retrieval_summary.get("status"),
+            "reuse_candidate_pair_count": retrieval_summary.get(
+                "candidate_pair_count", 0
+            ),
+            "reuse_candidate_target_count": len(candidate_targets),
+            "automated_decompile_target_count": len(decompile_targets),
+            "reuse_deep_comparison_status": deep_comparison_summary.get(
+                "status"
+            ),
+            "reuse_deep_source_family_count": deep_comparison_summary.get(
+                "source_family_comparison_count", 0
+            ),
         },
         warnings=warnings,
     )

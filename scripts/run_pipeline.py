@@ -32,15 +32,23 @@ def non_negative_int(value: str) -> int:
     return parsed
 
 
+def unit_interval(value: str) -> float:
+    parsed = float(value)
+    if not 0 <= parsed <= 1:
+        raise argparse.ArgumentTypeError("value must be between zero and one")
+    return parsed
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the APK research extraction pipeline.")
     parser.add_argument(
         "--profile",
-        choices=["standard", "ida-handoff", "ida-classroom"],
+        choices=["standard", "ida-handoff", "ida-classroom", "reuse-search"],
         default="standard",
         help=(
             "Named analysis preset. ida-handoff produces a manual review package; "
-            "ida-classroom runs the isolated IDALib/Hex-Rays backend."
+            "ida-classroom runs the isolated IDALib/Hex-Rays backend; "
+            "reuse-search adds full lightweight indexing and open-source candidate retrieval."
         ),
     )
     parser.add_argument("--apk", type=Path, help="Path to .apk, .apkm, .apks, or .xapk input.")
@@ -156,6 +164,59 @@ def parse_args() -> argparse.Namespace:
         help="Maximum unique library/ABI binaries included in phase3_native/ida_handoff.zip.",
     )
     parser.add_argument(
+        "--full-native-index-timeout-per-library",
+        type=positive_int,
+        default=None,
+        help="Timeout in seconds for one lightweight full-library IDA indexing job.",
+    )
+    parser.add_argument(
+        "--full-native-index-timeout-per-app",
+        type=positive_int,
+        default=None,
+        help="Total timeout in seconds for full native indexing across one app.",
+    )
+    parser.add_argument(
+        "--full-native-index-max-instructions",
+        type=positive_int,
+        default=None,
+        help="Maximum disassembly instructions sampled per indexed native function.",
+    )
+    parser.add_argument(
+        "--oss-function-index",
+        type=Path,
+        help="Frozen OSS source function_index.jsonl used by the reuse-search profile.",
+    )
+    parser.add_argument(
+        "--oss-compiled-function-index",
+        "--oss-binary-function-index",
+        dest="oss_binary_function_index",
+        type=Path,
+        metavar="PATH",
+        help=(
+            "Optional compiled OSS function index containing native and/or DEX "
+            "representations. The older --oss-binary-function-index name remains "
+            "accepted as an alias."
+        ),
+    )
+    parser.add_argument(
+        "--reuse-candidate-top-k",
+        type=positive_int,
+        default=None,
+        help="Maximum open-source retrieval candidates retained per commercial function.",
+    )
+    parser.add_argument(
+        "--reuse-candidate-min-score",
+        type=unit_interval,
+        default=None,
+        help="Minimum explainable retrieval score; this is not a copying probability.",
+    )
+    parser.add_argument(
+        "--reuse-candidate-decompile-limit",
+        type=positive_int,
+        default=None,
+        help="Maximum native reuse candidates allowed to consume Hex-Rays budget.",
+    )
+    parser.add_argument(
         "--native-target-capabilities",
         default="",
         help="Comma-separated capability names to prioritize during native target selection.",
@@ -225,6 +286,7 @@ def main() -> int:
                 "standard": "auto",
                 "ida-handoff": "none",
                 "ida-classroom": "ida",
+                "reuse-search": "ida",
             }[args.profile]
         toolchain = detect_native_toolchain(
             preferred_decompiler,
@@ -265,6 +327,12 @@ def main() -> int:
             "ida_callgraph_depth": 2,
             "ida_review_limit": 120,
             "ida_handoff_max_libraries": 12,
+            "full_native_index_timeout_per_library": 1200,
+            "full_native_index_timeout_per_app": 14_400,
+            "full_native_index_max_instructions": 512,
+            "reuse_candidate_top_k": 10,
+            "reuse_candidate_min_score": 0.28,
+            "reuse_candidate_decompile_limit": 120,
         },
         "ida-handoff": {
             "native_depth": "targeted",
@@ -278,6 +346,12 @@ def main() -> int:
             "ida_callgraph_depth": 1,
             "ida_review_limit": 240,
             "ida_handoff_max_libraries": 12,
+            "full_native_index_timeout_per_library": 1200,
+            "full_native_index_timeout_per_app": 14_400,
+            "full_native_index_max_instructions": 512,
+            "reuse_candidate_top_k": 10,
+            "reuse_candidate_min_score": 0.28,
+            "reuse_candidate_decompile_limit": 120,
         },
         "ida-classroom": {
             "native_depth": "deep",
@@ -291,11 +365,63 @@ def main() -> int:
             "ida_callgraph_depth": 2,
             "ida_review_limit": 300,
             "ida_handoff_max_libraries": 20,
+            "full_native_index_timeout_per_library": 1200,
+            "full_native_index_timeout_per_app": 14_400,
+            "full_native_index_max_instructions": 512,
+            "reuse_candidate_top_k": 10,
+            "reuse_candidate_min_score": 0.28,
+            "reuse_candidate_decompile_limit": 120,
+        },
+        "reuse-search": {
+            "native_depth": "deep",
+            "native_max_functions": 1200,
+            "native_decompiler": "ida",
+            "native_max_libraries": 64,
+            "native_max_decompile_targets": 180,
+            "native_timeout_per_function": 120,
+            "native_timeout_per_app": 14_400,
+            "ida_max_retries": 1,
+            "ida_callgraph_depth": 2,
+            "ida_review_limit": 400,
+            "ida_handoff_max_libraries": 20,
+            "full_native_index_timeout_per_library": 1200,
+            "full_native_index_timeout_per_app": 28_800,
+            "full_native_index_max_instructions": 512,
+            "reuse_candidate_top_k": 10,
+            "reuse_candidate_min_score": 0.28,
+            "reuse_candidate_decompile_limit": 140,
         },
     }[args.profile]
     for name, value in profile_defaults.items():
         if getattr(args, name) is None:
             setattr(args, name, value)
+
+    full_native_index = args.profile == "reuse-search"
+    if full_native_index and args.oss_function_index is None:
+        default_index = (
+            REPO_ROOT.parent
+            / "research"
+            / "oss_provenance"
+            / "source_index"
+            / "output"
+            / "function_index.jsonl"
+        )
+        args.oss_function_index = default_index
+    if full_native_index and not args.oss_function_index.expanduser().is_file():
+        raise SystemExit(
+            "reuse-search requires a readable OSS function index; provide "
+            "--oss-function-index. Expected default: "
+            f"{args.oss_function_index}"
+        )
+    if (
+        full_native_index
+        and args.oss_binary_function_index is not None
+        and not args.oss_binary_function_index.expanduser().is_file()
+    ):
+        raise SystemExit(
+            "--oss-compiled-function-index does not name a readable file: "
+            f"{args.oss_binary_function_index}"
+        )
 
     config = PipelineConfig(
         apk_path=args.apk,
@@ -307,6 +433,7 @@ def main() -> int:
         jadx_threads=args.jadx_threads,
         jadx_timeout_per_apk=args.jadx_timeout_per_apk,
         jadx_download=not args.no_jadx_download,
+        dex_method_index=full_native_index,
         log_level=args.log_level,
         decompile_all_splits=not args.no_decompile_all_splits,
         resource_scan=not args.no_resource_scan,
@@ -324,6 +451,19 @@ def main() -> int:
         ida_callgraph_depth=args.ida_callgraph_depth,
         ida_review_limit=args.ida_review_limit,
         ida_handoff_max_libraries=args.ida_handoff_max_libraries,
+        full_native_index=full_native_index,
+        full_native_index_timeout_per_library=(
+            args.full_native_index_timeout_per_library
+        ),
+        full_native_index_timeout_per_app=args.full_native_index_timeout_per_app,
+        full_native_index_max_instructions=(
+            args.full_native_index_max_instructions
+        ),
+        oss_function_index=args.oss_function_index,
+        oss_binary_function_index=args.oss_binary_function_index,
+        reuse_candidate_top_k=args.reuse_candidate_top_k,
+        reuse_candidate_min_score=args.reuse_candidate_min_score,
+        reuse_candidate_decompile_limit=args.reuse_candidate_decompile_limit,
         native_target_capabilities=tuple(
             item.strip()
             for item in args.native_target_capabilities.split(",")

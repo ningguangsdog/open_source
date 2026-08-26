@@ -16,6 +16,7 @@ from apk_pipeline.ida_integration import (
     import_manual_ida_results,
 )
 from apk_pipeline.native_decompiler import (
+    _prioritized_library_paths,
     _resolve_function_seek,
     run_targeted_decompile,
     select_native_targets,
@@ -220,6 +221,85 @@ class Phase3IDAIntegrationTests(unittest.TestCase):
         self.assertEqual(
             manifest["review_queue"][0]["abi"],
             "arm64-v8a",
+        )
+
+    def test_library_budget_prefers_unique_primary_abi_proprietary_inputs(self) -> None:
+        targets = [
+            {
+                "library": "/x86/libcore.so",
+                "score": 100,
+                "abi": "x86_64",
+                "library_sha256": "b" * 64,
+                "abi_analysis_role": "secondary_production",
+                "ownership": {"category": "unknown"},
+            },
+            {
+                "library": "/arm64/libcore.so",
+                "score": 90,
+                "abi": "arm64-v8a",
+                "library_sha256": "a" * 64,
+                "abi_analysis_role": "primary_production",
+                "ownership": {"category": "unknown"},
+            },
+            {
+                "library": "/arm64/libdocument.so",
+                "score": 80,
+                "abi": "arm64-v8a",
+                "library_sha256": "c" * 64,
+                "abi_analysis_role": "primary_production",
+                "ownership": {"category": "unknown"},
+            },
+            {
+                "library": "/arm64/libopencv_java4.so",
+                "score": 500,
+                "abi": "arm64-v8a",
+                "library_sha256": "d" * 64,
+                "abi_analysis_role": "primary_production",
+                "ownership": {"category": "third_party"},
+            },
+        ]
+        selected = _prioritized_library_paths(targets, 2)
+        self.assertEqual(
+            selected,
+            {"/arm64/libcore.so", "/arm64/libdocument.so"},
+        )
+
+    def test_library_budget_keeps_distinct_same_abi_feature_libraries(self) -> None:
+        targets = [
+            {
+                "library": "/feature-a/arm64/libcore.so",
+                "score": 100,
+                "abi": "arm64-v8a",
+                "library_sha256": "a" * 64,
+                "abi_analysis_role": "primary_production",
+                "ownership": {"category": "unknown"},
+            },
+            {
+                "library": "/feature-b/arm64/libcore.so",
+                "score": 90,
+                "abi": "arm64-v8a",
+                "library_sha256": "b" * 64,
+                "abi_analysis_role": "primary_production",
+                "ownership": {"category": "unknown"},
+            },
+            {
+                "library": "/feature-a/x86/libcore.so",
+                "score": 120,
+                "abi": "x86_64",
+                "library_sha256": "c" * 64,
+                "abi_analysis_role": "secondary_production",
+                "ownership": {"category": "unknown"},
+            },
+        ]
+
+        selected = _prioritized_library_paths(targets, 2)
+
+        self.assertEqual(
+            selected,
+            {
+                "/feature-a/arm64/libcore.so",
+                "/feature-b/arm64/libcore.so",
+            },
         )
 
     def test_ida_queue_and_handoff_cover_multiple_libraries(self) -> None:

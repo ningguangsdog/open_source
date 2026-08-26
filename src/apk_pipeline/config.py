@@ -15,6 +15,7 @@ class PipelineConfig:
     jadx_threads: int = 4
     jadx_timeout_per_apk: int = 1800
     jadx_download: bool = True
+    dex_method_index: bool = False
     log_level: str = "INFO"
     decompile_all_splits: bool = True
     resource_scan: bool = True
@@ -32,6 +33,15 @@ class PipelineConfig:
     ida_callgraph_depth: int = 2
     ida_review_limit: int = 120
     ida_handoff_max_libraries: int = 12
+    full_native_index: bool = False
+    full_native_index_timeout_per_library: int = 1200
+    full_native_index_timeout_per_app: int = 14_400
+    full_native_index_max_instructions: int = 512
+    oss_function_index: Path | None = None
+    oss_binary_function_index: Path | None = None
+    reuse_candidate_top_k: int = 10
+    reuse_candidate_min_score: float = 0.28
+    reuse_candidate_decompile_limit: int = 120
     native_target_capabilities: tuple[str, ...] = ()
     max_snippets_per_capability: int = 40
     first_party_prefixes: tuple[str, ...] = ()

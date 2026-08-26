@@ -35,7 +35,7 @@ from .utils import ensure_dir, safe_write_json
 
 logger = logging.getLogger(__name__)
 PIPELINE_VERSION_LABEL = (
-    "July 5 + Native Deep v1 + IDA Classroom Automation v1"
+    "July 5 + Native Deep v1 + IDA Classroom Automation v1 + Reuse Search v1"
 )
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -169,6 +169,7 @@ class APKPipeline:
                         jadx_timeout_per_apk=self.config.jadx_timeout_per_apk,
                         no_jadx_download=not self.config.jadx_download,
                         decompile_all_splits=self.config.decompile_all_splits,
+                        build_direct_dex_index=self.config.dex_method_index,
                         max_snippets_per_capability=self.config.max_snippets_per_capability,
                         first_party_prefixes=self.config.first_party_prefixes,
                         third_party_prefixes=self.config.third_party_prefixes,
@@ -194,6 +195,27 @@ class APKPipeline:
                         ida_callgraph_depth=self.config.ida_callgraph_depth,
                         ida_review_limit=self.config.ida_review_limit,
                         ida_handoff_max_libraries=self.config.ida_handoff_max_libraries,
+                        full_native_index=self.config.full_native_index,
+                        full_native_index_timeout_per_library=(
+                            self.config.full_native_index_timeout_per_library
+                        ),
+                        full_native_index_timeout_per_app=(
+                            self.config.full_native_index_timeout_per_app
+                        ),
+                        full_native_index_max_instructions=(
+                            self.config.full_native_index_max_instructions
+                        ),
+                        oss_function_index=self.config.oss_function_index,
+                        oss_binary_function_index=(
+                            self.config.oss_binary_function_index
+                        ),
+                        reuse_candidate_top_k=self.config.reuse_candidate_top_k,
+                        reuse_candidate_min_score=(
+                            self.config.reuse_candidate_min_score
+                        ),
+                        reuse_candidate_decompile_limit=(
+                            self.config.reuse_candidate_decompile_limit
+                        ),
                         native_target_capabilities=self.config.native_target_capabilities,
                         first_party_native_hashes=self.config.first_party_native_hashes,
                         third_party_native_hashes=self.config.third_party_native_hashes,
@@ -269,6 +291,7 @@ class APKPipeline:
             phases,
             expect_automated_ida=self.config.native_decompiler == "ida",
             require_evidence_packet=self.config.emit_evidence_packets,
+            expect_reuse_search=self.config.full_native_index,
         )
         summary = PipelineSummary(
             apk_filename=Path(self.config.apk_path).name,
@@ -292,7 +315,12 @@ class APKPipeline:
         config_payload = asdict(self.config)
         config_payload["apk_path"] = str(config_payload["apk_path"])
         config_payload["workspace"] = str(config_payload["workspace"])
-        for path_key in ("ida_install_dir", "ida_python_executable"):
+        for path_key in (
+            "ida_install_dir",
+            "ida_python_executable",
+            "oss_function_index",
+            "oss_binary_function_index",
+        ):
             if config_payload[path_key] is not None:
                 config_payload[path_key] = str(config_payload[path_key])
         config_payload["native_target_capabilities"] = list(config_payload["native_target_capabilities"])
