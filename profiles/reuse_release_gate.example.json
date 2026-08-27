@@ -1,0 +1,64 @@
+{
+  "schema_version": "2026-08-26.reuse-release-contract.v1",
+  "cases": [
+    {
+      "id": "xodo",
+      "validation_status": "passed",
+      "required_source_patterns": [],
+      "required_native_component_patterns": [
+        "Apryse.*PDFNet",
+        "Google ML Kit OCR",
+        "Google ML Kit Translation",
+        "Google ML Kit Language Identification",
+        "AndroidX DataStore"
+      ],
+      "forbidden_managed_commercial_patterns": [
+        "com[/\\\\.]pdftron",
+        "com[/\\\\.]apryse",
+        "com[/\\\\.]osano"
+      ],
+      "forbidden_managed_method_patterns": [
+        "^(hashCode|toString|equals|clone|finalize|getClass)$"
+      ],
+      "max_successful_ida_functions": 0,
+      "copying_conclusion_supported": false
+    },
+    {
+      "id": "mobipdf",
+      "validation_status": "passed",
+      "required_source_patterns": [
+        "primetang/pylsd|IPOL.*LSD"
+      ],
+      "required_native_component_patterns": [],
+      "forbidden_managed_commercial_patterns": [],
+      "forbidden_managed_method_patterns": [
+        "^(hashCode|toString|equals|clone|finalize|getClass)$"
+      ],
+      "copying_conclusion_supported": false
+    },
+    {
+      "id": "camscanner",
+      "validation_status": "passed",
+      "required_source_patterns": [
+        "CihanTopal/ED_Lib"
+      ],
+      "required_native_component_patterns": [],
+      "forbidden_managed_commercial_patterns": [],
+      "forbidden_managed_method_patterns": [
+        "^(hashCode|toString|equals|clone|finalize|getClass)$"
+      ],
+      "copying_conclusion_supported": false
+    },
+    {
+      "id": "adobe",
+      "validation_status": "passed",
+      "required_source_patterns": [],
+      "required_native_component_patterns": [],
+      "forbidden_managed_commercial_patterns": [],
+      "forbidden_managed_method_patterns": [
+        "^(hashCode|toString|equals|clone|finalize|getClass)$"
+      ],
+      "copying_conclusion_supported": false
+    }
+  ]
+}

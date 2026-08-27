@@ -20,6 +20,7 @@ from .phase3_native import run_phase3_multi
 from .phase4_resources import run_phase4_resources
 from .phase5_evidence import run_phase5_evidence
 from .result_validation import write_pipeline_validation
+from .reuse_regression import REGRESSION_SCHEMA, run_reuse_regression
 from .run_context import (
     assert_workspace_identity,
     assert_workspace_original_input,
@@ -35,7 +36,7 @@ from .utils import ensure_dir, safe_write_json
 
 logger = logging.getLogger(__name__)
 PIPELINE_VERSION_LABEL = (
-    "July 5 + Native Deep v1 + IDA Classroom Automation v1 + Reuse Search v1"
+    "July 5 + Native Deep v1 + IDA Classroom Automation v1 + Reuse Search v2"
 )
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -271,6 +272,7 @@ class APKPipeline:
                     )
                 )
 
+        regression_requested = self.config.reuse_regression_labels is not None
         for phase_name, call in phase_calls:
             try:
                 result = call()
@@ -285,6 +287,31 @@ class APKPipeline:
                     error=repr(exc),
                 )
             phases.append(result)
+            if regression_requested and phase_name == "phase3_native":
+                regression_path = (
+                    workspace / "phase3_native" / "reuse_regression.json"
+                )
+                try:
+                    run_reuse_regression(
+                        workspace
+                        / "phase3_native"
+                        / "reuse_candidates.jsonl",
+                        self.config.reuse_regression_labels.expanduser().resolve(),
+                        regression_path,
+                    )
+                except Exception as exc:
+                    logger.exception("Known-positive reuse regression failed")
+                    safe_write_json(
+                        regression_path,
+                        {
+                            "schema_version": REGRESSION_SCHEMA,
+                            "status": "error",
+                            "error": repr(exc),
+                            "labels_path": str(
+                                self.config.reuse_regression_labels
+                            ),
+                        },
+                    )
 
         validation = write_pipeline_validation(
             workspace,
@@ -292,6 +319,8 @@ class APKPipeline:
             expect_automated_ida=self.config.native_decompiler == "ida",
             require_evidence_packet=self.config.emit_evidence_packets,
             expect_reuse_search=self.config.full_native_index,
+            expect_reuse_regression=regression_requested,
+            strict_reuse_regression=self.config.strict_reuse_regression,
         )
         summary = PipelineSummary(
             apk_filename=Path(self.config.apk_path).name,
@@ -320,6 +349,7 @@ class APKPipeline:
             "ida_python_executable",
             "oss_function_index",
             "oss_binary_function_index",
+            "reuse_regression_labels",
         ):
             if config_payload[path_key] is not None:
                 config_payload[path_key] = str(config_payload[path_key])

@@ -20,7 +20,7 @@ from .run_context import (
 from .utils import ensure_dir, safe_write_json, safe_write_text
 
 
-PHASE_SCHEMA = "2026-08-25.phase5.v15"
+PHASE_SCHEMA = "2026-08-26.phase5.v17"
 SIMILARITY_UNIT_LIMIT = 250
 REUSE_EVIDENCE_UNIT_LIMIT = 5000
 REUSE_PACKET_CANDIDATE_LIMIT = 200
@@ -659,6 +659,74 @@ def _collect_evidence_units(workspace: Path) -> list[dict[str, Any]]:
                 "source_file": str(deep_source),
             }
         )
+    managed_deep_source = (
+        workspace / "phase3_native" / "managed_reuse_deep_comparisons.jsonl"
+    )
+    for row in _load_jsonl(
+        managed_deep_source,
+        limit=DEEP_COMPARISON_EVIDENCE_UNIT_LIMIT,
+    ):
+        commercial = row.get("commercial") or {}
+        source = row.get("source") or {}
+        claim = row.get("claim_eligibility") or {}
+        units.append(
+            {
+                "unit_id": unit_id(
+                    "managed_reuse_deep_comparison",
+                    row.get("comparison_id"),
+                    row.get("candidate_pair_id"),
+                    row.get("source_family"),
+                ),
+                "phase": "phase3_native",
+                "kind": "open_source_managed_deep_comparison",
+                "confidence": float(row.get("deep_comparison_score") or 0),
+                "score": float(row.get("deep_comparison_score") or 0),
+                "deep_comparison_score": row.get("deep_comparison_score"),
+                "retrieval_score": row.get("retrieval_score"),
+                "analysis_lane": row.get("analysis_lane"),
+                "candidate_pair_id": row.get("candidate_pair_id"),
+                "relationship_assessment": row.get(
+                    "relationship_assessment"
+                ),
+                "independent_signal_count": row.get(
+                    "independent_signal_count"
+                ),
+                "independent_signals": row.get("independent_signals") or [],
+                "deep_components": row.get("components") or {},
+                "commercial_function": commercial,
+                "open_source_function": source,
+                "source_family": row.get("source_family"),
+                "source_project": row.get("source_project"),
+                "name": commercial.get("name"),
+                "file": commercial.get("file"),
+                "line": commercial.get("start_line"),
+                "ownership": commercial.get("ownership") or {},
+                "comparison_eligible": bool(
+                    claim.get("usage_review") or claim.get("adaptation_review")
+                ),
+                "claim_eligibility": {
+                    "usage_review": bool(claim.get("usage_review")),
+                    "adaptation_review": bool(claim.get("adaptation_review")),
+                    "copying_conclusion": False,
+                },
+                "traceability": {
+                    "retrieval_candidate_pair_id": row.get(
+                        "candidate_pair_id"
+                    ),
+                    "managed_representation_available": True,
+                    "ida_required": False,
+                    "deep_comparison_available": True,
+                    "deep_comparison_id": row.get("comparison_id"),
+                    "claim_review_eligible": bool(
+                        claim.get("usage_review")
+                        or claim.get("adaptation_review")
+                    ),
+                },
+                "evidence_scope": "managed_source_or_bytecode_deep_comparison",
+                "conclusion_boundary": row.get("conclusion_boundary"),
+                "source_file": str(managed_deep_source),
+            }
+        )
     probe_root = workspace / "phase3_native" / "probes"
     if probe_root.exists():
         for source in sorted(probe_root.glob("*/native_probe_review_units.jsonl")):
@@ -1281,6 +1349,37 @@ def _render_markdown(packet: dict[str, Any]) -> str:
         lines.append("- Native libraries:")
         for ownership, count in sorted(native_ownership_counts.items()):
             lines.append(f"  - {ownership}: {count} libraries")
+        confirmed_components = (
+            native_attribution.get("confirmed_dependency_components") or []
+        )
+        if confirmed_components:
+            lines.append("- Confirmed native dependencies:")
+            for component in confirmed_components[:50]:
+                label = ": ".join(
+                    value
+                    for value in (
+                        str(component.get("vendor") or ""),
+                        str(component.get("component") or ""),
+                    )
+                    if value
+                )
+                lines.append(
+                    f"  - {label or 'unnamed dependency'} "
+                    f"({component.get('library') or 'unknown library'})"
+                )
+        unconfirmed_components = (
+            native_attribution.get("unconfirmed_component_clues") or []
+        )
+        if unconfirmed_components:
+            lines.append(
+                "- Unconfirmed component-name clues: "
+                f"{len(unconfirmed_components)} (retained as unknown ownership)"
+            )
+        lines.append(
+            "- Confirmed dependencies support dependency/usage analysis only; "
+            "unknown ownership remains a coverage boundary and is not treated as "
+            "proprietary evidence."
+        )
     else:
         lines.append("- Native ownership attribution was unavailable.")
     dependency_counts = (
@@ -1327,6 +1426,8 @@ def _render_markdown(packet: dict[str, Any]) -> str:
     reuse_search = packet.get("reuse_search") or {}
     retrieval = reuse_search.get("retrieval_summary") or {}
     full_index = reuse_search.get("native_full_index_summary") or {}
+    native_deep = reuse_search.get("deep_comparison_summary") or {}
+    managed_deep = reuse_search.get("managed_deep_comparison_summary") or {}
     lines.append("## Open-Source Reuse Candidate Search")
     if reuse_search.get("enabled"):
         lines.append(
@@ -1345,6 +1446,18 @@ def _render_markdown(packet: dict[str, Any]) -> str:
         lines.append(
             f"- Candidate preview retained here: {len(reuse_search.get('candidate_preview') or [])}; "
             f"complete candidates: {reuse_search.get('candidate_path') or 'missing'}"
+        )
+        lines.append(
+            f"- Native post-IDA comparisons: "
+            f"{native_deep.get('source_family_comparison_count') or 0}; "
+            f"managed-code bounded comparisons: "
+            f"{managed_deep.get('comparison_count') or 0}"
+        )
+        lines.append(
+            f"- Review-ready usage candidates: "
+            f"{int(native_deep.get('usage_review_ready_count') or 0) + int(managed_deep.get('usage_review_ready_count') or 0)}; "
+            f"adaptation candidates: "
+            f"{int(native_deep.get('adaptation_review_ready_count') or 0) + int(managed_deep.get('adaptation_review_ready_count') or 0)}"
         )
         lines.append(
             "- Retrieval scores prioritize review. They are not copying probabilities or "
@@ -1573,7 +1686,14 @@ def run_phase5_evidence(
         / "phase3_native"
         / "reuse_candidate_selection_summary.json",
         workspace / "phase3_native" / "reuse_deep_comparisons.jsonl",
+        workspace
+        / "phase3_native"
+        / "managed_reuse_deep_comparisons.jsonl",
+        workspace
+        / "phase3_native"
+        / "managed_reuse_deep_comparison_summary.json",
         workspace / "phase3_native" / "reuse_deep_comparison_summary.json",
+        workspace / "phase3_native" / "reuse_regression.json",
         workspace / "phase3_native" / "cache_manifest.json",
     ]
     if require_resources:
@@ -1651,8 +1771,22 @@ def run_phase5_evidence(
     reuse_deep_summary = _load_json(
         workspace / "phase3_native" / "reuse_deep_comparison_summary.json"
     )
+    managed_reuse_deep_summary = _load_json(
+        workspace
+        / "phase3_native"
+        / "managed_reuse_deep_comparison_summary.json"
+    )
+    reuse_regression = _load_json(
+        workspace / "phase3_native" / "reuse_regression.json"
+    )
     reuse_deep_preview = _load_jsonl(
         workspace / "phase3_native" / "reuse_deep_comparisons.jsonl",
+        limit=REUSE_PACKET_CANDIDATE_LIMIT,
+    )
+    managed_reuse_deep_preview = _load_jsonl(
+        workspace
+        / "phase3_native"
+        / "managed_reuse_deep_comparisons.jsonl",
         limit=REUSE_PACKET_CANDIDATE_LIMIT,
     )
     reuse_review_source = _reuse_review_source(workspace)
@@ -1670,9 +1804,20 @@ def run_phase5_evidence(
         "retrieval_summary": reuse_candidate_summary,
         "selection_summary": reuse_selection_summary,
         "deep_comparison_summary": reuse_deep_summary,
+        "managed_deep_comparison_summary": managed_reuse_deep_summary,
+        "known_positive_regression": reuse_regression,
+        "known_positive_regression_path": str(
+            workspace / "phase3_native" / "reuse_regression.json"
+        ),
         "deep_comparison_preview": reuse_deep_preview,
+        "managed_deep_comparison_preview": managed_reuse_deep_preview,
         "deep_comparison_path": str(
             workspace / "phase3_native" / "reuse_deep_comparisons.jsonl"
+        ),
+        "managed_deep_comparison_path": str(
+            workspace
+            / "phase3_native"
+            / "managed_reuse_deep_comparisons.jsonl"
         ),
         "candidate_preview_limit": REUSE_PACKET_CANDIDATE_LIMIT,
         "candidate_preview": reuse_candidate_preview,
@@ -1730,6 +1875,7 @@ def run_phase5_evidence(
         "index_coverage": code_index.get("index_coverage"),
         "files_truncated": code_index.get("files_truncated"),
         "files_excluded_count": code_index.get("files_excluded_count"),
+        "managed_code_coverage": code_index.get("managed_code_coverage") or {},
     }
     similarity_packet["java_code_attribution"] = java_code_attribution
     native_code_attribution = {
@@ -1744,6 +1890,23 @@ def run_phase5_evidence(
         ),
         "excluded_dependency_capability_counts": (
             native_analysis.get("excluded_dependency_capability_counts") or {}
+        ),
+        "component_library_counts": (
+            native_analysis.get("component_library_counts") or {}
+        ),
+        "native_component_inventory": (
+            native_analysis.get("native_component_inventory") or []
+        ),
+        "confirmed_dependency_components": (
+            native_analysis.get("native_dependency_components") or []
+        ),
+        "unconfirmed_component_clues": (
+            native_analysis.get("unconfirmed_native_component_clues") or []
+        ),
+        "interpretation": (
+            "Confirmed third-party and platform components are retained for dependency "
+            "and usage analysis but excluded from adaptation claims. Unknown ownership "
+            "is a coverage boundary, not evidence of proprietary authorship."
         ),
     }
     similarity_packet["native_code_attribution"] = native_code_attribution
@@ -1876,6 +2039,16 @@ def run_phase5_evidence(
                 / "phase3_native"
                 / "reuse_deep_comparison_summary.json"
             ),
+            "managed_reuse_deep_comparisons": str(
+                workspace
+                / "phase3_native"
+                / "managed_reuse_deep_comparisons.jsonl"
+            ),
+            "managed_reuse_deep_comparison_summary": str(
+                workspace
+                / "phase3_native"
+                / "managed_reuse_deep_comparison_summary.json"
+            ),
             "ida_target_manifest": str(
                 workspace / "phase3_native" / "ida_target_manifest.json"
             ),
@@ -1965,6 +2138,19 @@ def run_phase5_evidence(
             ),
             "reuse_adaptation_review_ready_count": int(
                 reuse_deep_summary.get("adaptation_review_ready_count") or 0
+            ),
+            "managed_reuse_deep_comparison_count": int(
+                managed_reuse_deep_summary.get("comparison_count") or 0
+            ),
+            "managed_reuse_usage_review_ready_count": int(
+                managed_reuse_deep_summary.get("usage_review_ready_count")
+                or 0
+            ),
+            "managed_reuse_adaptation_review_ready_count": int(
+                managed_reuse_deep_summary.get(
+                    "adaptation_review_ready_count"
+                )
+                or 0
             ),
             "java_native_bridge_mapping_count": bridge_map.get("mapping_count"),
             "similarity_packet": str(similarity_packet_path),

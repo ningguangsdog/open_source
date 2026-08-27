@@ -8,6 +8,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 from typing import Any, Callable, Iterable, TextIO
 
 from .function_fingerprint import (
@@ -21,6 +22,7 @@ from .source_candidate_policy import (
     annotate_source_policy,
     source_analysis_lane,
 )
+from .source_provenance import canonical_source_project
 from .utils import safe_write_json
 
 
@@ -87,6 +89,22 @@ GENERIC_FUNCTION_TOKENS = {
     "tostring",
     "update",
 }
+MANAGED_GENERIC_METHOD_NAMES = {
+    "clone",
+    "compareto",
+    "equals",
+    "finalize",
+    "getclass",
+    "hashcode",
+    "tostring",
+}
+MANAGED_GENERATED_METHOD_RE = re.compile(
+    r"^(?:access\$\d+|component\d+|copy\$default|lambda\$.*|.*\$default)$",
+    re.IGNORECASE,
+)
+MANAGED_ACCESSOR_METHOD_RE = re.compile(
+    r"^(?:get|set|is|has)[A-Z_][A-Za-z0-9_$]*$"
+)
 ProgressCallback = Callable[[dict[str, Any]], None]
 
 
@@ -439,12 +457,7 @@ def _posting_tokens(features: dict[str, Any]) -> set[str]:
 
 
 def _source_project_key(row: dict[str, Any]) -> str:
-    return str(
-        row.get("repository_full_name")
-        or row.get("corpus_id")
-        or row.get("project_id")
-        or "unknown_project"
-    )
+    return canonical_source_project(row)
 
 
 def _representation_relation(left: str, right: str) -> str | None:
@@ -599,6 +612,95 @@ def _generic_function_name(row: dict[str, Any]) -> bool:
     return tokens.issubset(GENERIC_FUNCTION_TOKENS)
 
 
+def _managed_method_name(row: dict[str, Any]) -> str:
+    raw_name = str((row.get("commercial") or {}).get("name") or "").strip()
+    if "->" in raw_name:
+        raw_name = raw_name.rsplit("->", 1)[-1]
+    elif "#" in raw_name:
+        raw_name = raw_name.rsplit("#", 1)[-1]
+    elif "::" in raw_name:
+        raw_name = raw_name.rsplit("::", 1)[-1]
+    raw_name = raw_name.split("(", 1)[0].strip()
+    if "." in raw_name:
+        raw_name = raw_name.rsplit(".", 1)[-1]
+    return raw_name
+
+
+def _managed_information_gate(
+    row: dict[str, Any],
+    profile: dict[str, Any],
+) -> dict[str, Any]:
+    commercial = row.get("commercial") or {}
+    ownership = commercial.get("ownership") or {}
+    ownership_category = str(ownership.get("category") or "unknown")
+    method_name = _managed_method_name(row)
+    normalized_name = method_name.casefold()
+    components = row.get("components") or {}
+
+    dependency_or_platform = ownership_category in {"third_party", "platform"}
+    generic_method = bool(
+        normalized_name in MANAGED_GENERIC_METHOD_NAMES
+        or MANAGED_GENERATED_METHOD_RE.fullmatch(method_name)
+        or MANAGED_ACCESSOR_METHOD_RE.fullmatch(method_name)
+    )
+    exact = bool(
+        float(components.get("exact_body") or 0) >= 1.0
+        or float(components.get("exact_structural") or 0) >= 1.0
+    )
+    strong_structure = bool(
+        float(components.get("source_shingles") or 0) >= 0.50
+        or float(components.get("instruction") or 0) >= 0.60
+        or (
+            float(components.get("source_shingles") or 0) >= 0.35
+            and float(components.get("cfg") or 0) >= 0.80
+        )
+    )
+    semantic_context = bool(
+        float(components.get("strings") or 0) >= 0.50
+        or float(components.get("capabilities") or 0) >= 0.75
+        or float(components.get("calls") or 0) >= 0.65
+    )
+    distinctive_override = bool(
+        (exact and (strong_structure or semantic_context))
+        or (strong_structure and semantic_context)
+        or (
+            float(components.get("source_shingles") or 0) >= 0.70
+            and float(components.get("cfg") or 0) >= 0.80
+        )
+    )
+    distinctive_signals = set(profile.get("distinctive_signals") or [])
+    high_information_signals = distinctive_signals.intersection(
+        {
+            "strings",
+            "capabilities",
+            "cfg",
+            "instruction",
+            "source_shingles",
+            "exact_body",
+            "exact_structural",
+        }
+    )
+
+    exclusion_reason = None
+    if dependency_or_platform:
+        exclusion_reason = "commercial_dependency_or_platform"
+    elif generic_method and not distinctive_override:
+        exclusion_reason = "managed_low_information_generic_method"
+    elif not high_information_signals and not distinctive_override:
+        exclusion_reason = "managed_low_information_no_distinctive_structure"
+
+    return {
+        "eligible": exclusion_reason is None,
+        "exclusion_reason": exclusion_reason,
+        "method_name": method_name,
+        "generic_method": generic_method,
+        "dependency_or_platform": dependency_or_platform,
+        "ownership_category": ownership_category,
+        "distinctive_override": distinctive_override,
+        "high_information_signals": sorted(high_information_signals),
+    }
+
+
 def _selection_evidence(row: dict[str, Any]) -> dict[str, Any]:
     components = row.get("components") or {}
     thresholds = {
@@ -676,6 +778,14 @@ def annotate_candidate_for_selection(row: dict[str, Any]) -> dict[str, Any]:
     missing_profile = not row.get("components") and not row.get(
         "evidence_sufficiency"
     )
+    managed_gate = (
+        _managed_information_gate(row, profile)
+        if group == "managed"
+        else {
+            "eligible": True,
+            "exclusion_reason": None,
+        }
+    )
     deep_eligible = not profile["explicitly_ineligible"]
     if ownership_class in {"test_example_or_demo", "test_or_example", "demo"}:
         deep_eligible = False
@@ -712,6 +822,19 @@ def annotate_candidate_for_selection(row: dict[str, Any]) -> dict[str, Any]:
             )
             or float((row.get("components") or {}).get("exact_body") or 0) > 0
         )
+    if group == "managed" and not managed_gate["eligible"]:
+        deep_eligible = False
+    exclusion_reason = None
+    if profile["explicitly_ineligible"]:
+        exclusion_reason = "upstream_evidence_sufficiency_gate"
+    elif ownership_class in {"test_example_or_demo", "test_or_example", "demo"}:
+        exclusion_reason = "source_test_or_demo"
+    elif group == "managed" and not managed_gate["eligible"]:
+        exclusion_reason = managed_gate["exclusion_reason"]
+    elif not deep_eligible:
+        exclusion_reason = "insufficient_lane_evidence"
+    profile["managed_information_gate"] = managed_gate
+    profile["deep_comparison_exclusion_reason"] = exclusion_reason
     annotated.update(
         {
             "candidate_pair_id": candidate_pair_id,
@@ -864,6 +987,8 @@ def select_candidate_cohorts(
     all_lane_counts: Counter[str] = Counter()
     representation_counts: Counter[str] = Counter()
     native_deep_eligible_counts: Counter[str] = Counter()
+    managed_deep_eligible_counts: Counter[str] = Counter()
+    managed_deep_exclusion_reason_counts: Counter[str] = Counter()
     row_count = 0
     review_bucket_capacity = max(1, review_limit)
     native_bucket_capacity = max(200, native_decompile_limit * 20)
@@ -889,6 +1014,17 @@ def select_candidate_cohorts(
                 row,
                 limit=native_bucket_capacity,
             )
+        elif group == "managed":
+            if row["candidate_deep_comparison_eligible"]:
+                managed_deep_eligible_counts[lane] += 1
+            else:
+                reason = str(
+                    (row.get("selection_evidence") or {}).get(
+                        "deep_comparison_exclusion_reason"
+                    )
+                    or "unspecified"
+                )
+                managed_deep_exclusion_reason_counts[reason] += 1
 
     for rows in review_buckets.values():
         rows.sort(key=_selection_sort_key)
@@ -985,6 +1121,13 @@ def select_candidate_cohorts(
             sorted(native_deep_eligible_counts.items())
         ),
         "native_deep_eligible_count": sum(native_deep_eligible_counts.values()),
+        "managed_deep_eligible_counts": dict(
+            sorted(managed_deep_eligible_counts.items())
+        ),
+        "managed_deep_eligible_count": sum(managed_deep_eligible_counts.values()),
+        "managed_deep_exclusion_reason_counts": dict(
+            sorted(managed_deep_exclusion_reason_counts.items())
+        ),
         "native_deep_pool_count": len(native_pool),
         "native_decompile_limit": native_decompile_limit,
         "selection_starved": bool(
@@ -1831,6 +1974,7 @@ def _candidate_record(
     relation: str,
     rank: int,
 ) -> dict[str, Any]:
+    source = annotate_source_policy(source)
     commercial_function_id = str(
         commercial.get("function_id")
         or stable_id(
@@ -1939,6 +2083,15 @@ def _candidate_record(
                 "address",
                 "build_variant",
                 "compiler",
+                "carrier_project",
+                "canonical_upstream_project",
+                "canonical_component",
+                "source_origin_class",
+                "source_origin_confidence",
+                "source_origin_rule",
+                "declared_candidate_role",
+                "effective_candidate_role",
+                "candidate_role_resolution",
             )
         }
         | {
@@ -1992,7 +2145,9 @@ def native_decompile_targets(
         if ownership.get("category") in {"third_party", "platform"}:
             continue
         source = row.get("source") or {}
-        role = source.get("candidate_role")
+        role = source.get("effective_candidate_role") or source.get(
+            "candidate_role"
+        )
         lane = str(row.get("analysis_lane") or "control")
         if lane == "control" and role != "method_control":
             continue

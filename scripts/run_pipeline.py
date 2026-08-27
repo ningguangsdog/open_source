@@ -217,6 +217,22 @@ def parse_args() -> argparse.Namespace:
         help="Maximum native reuse candidates allowed to consume Hex-Rays budget.",
     )
     parser.add_argument(
+        "--reuse-regression-labels",
+        type=Path,
+        help=(
+            "Optional external known-positive/control label file used to test "
+            "retrieval coverage after a reuse-search run."
+        ),
+    )
+    parser.add_argument(
+        "--strict-reuse-regression",
+        action="store_true",
+        help=(
+            "Make a missing known positive a blocking validation failure. "
+            "Requires --reuse-regression-labels."
+        ),
+    )
+    parser.add_argument(
         "--native-target-capabilities",
         default="",
         help="Comma-separated capability names to prioritize during native target selection.",
@@ -422,6 +438,20 @@ def main() -> int:
             "--oss-compiled-function-index does not name a readable file: "
             f"{args.oss_binary_function_index}"
         )
+    if args.reuse_regression_labels is not None:
+        if not full_native_index:
+            raise SystemExit(
+                "--reuse-regression-labels is only valid with --profile reuse-search"
+            )
+        if not args.reuse_regression_labels.expanduser().is_file():
+            raise SystemExit(
+                "--reuse-regression-labels does not name a readable file: "
+                f"{args.reuse_regression_labels}"
+            )
+    if args.strict_reuse_regression and args.reuse_regression_labels is None:
+        raise SystemExit(
+            "--strict-reuse-regression requires --reuse-regression-labels"
+        )
 
     config = PipelineConfig(
         apk_path=args.apk,
@@ -464,6 +494,8 @@ def main() -> int:
         reuse_candidate_top_k=args.reuse_candidate_top_k,
         reuse_candidate_min_score=args.reuse_candidate_min_score,
         reuse_candidate_decompile_limit=args.reuse_candidate_decompile_limit,
+        reuse_regression_labels=args.reuse_regression_labels,
+        strict_reuse_regression=args.strict_reuse_regression,
         native_target_capabilities=tuple(
             item.strip()
             for item in args.native_target_capabilities.split(",")

@@ -16,6 +16,7 @@ from .source_candidate_policy import (
     effective_source_role,
     source_analysis_lane,
 )
+from .source_provenance import canonical_source_project
 from .utils import safe_read_text, safe_write_json
 
 
@@ -254,15 +255,23 @@ def _source_identity(source: dict[str, Any]) -> tuple[str, ...]:
 
 
 def _source_family(source: dict[str, Any]) -> str:
-    representation = str(source.get("representation") or "")
+    canonical_project = canonical_source_project(source)
+    origin_class = str(source.get("source_origin_class") or "")
     name = str(source.get("function_name") or source.get("name") or "")
+    if origin_class == "generated_dependency_binding":
+        return "upstream-binding:" + stable_id(
+            canonical_project,
+            source.get("canonical_component"),
+            name,
+        )
+    representation = str(source.get("representation") or "")
     if (
         representation == "oss_compiled_binary_function"
         and name
         and not name.startswith(("sub_", "loc_", "j_", "nullsub_", "imp_"))
     ):
         return "compiled-source:" + stable_id(
-            source.get("repository_full_name") or source.get("corpus_id"),
+            canonical_project,
             source.get("commit_sha"),
             source.get("source_path"),
             name,
@@ -1314,6 +1323,7 @@ def compare_decompiled_candidates(
                     "canonical_resolution": resolution,
                     "source": {
                         **source_summary,
+                        **source,
                         "name": source.get("name") or source_summary.get("name"),
                         "function_name": source.get("function_name")
                         or source_summary.get("function_name"),
@@ -1322,6 +1332,7 @@ def compare_decompiled_candidates(
                     "source_project": candidate.get("source_project")
                     or source_summary.get("repository_full_name")
                     or source_summary.get("corpus_id"),
+                    "canonical_source_project": canonical_source_project(source),
                     "retrieval_score": candidate.get("retrieval_score"),
                     "retrieval_components": candidate.get("components") or {},
                     "source_family_expansion": candidate.get(
@@ -1380,10 +1391,16 @@ def compare_decompiled_candidates(
                 for member in members
             }
         )
+        representative["canonical_source_project"] = canonical_source_project(
+            representative.get("source") or {}
+        )
         representative["source_family_variants"] = sorted(
             (
                 {
                     "source_project": member.get("source_project"),
+                    "canonical_source_project": member.get(
+                        "canonical_source_project"
+                    ),
                     "function_id": member.get("source_function_id"),
                     "commit_sha": (member.get("source") or {}).get("commit_sha"),
                     "build_variant": (member.get("source") or {}).get(
@@ -1569,7 +1586,11 @@ def compare_decompiled_candidates(
         ),
         "review_ready_project_count": len(
             {
-                str(row.get("source_project") or "")
+                str(
+                    row.get("canonical_source_project")
+                    or row.get("source_project")
+                    or ""
+                )
                 for row in family_rows
                 if (
                     (row.get("claim_eligibility") or {}).get("usage_review")
@@ -1577,7 +1598,10 @@ def compare_decompiled_candidates(
                         "adaptation_review"
                     )
                 )
-                and row.get("source_project")
+                and (
+                    row.get("canonical_source_project")
+                    or row.get("source_project")
+                )
             }
         ),
         "copying_conclusion_supported": False,

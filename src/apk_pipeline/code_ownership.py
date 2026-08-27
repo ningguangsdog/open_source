@@ -73,6 +73,9 @@ KNOWN_THIRD_PARTY_NATIVE_NAMES = {
     "libncnn.so",
     "libonnxruntime.so",
     "libpng.so",
+    "libpdfium.so",
+    "libfreetype.so",
+    "libtesseract.so",
     "libreactnativejni.so",
     "libsqlite.so",
     "libsqlite3.so",
@@ -121,6 +124,10 @@ class OwnershipResult:
     confidence: float
     reason: str
     matched_prefix: str | None = None
+    vendor: str | None = None
+    component: str | None = None
+    attribution_kind: str | None = None
+    corroboration: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -128,7 +135,134 @@ class OwnershipResult:
             "confidence": self.confidence,
             "reason": self.reason,
             "matched_prefix": self.matched_prefix,
+            "vendor": self.vendor,
+            "component": self.component,
+            "attribution_kind": self.attribution_kind,
+            "corroboration": list(self.corroboration),
         }
+
+
+@dataclass(frozen=True, slots=True)
+class NativeComponentRule:
+    names: tuple[str, ...]
+    vendor: str
+    component: str
+    confidence: float
+    name_prefixes: tuple[str, ...] = ()
+    evidence_markers: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ManagedComponentRule:
+    prefixes: tuple[str, ...]
+    vendor: str
+    component: str
+    confidence: float
+
+
+MANAGED_COMPONENT_RULES = (
+    ManagedComponentRule(
+        prefixes=("com.pdftron.", "com.apryse."),
+        vendor="Apryse",
+        component="PDFNet SDK",
+        confidence=0.99,
+    ),
+    ManagedComponentRule(
+        prefixes=("com.osano.",),
+        vendor="Osano",
+        component="Osano Consent Management SDK",
+        confidence=0.98,
+    ),
+    ManagedComponentRule(
+        prefixes=("org.opencv.",),
+        vendor="OpenCV",
+        component="OpenCV Java bindings",
+        confidence=0.99,
+    ),
+    ManagedComponentRule(
+        prefixes=("com.google.mlkit.",),
+        vendor="Google",
+        component="Google ML Kit",
+        confidence=0.98,
+    ),
+    ManagedComponentRule(
+        prefixes=("com.google.firebase.",),
+        vendor="Google",
+        component="Firebase SDK",
+        confidence=0.98,
+    ),
+    ManagedComponentRule(
+        prefixes=("com.google.android.gms.",),
+        vendor="Google",
+        component="Google Play services",
+        confidence=0.97,
+    ),
+    ManagedComponentRule(
+        prefixes=("org.tensorflow.",),
+        vendor="Google",
+        component="TensorFlow runtime",
+        confidence=0.98,
+    ),
+    ManagedComponentRule(
+        prefixes=("ai.onnxruntime.",),
+        vendor="Microsoft",
+        component="ONNX Runtime",
+        confidence=0.98,
+    ),
+    ManagedComponentRule(
+        prefixes=("org.pytorch.",),
+        vendor="PyTorch",
+        component="PyTorch runtime",
+        confidence=0.98,
+    ),
+)
+
+
+NATIVE_COMPONENT_RULES = (
+    NativeComponentRule(
+        names=("libpdfnetc.so",),
+        vendor="Apryse",
+        component="PDFNet SDK",
+        confidence=0.99,
+    ),
+    NativeComponentRule(
+        names=("libmlkit_google_ocr_pipeline.so",),
+        vendor="Google",
+        component="Google ML Kit OCR",
+        confidence=0.99,
+    ),
+    NativeComponentRule(
+        names=("libtranslate_jni.so",),
+        vendor="Google",
+        component="Google ML Kit Translation",
+        confidence=0.98,
+    ),
+    NativeComponentRule(
+        names=("liblanguage_id_l2c_jni.so",),
+        vendor="Google",
+        component="Google ML Kit Language Identification",
+        confidence=0.98,
+    ),
+    NativeComponentRule(
+        names=("libdatastore_shared_counter.so",),
+        vendor="AndroidX",
+        component="AndroidX DataStore Shared Counter",
+        confidence=0.96,
+        evidence_markers=(
+            "androidx.datastore",
+            "androidx/datastore",
+            "datastore_shared_counter",
+            "datastore shared counter",
+        ),
+    ),
+    NativeComponentRule(
+        names=(),
+        name_prefixes=("libmlkit_",),
+        vendor="Google",
+        component="Google ML Kit native runtime",
+        confidence=0.96,
+    ),
+)
 
 
 def normalize_prefixes(values: Iterable[str]) -> tuple[str, ...]:
@@ -158,6 +292,17 @@ def infer_first_party_prefixes(app_package: str | None) -> tuple[str, ...]:
         if organization not in GENERIC_ORGANIZATION_TOKENS:
             prefixes.add(".".join(parts[:2]) + ".")
     return tuple(sorted(prefixes, key=lambda item: (-len(item), item)))
+
+
+def _managed_component_match(
+    package: str,
+) -> tuple[ManagedComponentRule, str] | None:
+    normalized_package = package.casefold()
+    for rule in MANAGED_COMPONENT_RULES:
+        for prefix in rule.prefixes:
+            if _matches_prefix(normalized_package, prefix):
+                return rule, prefix
+    return None
 
 
 def classify_code_ownership(
@@ -210,6 +355,19 @@ def classify_code_ownership(
                     "Matched an explicitly configured third-party package prefix.",
                     prefix,
                 )
+        component_match = _managed_component_match(normalized_package)
+        if component_match is not None:
+            rule, prefix = component_match
+            return OwnershipResult(
+                "third_party",
+                rule.confidence,
+                "Matched the audited managed SDK component registry.",
+                prefix,
+                vendor=rule.vendor,
+                component=rule.component,
+                attribution_kind="managed_component_registry",
+                corroboration=(f"package_prefix:{prefix}",),
+            )
         for prefix in KNOWN_THIRD_PARTY_PREFIXES:
             if _matches_prefix(normalized_package, prefix):
                 return OwnershipResult(
@@ -248,6 +406,36 @@ def normalize_hashes(values: Iterable[str]) -> frozenset[str]:
     )
 
 
+def _native_component_match(
+    normalized_name: str,
+    evidence_tokens: Iterable[str],
+) -> tuple[NativeComponentRule, tuple[str, ...], bool] | None:
+    normalized_evidence = tuple(
+        sorted(
+            {
+                str(value).strip().casefold()
+                for value in evidence_tokens
+                if str(value).strip()
+            }
+        )
+    )
+    for rule in NATIVE_COMPONENT_RULES:
+        name_match = normalized_name in rule.names or any(
+            normalized_name.startswith(prefix)
+            for prefix in rule.name_prefixes
+        )
+        if not name_match:
+            continue
+        corroboration = tuple(
+            marker
+            for marker in rule.evidence_markers
+            if any(marker in value for value in normalized_evidence)
+        )
+        corroborated = not rule.evidence_markers or bool(corroboration)
+        return rule, corroboration, corroborated
+    return None
+
+
 def classify_native_ownership(
     name: str | None,
     sha256: str | None,
@@ -256,6 +444,7 @@ def classify_native_ownership(
     jni_symbols: Iterable[str] = (),
     first_party_hashes: Iterable[str] = (),
     third_party_hashes: Iterable[str] = (),
+    evidence_tokens: Iterable[str] = (),
 ) -> OwnershipResult:
     normalized_name = Path(name or "").name.lower()
     normalized_sha = (sha256 or "").strip().lower()
@@ -265,6 +454,7 @@ def classify_native_ownership(
             1.0,
             "Matched an explicitly configured first-party native SHA-256.",
             normalized_sha,
+            attribution_kind="explicit_hash",
         )
     if normalized_sha and normalized_sha in normalize_hashes(third_party_hashes):
         return OwnershipResult(
@@ -272,22 +462,41 @@ def classify_native_ownership(
             1.0,
             "Matched an explicitly configured third-party native SHA-256.",
             normalized_sha,
+            attribution_kind="explicit_hash",
         )
-    if app_package:
-        jni_prefix = f"Java_{app_package.strip('.').replace('.', '_')}_"
-        if any(str(symbol).startswith(jni_prefix) for symbol in jni_symbols):
-            return OwnershipResult(
-                "first_party",
-                0.9,
-                "Exported JNI symbols match the application package.",
-                jni_prefix,
-            )
     if normalized_name in KNOWN_PLATFORM_NATIVE_NAMES:
         return OwnershipResult(
             "platform",
             0.95,
             "Matched a known Android system library name.",
             normalized_name,
+            attribution_kind="platform_registry",
+        )
+    component_match = _native_component_match(
+        normalized_name,
+        evidence_tokens,
+    )
+    if component_match is not None:
+        rule, corroboration, corroborated = component_match
+        if corroborated:
+            return OwnershipResult(
+                "third_party",
+                rule.confidence,
+                "Matched an audited native vendor-component rule.",
+                normalized_name,
+                vendor=rule.vendor,
+                component=rule.component,
+                attribution_kind="vendor_component_registry",
+                corroboration=corroboration,
+            )
+        return OwnershipResult(
+            "unknown",
+            0.45,
+            "Library name suggests a dependency, but required cross-layer corroboration was absent.",
+            normalized_name,
+            vendor=rule.vendor,
+            component=rule.component,
+            attribution_kind="unconfirmed_component_name",
         )
     if normalized_name in KNOWN_THIRD_PARTY_NATIVE_NAMES or any(
         normalized_name.startswith(prefix)
@@ -298,10 +507,22 @@ def classify_native_ownership(
             0.9,
             "Matched a conservative built-in registry of native runtime names.",
             normalized_name,
+            attribution_kind="dependency_name_registry",
         )
+    if app_package:
+        jni_prefix = f"Java_{app_package.strip('.').replace('.', '_')}_"
+        if any(str(symbol).startswith(jni_prefix) for symbol in jni_symbols):
+            return OwnershipResult(
+                "first_party",
+                0.9,
+                "Exported JNI symbols match the application package after dependency rules were excluded.",
+                jni_prefix,
+                attribution_kind="app_jni_namespace",
+            )
     return OwnershipResult(
         "unknown",
         0.3,
         "No reliable native ownership indicator was available; SHA-256 is retained for batch attribution.",
         normalized_sha or None,
+        attribution_kind="unresolved",
     )

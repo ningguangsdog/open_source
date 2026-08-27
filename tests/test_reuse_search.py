@@ -260,7 +260,7 @@ class ReuseSearchTests(unittest.TestCase):
             self.assertGreater(summary["collapsed_duplicate_source_count"], 0)
             self.assertGreater(summary["source_family_expansion_candidate_count"], 0)
 
-    def test_dependency_wrapper_remains_control(self) -> None:
+    def test_opencv_dependency_wrapper_is_attributed_to_dependency(self) -> None:
         source = {
             "source_path": "include/opencv2/line_descriptor.hpp",
             "function_name": "~LineSegmentDetector",
@@ -269,9 +269,9 @@ class ReuseSearchTests(unittest.TestCase):
             "line_count": 1,
         }
         role, reason = effective_source_role(source)
-        self.assertEqual(role, "method_control")
-        self.assertEqual(reason, "declared_role_preserved")
-        self.assertEqual(source_analysis_lane(source), "control")
+        self.assertEqual(role, "dependency_control")
+        self.assertEqual(reason, "curated_source_provenance_override")
+        self.assertEqual(source_analysis_lane(source), "usage")
 
     def test_unresolved_import_wrapper_cannot_expand_or_support_claim(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1172,6 +1172,66 @@ class ReuseSearchTests(unittest.TestCase):
             "vendored_or_external",
         )
 
+    def test_managed_generic_method_is_excluded_before_deep_budgeting(self) -> None:
+        row = {
+            "retrieval_score": 0.84,
+            "components": {"semantic": 0.8, "calls": 0.5},
+            "evidence_sufficiency": {"deep_comparison_eligible": True},
+            "commercial": {
+                "function_id": "commercial-hash",
+                "representation": "dex_bytecode_method",
+                "name": "hashCode",
+                "file": "sources/com/example/Rect.java",
+                "ownership": {"category": "first_party"},
+            },
+            "source": {
+                "function_id": "oss-hash",
+                "repository_full_name": "example/geometry",
+                "candidate_role": "upstream_candidate",
+                "ownership_class": "project_owned_candidate",
+            },
+        }
+
+        annotated = annotate_candidate_for_selection(row)
+
+        self.assertFalse(annotated["candidate_deep_comparison_eligible"])
+        self.assertEqual(
+            annotated["selection_evidence"]["deep_comparison_exclusion_reason"],
+            "managed_low_information_generic_method",
+        )
+
+    def test_managed_domain_method_with_structural_context_remains_eligible(self) -> None:
+        row = {
+            "retrieval_score": 0.84,
+            "components": {
+                "semantic": 0.8,
+                "source_shingles": 0.62,
+                "calls": 0.68,
+                "strings": 0.52,
+            },
+            "evidence_sufficiency": {"deep_comparison_eligible": True},
+            "commercial": {
+                "function_id": "commercial-detect-page",
+                "representation": "dex_bytecode_method",
+                "name": "detectDocumentCorners",
+                "file": "sources/com/example/Detector.java",
+                "ownership": {"category": "first_party"},
+            },
+            "source": {
+                "function_id": "oss-detect-page",
+                "repository_full_name": "example/document-detector",
+                "candidate_role": "upstream_candidate",
+                "ownership_class": "project_owned_candidate",
+            },
+        }
+
+        annotated = annotate_candidate_for_selection(row)
+
+        self.assertTrue(annotated["candidate_deep_comparison_eligible"])
+        self.assertIsNone(
+            annotated["selection_evidence"]["deep_comparison_exclusion_reason"]
+        )
+
     def test_retrieval_resumes_from_checkpoint_and_reuses_completed_output(self) -> None:
         source_rows = [
             {
@@ -2066,6 +2126,96 @@ class ReuseSearchTests(unittest.TestCase):
                 ["address", "library_sha256", "source_project"],
             )
 
+    def test_validation_blocks_dependency_owned_native_target(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace = Path(temp_dir)
+            phase2 = workspace / "phase2_jadx"
+            phase3 = workspace / "phase3_native"
+            phase2.mkdir(parents=True)
+            phase3.mkdir(parents=True)
+            safe_write_json(
+                phase2 / "java_method_index_summary.json",
+                {"status": "completed", "indexed_method_count": 1},
+            )
+            safe_write_json(
+                phase2 / "dex_method_index_summary.json",
+                {"status": "completed", "indexed_method_count": 1},
+            )
+            safe_write_json(
+                phase3 / "native_full_index_summary.json",
+                {"status": "completed", "indexed_function_count": 1},
+            )
+            safe_write_json(
+                phase3 / "reuse_candidate_summary.json",
+                {
+                    "status": "completed",
+                    "commercial_function_count": 1,
+                    "source_function_count": 1,
+                    "candidate_pair_count": 1,
+                },
+            )
+            safe_write_json(
+                phase3 / "reuse_candidate_selection_summary.json",
+                {
+                    "status": "completed",
+                    "native_deep_eligible_count": 1,
+                    "native_decompile_target_count": 1,
+                    "selection_starved": False,
+                },
+            )
+            safe_write_json(
+                phase3 / "reuse_candidate_targets.json",
+                {
+                    "targets": [
+                        {
+                            "candidate_pair_id": "pair-dependency",
+                            "analysis_lane": "adaptation",
+                            "commercial_function_id": "commercial-1",
+                            "source_function_id": "source-1",
+                            "library_sha256": "a" * 64,
+                            "address": "0x1000",
+                            "library": "libPDFNetC.so",
+                            "reuse_candidate": {
+                                "candidate_pair_id": "pair-dependency",
+                                "analysis_lane": "adaptation",
+                                "source_project": "example/project",
+                                "commercial": {
+                                    "function_id": "commercial-1",
+                                    "library_sha256": "a" * 64,
+                                    "address": "0x1000",
+                                    "library": "libPDFNetC.so",
+                                    "ownership": {"category": "third_party"},
+                                },
+                                "source": {
+                                    "function_id": "source-1",
+                                    "repository_full_name": "example/project",
+                                },
+                            },
+                        }
+                    ]
+                },
+            )
+
+            checks = _reuse_search_checks(
+                workspace,
+                native_library_count=1,
+                require_evidence_packet=False,
+            )
+            identity = next(
+                row
+                for row in checks
+                if row["id"] == "reuse_candidate_target_identity"
+            )
+
+            self.assertEqual(identity["status"], "failed")
+            self.assertTrue(identity["blocking"])
+            self.assertEqual(
+                identity["details"]["prohibited_commercial_ownership"][0][
+                    "ownership_category"
+                ],
+                "third_party",
+            )
+
     def test_post_ida_replay_is_non_destructive_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -2469,9 +2619,11 @@ class ReuseSearchTests(unittest.TestCase):
             self.assertEqual(result["status"], "passed")
             self.assertFalse(result["automated_ida_required"])
             self.assertTrue(result["ready_for_similarity"])
+            self.assertTrue(result["ready_for_dependency_analysis"])
             self.assertTrue(result["ready_for_usage_analysis"])
-            self.assertTrue(result["ready_for_adaptation_analysis"])
-            self.assertTrue(result["ready_for_copying_review"])
+            self.assertFalse(result["ready_for_adaptation_analysis"])
+            self.assertFalse(result["ready_for_copying_review"])
+            self.assertFalse(result["copying_candidate_present"])
             self.assertFalse(result["copying_conclusion_supported"])
             ida_check = next(
                 row for row in result["checks"] if row["id"] == "automated_ida"

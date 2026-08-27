@@ -42,6 +42,8 @@ class PipelineConfig:
     reuse_candidate_top_k: int = 10
     reuse_candidate_min_score: float = 0.28
     reuse_candidate_decompile_limit: int = 120
+    reuse_regression_labels: Path | None = None
+    strict_reuse_regression: bool = False
     native_target_capabilities: tuple[str, ...] = ()
     max_snippets_per_capability: int = 40
     first_party_prefixes: tuple[str, ...] = ()

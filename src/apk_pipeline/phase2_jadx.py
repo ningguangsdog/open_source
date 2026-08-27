@@ -52,7 +52,7 @@ from .utils import (
 from .evidence import write_jsonl
 
 
-PHASE_SCHEMA = "2026-08-24.phase2.v5"
+PHASE_SCHEMA = "2026-08-26.phase2.v6"
 JADX_RELEASE_URL = (
     "https://github.com/skylot/jadx/releases/download/v{version}/jadx-{version}.zip"
 )
@@ -77,6 +77,24 @@ METHOD_RE = re.compile(
 NATIVE_METHOD_RE = re.compile(
     r"\bnative\s+(?:[A-Za-z0-9_<>\[\].]+\s+)+([A-Za-z0-9_]+)\s*\(",
     re.MULTILINE,
+)
+
+PROTECTED_SHELL_PACKAGE_PREFIXES = (
+    "s.h.e.l.l",
+    "com.secneo.apkwrapper",
+    "com.stub",
+    "com.wrapper.proxyapplication",
+    "com.qihoo.util",
+)
+PROTECTED_SHELL_CLASS_NAMES = {
+    "proxyapplication",
+    "shellapplication",
+    "stubapp",
+    "wrapperapplication",
+}
+PROTECTED_SHELL_LIBRARY_SETS = (
+    frozenset({"exec", "execmain"}),
+    frozenset({"shell", "shella"}),
 )
 LOAD_LIBRARY_RE = re.compile(r"System\.loadLibrary\(\s*\"([A-Za-z0-9_.-]+)\"")
 ERROR_LINE_RE = re.compile(r"\b(error|exception|failed|failure)\b", re.IGNORECASE)
@@ -723,6 +741,76 @@ def _stratified_snippet_sample(
     return selected
 
 
+def _detect_managed_code_coverage(
+    records: list[dict[str, Any]],
+    load_library_calls: Counter[str],
+) -> dict[str, Any]:
+    packages = {
+        str(value).casefold()
+        for record in records
+        for value in (
+            record.get("package"),
+            record.get("path_inferred_package"),
+        )
+        if value
+    }
+    class_names = {
+        str(value).casefold()
+        for record in records
+        for value in (record.get("class_names") or [])
+        if value
+    }
+    libraries = {str(value).casefold() for value in load_library_calls}
+    package_hits = sorted(
+        prefix
+        for prefix in PROTECTED_SHELL_PACKAGE_PREFIXES
+        if any(
+            package == prefix or package.startswith(f"{prefix}.")
+            for package in packages
+        )
+    )
+    class_hits = sorted(PROTECTED_SHELL_CLASS_NAMES.intersection(class_names))
+    library_hits = sorted(
+        "+".join(sorted(required))
+        for required in PROTECTED_SHELL_LIBRARY_SETS
+        if required.issubset(libraries)
+    )
+    detected = bool(package_hits or class_hits or library_hits)
+    high_confidence = bool(
+        package_hits
+        or class_hits
+        or len(library_hits) >= 2
+        or (library_hits and class_hits)
+    )
+    classification = (
+        "protected_shell_visible_only"
+        if high_confidence
+        else "probable_protected_shell"
+        if detected
+        else "not_detected"
+    )
+    return {
+        "classification": classification,
+        "protected_shell_detected": detected,
+        "confidence": "high" if high_confidence else "medium" if detected else "none",
+        "package_prefix_hits": package_hits,
+        "class_name_hits": class_hits,
+        "loader_library_set_hits": library_hits,
+        "business_logic_visibility": (
+            "likely_incomplete"
+            if detected
+            else "not_flagged_by_static_shell_signatures"
+        ),
+        "interpretation": (
+            "JADX-visible managed code appears to be an unpacking or loader shell. "
+            "Treat Java/Kotlin business-logic coverage as incomplete; native, DEX, "
+            "resource, and runtime evidence remain independently usable."
+            if detected
+            else "No conservative protected-shell signature was detected."
+        ),
+    }
+
+
 def build_java_package_index(code_index: dict[str, Any]) -> dict[str, Any]:
     packages: dict[str, dict[str, Any]] = {}
     ownership_counts: Counter[str] = Counter()
@@ -952,6 +1040,11 @@ def build_code_index(
             for capability in snippet.get("capabilities") or []:
                 snippet_candidates[capability].append(snippet)
 
+    managed_code_coverage = _detect_managed_code_coverage(
+        readable_records,
+        load_library_calls,
+    )
+
     selected_snippets: dict[str, list[dict[str, Any]]] = {}
     snippet_selection: dict[str, dict[str, Any]] = {}
     for capability, candidates in sorted(snippet_candidates.items()):
@@ -1054,6 +1147,7 @@ def build_code_index(
                 "discarding obfuscated first-party code."
             ),
         },
+        "managed_code_coverage": managed_code_coverage,
         "load_library_calls": dict(load_library_calls.most_common()),
         "native_method_count": native_method_count,
         "urls": dict(urls.most_common()),
@@ -1335,6 +1429,12 @@ def run_phase2_multi(
         for run in runs
         if run.get("status") != "success"
     ]
+    managed_code_coverage = code_index.get("managed_code_coverage") or {}
+    if managed_code_coverage.get("protected_shell_detected"):
+        warnings.append(
+            "Protected managed-code shell detected; JADX-visible Java/Kotlin is "
+            "likely loader code rather than complete application business logic."
+        )
     if method_index_summary.get("status") != "completed":
         warnings.append(
             "JADX method index status="
@@ -1372,6 +1472,7 @@ def run_phase2_multi(
         "package_count": package_index["package_count"],
         "ownership_file_counts": code_index["ownership_file_counts"],
         "ownership_code_file_counts": code_index["ownership_code_file_counts"],
+        "managed_code_coverage": managed_code_coverage,
         "capability_counts": code_index["capability_counts"],
         "comparison_capability_counts": code_index[
             "comparison_capability_counts"

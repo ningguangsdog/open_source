@@ -10,7 +10,7 @@ from .models import PhaseResult
 from .utils import safe_write_json, sha256_file
 
 
-VALIDATION_SCHEMA = "2026-08-25.pipeline-validation.v10"
+VALIDATION_SCHEMA = "2026-08-26.pipeline-validation.v12"
 REUSE_EVIDENCE_UNIT_LIMIT = 5000
 
 
@@ -77,15 +77,192 @@ def _safe_int(value: Any) -> int:
         return 0
 
 
+def _reuse_regression_check(
+    workspace: Path,
+    *,
+    required: bool,
+    strict: bool,
+) -> dict[str, Any] | None:
+    if not required:
+        return None
+    path = workspace / "phase3_native" / "reuse_regression.json"
+    report = _load_json(path)
+    if not isinstance(report, dict):
+        return _check(
+            "known_positive_regression",
+            "failed" if strict else "partial",
+            "The requested known-positive retrieval regression report is missing.",
+            details={"path": str(path), "strict": strict},
+            blocking=strict,
+        )
+    report_status = str(report.get("status") or "missing")
+    positive_count = _safe_int(report.get("known_positive_count"))
+    positive_hits = _safe_int(report.get("known_positive_hit_count"))
+    passed = bool(
+        report_status == "passed"
+        and positive_count > 0
+        and positive_hits == positive_count
+    )
+    return _check(
+        "known_positive_regression",
+        "passed" if passed else "failed" if strict else "partial",
+        (
+            "All externally labeled known positives were retrieved."
+            if passed
+            else "One or more externally labeled known positives were not retrieved."
+        ),
+        details={
+            "path": str(path),
+            "strict": strict,
+            "report_status": report_status,
+            "known_positive_count": positive_count,
+            "known_positive_hit_count": positive_hits,
+            "known_positive_recall": report.get("known_positive_recall"),
+            "negative_control_count": _safe_int(
+                report.get("negative_control_count")
+            ),
+            "negative_control_hit_count": _safe_int(
+                report.get("negative_control_hit_count")
+            ),
+            "error": report.get("error"),
+        },
+        blocking=strict and not passed,
+    )
+
+
+def _managed_code_coverage_check(workspace: Path) -> dict[str, Any]:
+    code_index = _load_json(workspace / "phase2_jadx" / "code_index.json")
+    if not isinstance(code_index, dict):
+        return _check(
+            "managed_code_coverage_boundary",
+            "not_applicable",
+            "Managed-code coverage could not be classified because the code index is unavailable.",
+        )
+    coverage = code_index.get("managed_code_coverage") or {}
+    if not isinstance(coverage, dict):
+        coverage = {}
+    protected = bool(coverage.get("protected_shell_detected"))
+    return _check(
+        "managed_code_coverage_boundary",
+        "passed",
+        (
+            "A protected loader shell was detected; managed business-logic coverage is explicitly bounded."
+            if protected
+            else "No conservative protected-shell signature was detected in managed code."
+        ),
+        details=coverage,
+        blocking=False,
+    )
+
+
+def _code_surface_attribution_check(workspace: Path) -> dict[str, Any]:
+    native_analysis = _load_json(
+        workspace / "phase3_native" / "native_analysis.json"
+    )
+    code_index = _load_json(workspace / "phase2_jadx" / "code_index.json")
+    native_analysis = native_analysis if isinstance(native_analysis, dict) else {}
+    code_index = code_index if isinstance(code_index, dict) else {}
+
+    native_counts = native_analysis.get("ownership_library_counts") or {}
+    if not isinstance(native_counts, dict) or not native_counts:
+        native_counts = {}
+        for library in native_analysis.get("libraries") or []:
+            if not isinstance(library, dict):
+                continue
+            category = str(
+                ((library.get("ownership") or {}).get("category")) or "unknown"
+            )
+            native_counts[category] = _safe_int(native_counts.get(category)) + 1
+    normalized_native_counts = {
+        str(category): _safe_int(count)
+        for category, count in native_counts.items()
+    }
+    native_total = sum(normalized_native_counts.values())
+    native_first_party = normalized_native_counts.get("first_party", 0)
+    native_unknown = normalized_native_counts.get("unknown", 0)
+    native_dependency = sum(
+        normalized_native_counts.get(category, 0)
+        for category in ("third_party", "platform")
+    )
+    if native_total == 0:
+        native_status = "not_present"
+    elif native_first_party > 0:
+        native_status = "proprietary_surface_observed"
+    elif native_unknown > 0:
+        native_status = "unresolved_surface_present"
+    elif native_dependency == native_total:
+        native_status = "dependency_only_observed"
+    else:
+        native_status = "unresolved"
+
+    managed_counts = code_index.get("ownership_code_file_counts") or {}
+    if not isinstance(managed_counts, dict):
+        managed_counts = {}
+    normalized_managed_counts = {
+        str(category): _safe_int(count)
+        for category, count in managed_counts.items()
+    }
+    managed_first_party = normalized_managed_counts.get("first_party", 0)
+    managed_unknown = normalized_managed_counts.get("unknown", 0)
+    if managed_first_party > 0:
+        managed_status = "proprietary_surface_observed"
+    elif managed_unknown > 0:
+        managed_status = "unresolved_surface_present"
+    elif sum(normalized_managed_counts.values()) > 0:
+        managed_status = "dependency_only_observed"
+    else:
+        managed_status = "not_observed"
+
+    confirmed_components = native_analysis.get("native_dependency_components") or []
+    unconfirmed_components = (
+        native_analysis.get("unconfirmed_native_component_clues") or []
+    )
+    return _check(
+        "code_surface_attribution",
+        "passed",
+        "Managed and native code surfaces were separated into proprietary, dependency, and unresolved evidence.",
+        details={
+            "native_surface_status": native_status,
+            "native_ownership_library_counts": dict(
+                sorted(normalized_native_counts.items())
+            ),
+            "confirmed_native_dependency_component_count": len(
+                confirmed_components
+            ),
+            "confirmed_native_dependency_components": confirmed_components,
+            "unconfirmed_native_component_clue_count": len(
+                unconfirmed_components
+            ),
+            "unconfirmed_native_component_clues": unconfirmed_components,
+            "managed_surface_status": managed_status,
+            "managed_ownership_code_file_counts": dict(
+                sorted(normalized_managed_counts.items())
+            ),
+            "interpretation": (
+                "Unknown ownership is a coverage boundary, not evidence that code is "
+                "proprietary. Confirmed dependencies remain available for usage and "
+                "dependency analysis but are excluded from adaptation claims."
+            ),
+        },
+        blocking=False,
+    )
+
+
 def _readiness_fields(
     status: str,
     checks: list[dict[str, Any]],
     *,
     reuse_required: bool,
 ) -> dict[str, Any]:
-    check_status = {str(row.get("id")): str(row.get("status")) for row in checks}
+    check_rows = {str(row.get("id")): row for row in checks}
+    check_status = {
+        check_id: str(row.get("status")) for check_id, row in check_rows.items()
+    }
     deep_status = check_status.get("post_ida_deep_comparison")
     canonical_status = check_status.get("canonical_implementation_resolution")
+    regression_status = check_status.get(
+        "known_positive_regression", "not_requested"
+    )
     pipeline_execution_complete = check_status.get("phase_execution") == "passed"
     evidence_check_ids = {
         "phase3_ida_evidence",
@@ -94,6 +271,7 @@ def _readiness_fields(
         "phase5_reuse_candidate_integration",
         "phase5_deep_comparison_integration",
         "phase5_reuse_traceability",
+        "phase5_managed_deep_comparison_integration",
     }
     evidence_complete = bool(
         pipeline_execution_complete
@@ -107,22 +285,75 @@ def _readiness_fields(
         and reuse_required
         and deep_status in {"passed", "not_applicable"}
         and canonical_status in {"passed", "not_applicable"}
+        and regression_status in {"passed", "not_requested"}
     )
-    reuse_ready = bool(
-        retrieval_validated and evidence_complete
+    reuse_ready = bool(retrieval_validated and evidence_complete)
+    surface_details = (
+        check_rows.get("code_surface_attribution", {}).get("details") or {}
+    )
+    native_surface_status = str(
+        surface_details.get("native_surface_status") or "unknown"
+    )
+    native_deep_details = (
+        check_rows.get("post_ida_deep_comparison", {}).get("details") or {}
+    )
+    managed_deep_details = (
+        check_rows.get("managed_code_deep_comparison", {}).get("details") or {}
+    )
+    native_adaptation_complete = bool(
+        deep_status == "passed"
+        and _safe_int(native_deep_details.get("source_family_comparison_count"))
+        > 0
+    )
+    managed_adaptation_complete = bool(
+        check_status.get("managed_code_deep_comparison") == "passed"
+        and _safe_int(managed_deep_details.get("comparison_count")) > 0
+    )
+    usage_review_ready_count = _safe_int(
+        native_deep_details.get("usage_review_ready_count")
+    ) + _safe_int(managed_deep_details.get("usage_review_ready_count"))
+    adaptation_review_ready_count = _safe_int(
+        native_deep_details.get("adaptation_review_ready_count")
+    ) + _safe_int(managed_deep_details.get("adaptation_review_ready_count"))
+    copying_review_ready = bool(
+        reuse_ready
+        and (usage_review_ready_count + adaptation_review_ready_count) > 0
     )
     return {
         "pipeline_execution_complete": pipeline_execution_complete,
         "evidence_complete": evidence_complete,
         "retrieval_validated": retrieval_validated,
-        "known_positive_regression_status": "not_run_in_pipeline",
+        "known_positive_regression_status": regression_status,
         "ready_for_similarity": status == "passed" and evidence_complete,
+        "ready_for_dependency_analysis": bool(
+            status == "passed"
+            and evidence_complete
+            and check_status.get("code_surface_attribution") == "passed"
+        ),
         "ready_for_usage_analysis": reuse_ready,
-        "ready_for_adaptation_analysis": reuse_ready,
-        "ready_for_copying_review": reuse_ready,
+        "ready_for_adaptation_analysis": bool(
+            reuse_ready
+            and (native_adaptation_complete or managed_adaptation_complete)
+        ),
+        "native_adaptation_analysis_status": (
+            "completed"
+            if native_adaptation_complete
+            else "not_applicable_dependency_only"
+            if native_surface_status == "dependency_only_observed"
+            else "not_run_or_insufficient_evidence"
+        ),
+        "managed_adaptation_analysis_status": (
+            "completed"
+            if managed_adaptation_complete
+            else "not_run_or_insufficient_evidence"
+        ),
+        "ready_for_copying_review": copying_review_ready,
+        "copying_candidate_present": copying_review_ready,
+        "usage_review_ready_count": usage_review_ready_count,
+        "adaptation_review_ready_count": adaptation_review_ready_count,
         # Backward-compatible field: readiness to review evidence, never a
         # statement that copying was established.
-        "ready_for_copying_assessment": reuse_ready,
+        "ready_for_copying_assessment": copying_review_ready,
         "copying_conclusion_supported": False,
     }
 
@@ -154,6 +385,12 @@ def _reuse_search_checks(
     deep_summary = _load_json(
         workspace / "phase3_native" / "reuse_deep_comparison_summary.json"
     )
+    managed_deep_path = (
+        workspace
+        / "phase3_native"
+        / "managed_reuse_deep_comparison_summary.json"
+    )
+    managed_deep_summary = _load_json(managed_deep_path)
     if not isinstance(method_summary, dict):
         method_summary = {}
     if not isinstance(dex_method_summary, dict):
@@ -168,6 +405,8 @@ def _reuse_search_checks(
         selection_summary = {}
     if not isinstance(deep_summary, dict):
         deep_summary = {}
+    if not isinstance(managed_deep_summary, dict):
+        managed_deep_summary = {}
 
     method_status = str(method_summary.get("status") or "missing")
     method_count = _safe_int(method_summary.get("indexed_method_count"))
@@ -396,6 +635,7 @@ def _reuse_search_checks(
     missing_pair_ids: list[int] = []
     invalid_lanes: list[dict[str, Any]] = []
     incomplete_metadata: list[dict[str, Any]] = []
+    prohibited_commercial_ownership: list[dict[str, Any]] = []
     for index, target in enumerate(authoritative_rows):
         candidate = target.get("reuse_candidate") or {}
         commercial = candidate.get("commercial") or {}
@@ -437,6 +677,19 @@ def _reuse_search_checks(
                     "missing_fields": missing_fields,
                 }
             )
+        ownership = commercial.get("ownership") or target.get("ownership") or {}
+        ownership_category = str(ownership.get("category") or "unknown")
+        if ownership_category in {"third_party", "platform"}:
+            prohibited_commercial_ownership.append(
+                {
+                    "index": index,
+                    "candidate_pair_id": pair_id or None,
+                    "ownership_category": ownership_category,
+                    "library": target.get("library") or commercial.get("library"),
+                    "library_sha256": target.get("library_sha256")
+                    or commercial.get("library_sha256"),
+                }
+            )
     targets_required = selected_native_count > 0
     target_identity_ok = bool(
         not targets_required
@@ -446,6 +699,7 @@ def _reuse_search_checks(
             and not missing_pair_ids
             and not invalid_lanes
             and not incomplete_metadata
+            and not prohibited_commercial_ownership
         )
     )
     checks.append(
@@ -469,6 +723,14 @@ def _reuse_search_checks(
                 "missing_candidate_pair_id_indexes": missing_pair_ids,
                 "invalid_analysis_lanes": invalid_lanes,
                 "incomplete_metadata": incomplete_metadata[:100],
+                "prohibited_commercial_ownership": (
+                    prohibited_commercial_ownership[:100]
+                ),
+                "ownership_gate": (
+                    "Platform and confirmed third-party commercial functions may be "
+                    "retained as dependency evidence but cannot enter adaptation or "
+                    "targeted decompilation queues."
+                ),
             },
             blocking=targets_required and not target_identity_ok,
         )
@@ -694,6 +956,69 @@ def _reuse_search_checks(
         )
     )
 
+    managed_deep_status = str(
+        managed_deep_summary.get("status") or "missing"
+    )
+    managed_deep_count = _safe_int(
+        managed_deep_summary.get("comparison_count")
+    )
+    managed_summary_present = managed_deep_path.is_file()
+    if managed_summary_present and managed_deep_status == "completed":
+        managed_check_status = "passed"
+        managed_message = (
+            "A bounded managed-code candidate cohort completed source- and "
+            "bytecode-level deep comparison without requiring IDA."
+        )
+    elif managed_summary_present:
+        managed_check_status = "partial"
+        managed_message = (
+            "The managed-code deep-comparison artifact exists but did not "
+            "complete."
+        )
+    else:
+        managed_check_status = "not_applicable"
+        managed_message = (
+            "No managed-code deep-comparison artifact was produced by this run."
+        )
+    checks.append(
+        _check(
+            "managed_code_deep_comparison",
+            managed_check_status,
+            managed_message,
+            details={
+                "status": managed_deep_status,
+                "comparison_count": managed_deep_count,
+                "comparison_limit": _safe_int(
+                    managed_deep_summary.get("comparison_limit")
+                ),
+                "analysis_lane_counts": managed_deep_summary.get(
+                    "analysis_lane_counts"
+                )
+                or {},
+                "relationship_counts": managed_deep_summary.get(
+                    "relationship_counts"
+                )
+                or {},
+                "usage_review_ready_count": _safe_int(
+                    managed_deep_summary.get("usage_review_ready_count")
+                ),
+                "adaptation_review_ready_count": _safe_int(
+                    managed_deep_summary.get(
+                        "adaptation_review_ready_count"
+                    )
+                ),
+                "review_ready_project_count": _safe_int(
+                    managed_deep_summary.get("review_ready_project_count")
+                ),
+                "comparison_path": managed_deep_summary.get(
+                    "comparison_path"
+                ),
+                "copying_conclusion_supported": False,
+            },
+            blocking=False,
+        )
+    )
+
     if require_evidence_packet:
         phase5_units = _load_jsonl(
             workspace / "phase5_evidence" / "evidence_units.jsonl"
@@ -704,6 +1029,10 @@ def _reuse_search_checks(
         )
         phase5_deep_count = sum(
             row.get("kind") == "open_source_deep_comparison"
+            for row in phase5_units
+        )
+        phase5_managed_deep_count = sum(
+            row.get("kind") == "open_source_managed_deep_comparison"
             for row in phase5_units
         )
         review_source = _reuse_review_source(workspace)
@@ -756,9 +1085,40 @@ def _reuse_search_checks(
                 blocking=not phase5_deep_ok,
             )
         )
+        expected_managed_deep_count = min(
+            managed_deep_count,
+            REUSE_EVIDENCE_UNIT_LIMIT,
+        )
+        phase5_managed_deep_ok = (
+            phase5_managed_deep_count == expected_managed_deep_count
+        )
+        checks.append(
+            _check(
+                "phase5_managed_deep_comparison_integration",
+                "passed" if phase5_managed_deep_ok else "failed",
+                (
+                    "Managed-code deep comparisons reached Phase 5."
+                    if phase5_managed_deep_ok
+                    else "Managed-code comparison evidence is missing from Phase 5."
+                ),
+                details={
+                    "expected_phase5_managed_deep_comparison_count": (
+                        expected_managed_deep_count
+                    ),
+                    "phase5_managed_deep_comparison_count": (
+                        phase5_managed_deep_count
+                    ),
+                },
+                blocking=not phase5_managed_deep_ok,
+            )
+        )
         traceability_violations: list[dict[str, Any]] = []
         for row in phase5_units:
-            if row.get("kind") != "open_source_deep_comparison":
+            kind = row.get("kind")
+            if kind not in {
+                "open_source_deep_comparison",
+                "open_source_managed_deep_comparison",
+            }:
                 continue
             trace = row.get("traceability") or {}
             commercial = row.get("commercial_function") or {}
@@ -774,10 +1134,15 @@ def _reuse_search_checks(
                 missing_fields.append("source_function_id")
             if not trace.get("deep_comparison_id"):
                 missing_fields.append("deep_comparison_id")
-            if not trace.get("ida_pseudocode_available"):
-                missing_fields.append("ida_pseudocode_available")
-            if not trace.get("canonical_implementation_available"):
-                missing_fields.append("canonical_implementation_available")
+            if kind == "open_source_deep_comparison":
+                if not trace.get("ida_pseudocode_available"):
+                    missing_fields.append("ida_pseudocode_available")
+                if not trace.get("canonical_implementation_available"):
+                    missing_fields.append(
+                        "canonical_implementation_available"
+                    )
+            elif trace.get("ida_required") is not False:
+                missing_fields.append("ida_required_false")
             if missing_fields:
                 traceability_violations.append(
                     {
@@ -797,6 +1162,9 @@ def _reuse_search_checks(
                 ),
                 details={
                     "deep_comparison_unit_count": phase5_deep_count,
+                    "managed_deep_comparison_unit_count": (
+                        phase5_managed_deep_count
+                    ),
                     "traceability_violations": traceability_violations[:100],
                 },
                 blocking=not phase5_trace_ok,
@@ -812,6 +1180,8 @@ def build_pipeline_validation(
     expect_automated_ida: bool,
     require_evidence_packet: bool,
     expect_reuse_search: bool = False,
+    expect_reuse_regression: bool = False,
+    strict_reuse_regression: bool = False,
 ) -> dict[str, Any]:
     """Validate that generated native evidence reached the final review layer."""
 
@@ -839,6 +1209,15 @@ def build_pipeline_validation(
             blocking=bool(failed_phases),
         )
     )
+    regression_check = _reuse_regression_check(
+        workspace,
+        required=expect_reuse_regression,
+        strict=strict_reuse_regression,
+    )
+    if regression_check is not None:
+        checks.append(regression_check)
+    checks.append(_managed_code_coverage_check(workspace))
+    checks.append(_code_surface_attribution_check(workspace))
 
     native_analysis = _load_json(
         workspace / "phase3_native" / "native_analysis.json"
@@ -877,7 +1256,19 @@ def build_pipeline_validation(
                 "Automated IDA was not required by this analysis profile.",
             )
         )
-        status = "failed" if failed_phases else "partial" if partial_phases else "passed"
+        blocking_failures = [
+            item
+            for item in checks
+            if item["blocking"] and item["status"] == "failed"
+        ]
+        incomplete = [item for item in checks if item["status"] == "partial"]
+        status = (
+            "failed"
+            if failed_phases or blocking_failures
+            else "partial"
+            if partial_phases or incomplete
+            else "passed"
+        )
         return {
             "schema_version": VALIDATION_SCHEMA,
             "status": status,
@@ -1290,6 +1681,8 @@ def write_pipeline_validation(
     expect_automated_ida: bool,
     require_evidence_packet: bool,
     expect_reuse_search: bool = False,
+    expect_reuse_regression: bool = False,
+    strict_reuse_regression: bool = False,
 ) -> dict[str, Any]:
     payload = build_pipeline_validation(
         workspace,
@@ -1297,6 +1690,8 @@ def write_pipeline_validation(
         expect_automated_ida=expect_automated_ida,
         require_evidence_packet=require_evidence_packet,
         expect_reuse_search=expect_reuse_search,
+        expect_reuse_regression=expect_reuse_regression,
+        strict_reuse_regression=strict_reuse_regression,
     )
     path = workspace / "pipeline_validation.json"
     payload["path"] = str(path)

@@ -6,6 +6,8 @@ from pathlib import PurePosixPath
 import re
 from typing import Any
 
+from .source_provenance import annotate_source_provenance
+
 
 _IMPLEMENTATION_SUFFIXES = {
     ".c",
@@ -68,6 +70,10 @@ def effective_source_role(source: dict[str, Any]) -> tuple[str, str]:
     names or paths.
     """
 
+    source = annotate_source_provenance(source)
+    override = source.get("provenance_candidate_role_override")
+    if override:
+        return str(override), "curated_source_provenance_override"
     declared = str(source.get("candidate_role") or "upstream_candidate")
     ownership = str(source.get("ownership_class") or "unknown")
     parts = _path_parts(source)
@@ -99,8 +105,15 @@ def effective_source_role(source: dict[str, Any]) -> tuple[str, str]:
 def source_analysis_lane(source: dict[str, Any]) -> str:
     """Map a source row to the research claim it may support."""
 
+    source = annotate_source_provenance(source)
     role, _reason = effective_source_role(source)
     ownership = str(source.get("ownership_class") or "unknown")
+    origin_class = str(source.get("source_origin_class") or "")
+    if origin_class in {
+        "generated_dependency_binding",
+        "vendored_dependency",
+    }:
+        return "usage"
     if role in {"method_control", "dependency_control", "sibling_control"}:
         return "control"
     if ownership in {"test_example_or_demo", "test_or_example", "demo"}:
@@ -117,8 +130,8 @@ def source_analysis_lane(source: dict[str, Any]) -> str:
 def annotate_source_policy(source: dict[str, Any]) -> dict[str, Any]:
     """Return a copy carrying the effective role and its audit rationale."""
 
-    annotated = dict(source)
-    role, reason = effective_source_role(source)
+    annotated = annotate_source_provenance(source)
+    role, reason = effective_source_role(annotated)
     annotated["declared_candidate_role"] = source.get("candidate_role")
     annotated["effective_candidate_role"] = role
     annotated["candidate_role_resolution"] = reason

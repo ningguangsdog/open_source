@@ -145,6 +145,14 @@ Trivial exact matches in very small functions remain visible in the candidate
 file, but are marked as low-information and cannot consume Hex-Rays or OSS
 build-queue budget by themselves.
 
+Native ownership uses an auditable precedence order: explicit hash overrides,
+platform/runtime rules, high-confidence component rules, the dependency
+registry, application JNI namespaces, and finally unknown. Confirmed SDK and
+platform libraries remain in dependency and usage evidence but cannot enter an
+adaptation claim or targeted IDA queue. A conditional component rule requires
+cross-layer corroboration; otherwise it remains an unconfirmed clue rather than
+a dependency assignment.
+
 Candidate retention separates three research claims. The `usage` lane records
 possible bundled or externally maintained open-source code, the `adaptation`
 lane retains project-owned upstream implementations for deeper comparison, and
@@ -154,6 +162,15 @@ a large Java candidate population cannot displace all native candidates from
 the bounded review set. Native Hex-Rays targets are selected from the complete
 candidate stream with per-project, per-library, and per-function diversity
 constraints; they do not compete with Java methods for one global Top-K.
+Managed Java/Kotlin and DEX candidates use a separate bounded deep-comparison
+pass over their retained source- and bytecode-level fingerprints. They do not
+consume IDA or native-library budget. Audited managed SDK namespaces are
+attributed before candidate selection. Confirmed dependencies, platform code,
+generated accessors, and low-information methods such as uncorroborated
+`hashCode` or `toString` implementations cannot consume the managed deep-review
+budget. Project, commercial-class, source-family, and commercial-function caps
+are hard limits; the pass leaves budget unused instead of refilling it with
+repeated or low-information observations.
 
 Inventory jobs are checkpointed per content-unique library and reused only
 when the job configuration and library SHA-256 still match. Retrieval is also
@@ -193,6 +210,70 @@ stored elsewhere. Primary outputs are:
 - `phase3_native/reuse_canonical_implementations.jsonl`
 - `phase3_native/reuse_deep_comparisons.jsonl`
 - `phase3_native/reuse_deep_comparison_summary.json`
+- `phase3_native/managed_reuse_deep_comparisons.jsonl`
+- `phase3_native/managed_reuse_deep_comparison_summary.json`
+
+Source rows preserve both the repository that carried the observed file and
+the implementation's attributed upstream owner. The fields
+`carrier_project`, `canonical_upstream_project`, `canonical_component`, and
+`source_origin_rule` prevent generated SDK bindings or vendored dependencies
+inside demo applications from being counted as independent project matches.
+The attribution rules are deliberately conservative: an unrecognized source
+remains attached to its carrier project instead of being reassigned by name
+similarity alone.
+
+Phase 2 also records `managed_code_coverage` in `code_index.json`. Conservative
+loader-shell signatures mark JADX-visible business-logic coverage as likely
+incomplete without failing the run. This boundary does not invalidate native,
+DEX, resource, or runtime evidence; it prevents a protected Java/Kotlin shell
+from being described as complete application logic.
+
+Candidate-retrieval changes can be checked against an external, frozen set of
+known positives and optional negative controls. Start from
+`profiles/reuse_regression_labels.example.json`, replace the placeholder
+patterns with independently established labels, and run:
+
+```bash
+python scripts/run_pipeline.py \
+  --profile reuse-search \
+  --apk path/to/app.apkm \
+  --workspace ./runs \
+  --isolated-workspace \
+  --oss-function-index ../research/oss_provenance/source_index/output/function_index.jsonl \
+  --reuse-regression-labels path/to/frozen_labels.json \
+  --strict-reuse-regression \
+  --log-level WARNING
+```
+
+The optional check runs after retrieval and before Phase 5. In strict mode, a
+missing labeled positive blocks research-readiness validation. It measures
+retrieval coverage only: a retrieved pair still needs third-party attribution
+and deep comparison before it can support a usage or adaptation claim. Normal
+APK runs do not load or execute this regression unless the label option is
+explicitly supplied.
+
+Before changing production retrieval or deep-comparison rules, evaluate the
+four frozen APK workspaces with the cross-APK release gate. Copy
+`profiles/reuse_release_gate.example.json`, keep only independently verified
+positive and negative conditions, and map each case to an existing completed
+workspace:
+
+```bash
+python scripts/check_reuse_release_gate.py \
+  --contract path/to/reuse_release_gate.json \
+  --workspace xodo=path/to/xodo/run \
+  --workspace mobipdf=path/to/mobipdf/run \
+  --workspace camscanner=path/to/camscanner/run \
+  --workspace adobe=path/to/adobe/run \
+  --output reuse_release_gate_report.json
+```
+
+The gate checks pipeline validity, preservation of known source candidates,
+native component attribution, managed dependency leakage, generic-method
+leakage, IDA budget boundaries, and copying-conclusion boundaries. It does not
+rerun an APK or create new similarity evidence. After all frozen cases pass,
+production selection rules should change only for a hard failure, loss of a
+known positive, or a documented false positive reproduced by a frozen case.
 
 `reuse_candidates.jsonl` is the complete streamed audit trail.
 `reuse_candidates_review.jsonl` contains the bounded, representation-aware
@@ -373,6 +454,8 @@ Add this compiled index to later APK runs with
 - `--reuse-candidate-top-k`: retain at most this many source candidates per commercial function.
 - `--reuse-candidate-min-score`: set the candidate-retrieval threshold; this is not a copying probability.
 - `--reuse-candidate-decompile-limit`: cap native retrieval candidates allowed to consume Hex-Rays budget.
+- `--reuse-regression-labels`: run retrieval coverage checks against an external frozen label file.
+- `--strict-reuse-regression`: block research-readiness validation when a labeled known positive is missed.
 - `--native-target-capabilities`: prioritize one or more capability names during native target selection.
 - `--no-resource-scan`: skip raw model/resource inventory.
 - `--no-evidence-packets`: skip the final review packet.
@@ -480,9 +563,12 @@ successful.
 `pipeline_validation.json` is the final automation gate. Its `status` is
 `passed`, `partial`, or `failed`, and `ready_for_similarity` is true only after
 every required check passes. Reuse-search runs additionally expose
-`ready_for_usage_analysis`, `ready_for_adaptation_analysis`, and
-`ready_for_copying_review`. These fields mean the evidence is complete enough
-for the named review; they do not assert that reuse or copying occurred.
+`ready_for_dependency_analysis`, `ready_for_usage_analysis`,
+`ready_for_adaptation_analysis`, and `ready_for_copying_review`. Dependency
+readiness only means component attribution is available. Adaptation readiness
+requires a completed native or managed implementation comparison, while
+copying-review readiness requires at least one review-ready candidate. These
+fields do not assert that reuse or copying occurred.
 `copying_conclusion_supported` remains false because attribution and independent
 corroboration are outside the automated gate. `pipeline_summary.json` includes
 the same validation result, so a process exit code of zero means both the phase

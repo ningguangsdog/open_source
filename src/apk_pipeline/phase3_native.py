@@ -29,6 +29,7 @@ from .ida_integration import (
     normalize_address,
     prepare_manual_ida_workspace,
 )
+from .managed_candidate_comparison import compare_managed_candidates
 from .models import PhaseResult
 from .native_decompiler import (
     AUTOMATED_DECOMPILER_TOOLS,
@@ -72,9 +73,10 @@ MAX_INTERESTING_STRINGS = 500
 NATIVE_TOOL_TIMEOUT_SECONDS = 120
 AUTO_DEEP_MIN_SCORE = 18
 AUTO_DEEP_MIN_CAPABILITY_SCORE = 12
-PHASE_SCHEMA = "2026-08-25.phase3.v12"
+PHASE_SCHEMA = "2026-08-26.phase3.v13"
 NATIVE_FULL_INDEX_SCHEMA = "2026-08-24.native-full-index.v2"
 REUSE_REVIEW_LIMIT = 5000
+MANAGED_DEEP_COMPARISON_LIMIT = 600
 NATIVE_DEPTHS = {"none", "basic", "targeted", "auto", "deep"}
 NATIVE_DECOMPILERS = {"auto", "none", "ida", "rizin", "radare2", "ghidra", "retdec"}
 logger = logging.getLogger(__name__)
@@ -170,6 +172,7 @@ def _consolidate_native_inventory(
     )
     function_count = 0
     ownership_counts: Counter[str] = Counter()
+    component_function_counts: Counter[str] = Counter()
     capability_counts: Counter[str] = Counter()
     library_counts: Counter[str] = Counter()
     invalid_row_count = 0
@@ -237,6 +240,13 @@ def _consolidate_native_inventory(
                             )
                         ]
                     )
+                    ownership = row.get("ownership") or {}
+                    component = str(ownership.get("component") or "")
+                    vendor = str(ownership.get("vendor") or "")
+                    if component:
+                        component_function_counts.update(
+                            [f"{vendor}: {component}" if vendor else component]
+                        )
                     capability_counts.update(capabilities)
                     library_counts.update(
                         [str(row.get("library_sha256") or "unknown")]
@@ -265,6 +275,9 @@ def _consolidate_native_inventory(
         ),
         "invalid_row_count": invalid_row_count,
         "ownership_function_counts": dict(sorted(ownership_counts.items())),
+        "component_function_counts": dict(
+            sorted(component_function_counts.items())
+        ),
         "capability_counts": dict(sorted(capability_counts.items())),
         "indexed_library_hash_count": len(library_counts),
         "index_path": str(output_path),
@@ -713,6 +726,60 @@ def _analyze_library(record: dict[str, Any]) -> dict[str, Any]:
         }
     )
     return enriched
+
+
+def _native_attribution_evidence_tokens(
+    record: dict[str, Any],
+    code_index: dict[str, Any],
+) -> tuple[str, ...]:
+    """Collect bounded managed-code evidence tied to one loaded library."""
+
+    library_names = {
+        Path(str(value or "")).name.casefold()
+        for value in (
+            record.get("name"),
+            record.get("entry"),
+            record.get("extracted_path"),
+        )
+        if value
+    }
+    library_stems = {
+        name[3:-3] if name.startswith("lib") and name.endswith(".so") else name
+        for name in library_names
+    }
+    evidence: set[str] = set()
+    for loaded_name in (code_index.get("load_library_calls") or {}):
+        normalized = Path(str(loaded_name)).name.casefold()
+        normalized_stem = (
+            normalized[3:-3]
+            if normalized.startswith("lib") and normalized.endswith(".so")
+            else normalized.removeprefix("lib").removesuffix(".so")
+        )
+        if normalized_stem in library_stems:
+            evidence.add(f"load_library:{normalized}")
+    for source in code_index.get("files") or []:
+        if not isinstance(source, dict):
+            continue
+        loaded = {
+            Path(str(value)).name.casefold()
+            .removeprefix("lib")
+            .removesuffix(".so")
+            for value in source.get("load_libraries") or []
+            if str(value).strip()
+        }
+        if not loaded.intersection(library_stems):
+            continue
+        for value in (
+            source.get("package"),
+            source.get("class_name"),
+            source.get("file"),
+            *(source.get("load_libraries") or []),
+        ):
+            if value:
+                evidence.add(str(value).casefold())
+        if len(evidence) >= 100:
+            break
+    return tuple(sorted(evidence))
 
 
 def _library_id(record: dict[str, Any]) -> str:
@@ -1407,6 +1474,12 @@ def run_phase3_multi(
     canonical_implementations_path = (
         output_dir / "reuse_canonical_implementations.jsonl"
     )
+    managed_deep_comparisons_path = (
+        output_dir / "managed_reuse_deep_comparisons.jsonl"
+    )
+    managed_deep_summary_path = (
+        output_dir / "managed_reuse_deep_comparison_summary.json"
+    )
     deep_summary_path = output_dir / "native_deep_summary.json"
     ida_manifest_path = output_dir / "ida_target_manifest.json"
     ida_handoff_manifest_path = output_dir / "ida_handoff" / "ida_handoff_manifest.json"
@@ -1441,6 +1514,8 @@ def run_phase3_multi(
         reuse_candidate_targets_path,
         deep_comparisons_path,
         deep_comparison_summary_path,
+        managed_deep_comparisons_path,
+        managed_deep_summary_path,
         deep_summary_path,
         ida_manifest_path,
         ida_handoff_manifest_path,
@@ -1532,6 +1607,7 @@ def run_phase3_multi(
         ensure_dir(decompiled_targets_dir)
     extracted = _extract_native_libraries(apk_paths, libs_dir)
     library_records = [_analyze_library(record) for record in extracted if record.get("success")]
+    code_index = _load_json_object(code_index_path)
     for record in library_records:
         record["ownership"] = classify_native_ownership(
             record.get("name"),
@@ -1540,6 +1616,10 @@ def run_phase3_multi(
             jni_symbols=record.get("jni_symbols") or [],
             first_party_hashes=first_party_native_hashes,
             third_party_hashes=third_party_native_hashes,
+            evidence_tokens=_native_attribution_evidence_tokens(
+                record,
+                code_index,
+            ),
         ).to_dict()
     extraction_errors = [record for record in extracted if not record.get("success")]
     toolchain = detect_native_toolchain(
@@ -1553,12 +1633,38 @@ def run_phase3_multi(
     dependency_capability_counts: Counter[str] = Counter()
     abi_counts: Counter[str] = Counter()
     ownership_library_counts: Counter[str] = Counter()
+    component_library_counts: Counter[str] = Counter()
+    component_inventory: dict[tuple[str, str], dict[str, Any]] = {}
     for record in library_records:
         abi_counts.update([str(record.get("abi"))])
         record_capabilities = record.get("capability_counts") or {}
         capability_counts.update(record_capabilities)
         ownership = (record.get("ownership") or {}).get("category") or "unknown"
         ownership_library_counts[ownership] += 1
+        attribution = record.get("ownership") or {}
+        component = str(attribution.get("component") or "")
+        vendor = str(attribution.get("vendor") or "")
+        if component:
+            component_key = f"{vendor}: {component}" if vendor else component
+            component_library_counts[component_key] += 1
+            identity = (str(record.get("sha256") or ""), component_key)
+            component_inventory[identity] = {
+                "library": record.get("name"),
+                "library_sha256": record.get("sha256"),
+                "abi": record.get("abi"),
+                "vendor": vendor or None,
+                "component": component,
+                "category": attribution.get("category"),
+                "confidence": attribution.get("confidence"),
+                "attribution_kind": attribution.get("attribution_kind"),
+                "corroboration": attribution.get("corroboration") or [],
+                "comparison_excluded": ownership in {"third_party", "platform"},
+                "exclusion_reason": (
+                    "Known dependency or platform component; retained for dependency analysis only."
+                    if ownership in {"third_party", "platform"}
+                    else None
+                ),
+            }
         if ownership in {"first_party", "unknown"}:
             comparison_capability_counts.update(record_capabilities)
         else:
@@ -1566,7 +1672,6 @@ def run_phase3_multi(
 
     function_index = build_native_function_index(library_records)
     safe_write_json(function_index_path, function_index)
-    code_index = _load_json_object(code_index_path)
     java_native_hints = build_java_native_hints(code_index, library_records)
 
     reuse_candidates: list[dict[str, Any]] = []
@@ -1715,6 +1820,12 @@ def run_phase3_multi(
             }
         )
         write_jsonl(reuse_review_path, review_candidates)
+        managed_deep_summary = compare_managed_candidates(
+            review_candidates,
+            managed_deep_comparisons_path,
+            managed_deep_summary_path,
+            limit=MANAGED_DEEP_COMPARISON_LIMIT,
+        )
         safe_write_json(reuse_selection_summary_path, selection_summary)
         retrieval_summary["review_candidate_count"] = len(review_candidates)
         retrieval_summary["review_candidate_limit"] = REUSE_REVIEW_LIMIT
@@ -1752,6 +1863,18 @@ def run_phase3_multi(
             "selection_starved": False,
         }
         safe_write_json(reuse_selection_summary_path, selection_summary)
+        write_jsonl(managed_deep_comparisons_path, [])
+        managed_deep_summary = {
+            "schema_version": "2026-08-26.managed-deep-comparison.v1",
+            "status": "not_requested",
+            "comparison_limit": MANAGED_DEEP_COMPARISON_LIMIT,
+            "comparison_count": 0,
+            "usage_review_ready_count": 0,
+            "adaptation_review_ready_count": 0,
+            "copying_conclusion_supported": False,
+            "comparison_path": str(managed_deep_comparisons_path),
+        }
+        safe_write_json(managed_deep_summary_path, managed_deep_summary)
         retrieval_summary = {
             "schema_version": "2026-08-24.reuse-candidate-retrieval.v6",
             "status": "not_requested",
@@ -2001,6 +2124,18 @@ def run_phase3_multi(
         "reuse_deep_comparison_summary_path": str(
             deep_comparison_summary_path
         ),
+        "managed_reuse_deep_comparisons_path": str(
+            managed_deep_comparisons_path
+        ),
+        "managed_reuse_deep_comparison_summary_path": str(
+            managed_deep_summary_path
+        ),
+        "managed_reuse_deep_comparison_status": managed_deep_summary.get(
+            "status"
+        ),
+        "managed_reuse_deep_comparison_count": managed_deep_summary.get(
+            "comparison_count", 0
+        ),
         "reuse_canonical_implementations_path": str(
             canonical_implementations_path
         ),
@@ -2041,6 +2176,25 @@ def run_phase3_multi(
     }
     safe_write_json(deep_summary_path, deep_summary)
 
+    native_component_inventory = sorted(
+        component_inventory.values(),
+        key=lambda item: (
+            str(item.get("vendor") or ""),
+            str(item.get("component") or ""),
+            str(item.get("library") or ""),
+            str(item.get("abi") or ""),
+        ),
+    )
+    confirmed_dependency_components = [
+        item
+        for item in native_component_inventory
+        if item.get("category") in {"third_party", "platform"}
+    ]
+    unconfirmed_component_clues = [
+        item
+        for item in native_component_inventory
+        if item.get("category") not in {"third_party", "platform"}
+    ]
     payload = {
         "apk_paths": [str(path) for path in apk_paths],
         "native_library_count": len(library_records),
@@ -2055,6 +2209,12 @@ def run_phase3_multi(
         "ownership_library_counts": dict(
             sorted(ownership_library_counts.items())
         ),
+        "component_library_counts": dict(
+            sorted(component_library_counts.items())
+        ),
+        "native_component_inventory": native_component_inventory,
+        "native_dependency_components": confirmed_dependency_components,
+        "unconfirmed_native_component_clues": unconfirmed_component_clues,
         "ownership_policy": {
             "comparison_included": ["first_party", "unknown"],
             "comparison_excluded_by_default": ["third_party", "platform"],
@@ -2098,6 +2258,18 @@ def run_phase3_multi(
         "reuse_deep_comparisons_path": str(deep_comparisons_path),
         "reuse_deep_comparison_summary_path": str(
             deep_comparison_summary_path
+        ),
+        "managed_reuse_deep_comparisons_path": str(
+            managed_deep_comparisons_path
+        ),
+        "managed_reuse_deep_comparison_summary_path": str(
+            managed_deep_summary_path
+        ),
+        "managed_reuse_deep_comparison_status": managed_deep_summary.get(
+            "status"
+        ),
+        "managed_reuse_deep_comparison_count": managed_deep_summary.get(
+            "comparison_count", 0
         ),
         "reuse_deep_comparison_status": deep_comparison_summary.get("status"),
         "reuse_deep_source_family_count": deep_comparison_summary.get(

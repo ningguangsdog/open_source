@@ -1,0 +1,17 @@
+{
+  "schema_version": "2026-08-26.reuse-regression-labels.v1",
+  "known_positives": [
+    {
+      "id": "replace-with-frozen-positive-id",
+      "commercial_pattern": "REPLACE_WITH_COMMERCIAL_FUNCTION_OR_LIBRARY_PATTERN",
+      "source_pattern": "REPLACE_WITH_UPSTREAM_PROJECT_OR_FUNCTION_PATTERN"
+    }
+  ],
+  "negative_controls": [
+    {
+      "id": "replace-with-frozen-control-id",
+      "commercial_pattern": "REPLACE_WITH_CONTROL_COMMERCIAL_PATTERN",
+      "source_pattern": "REPLACE_WITH_CONTROL_SOURCE_PATTERN"
+    }
+  ]
+}
